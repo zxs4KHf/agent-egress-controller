@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="440" viewBox="0 0 1200 440" role="img" aria-labelledby="title desc">
+  <title id="title">Agent 出口控制器</title>
+  <desc id="desc">Windows 托盘程序：让 AI 用的浏览器和命令行走你自己配置的固定出口，把时区调成一致，逐项检测并给出证据，退出时恢复原样。右侧是检测结果的示例：五个硬门槛全部通过，托盘圆点变绿。</desc>
+
+  <rect width="1200" height="440" rx="24" fill="#f4f5f2"/>
+
+  <!-- title block -->
+  <g id="title-block" transform="translate(64 64)">
+    <text x="0" y="0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18" fill="#5d6862" letter-spacing="1">WINDOWS · AGENT EGRESS CONTROLLER</text>
+    <text x="0" y="74" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei UI', 'PingFang SC', sans-serif" font-size="58" font-weight="700" fill="#17201b">Agent 出口控制器</text>
+    <text x="0" y="132" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei UI', 'PingFang SC', sans-serif" font-size="25" fill="#2b3530">让 AI 用的浏览器和 CLI 走你自己的固定出口，</text>
+    <text x="0" y="170" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei UI', 'PingFang SC', sans-serif" font-size="25" fill="#2b3530">时区跟着对齐，每一项都给证据，退出就还原。</text>
+
+    <!-- route: the actual chain -->
+    <g id="route" transform="translate(0 222)" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="18">
+      <rect x="0" y="0" width="128" height="44" rx="10" fill="#ffffff" stroke="#c9cfca"/>
+      <text x="64" y="28" text-anchor="middle" fill="#17201b">Edge · CLI</text>
+      <path d="M136 22 H168" stroke="#2e9d5b" stroke-width="3"/>
+      <path d="M162 15 L172 22 L162 29" fill="none" stroke="#2e9d5b" stroke-width="3"/>
+      <rect x="180" y="0" width="128" height="44" rx="10" fill="#ffffff" stroke="#c9cfca"/>
+      <text x="244" y="28" text-anchor="middle" fill="#17201b" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei UI', 'PingFang SC', sans-serif">本机内核</text>
+      <path d="M316 22 H348" stroke="#2e9d5b" stroke-width="3"/>
+      <path d="M342 15 L352 22 L342 29" fill="none" stroke="#2e9d5b" stroke-width="3"/>
+      <rect x="360" y="0" width="112" height="44" rx="10" fill="#ffffff" stroke="#c9cfca"/>
+      <text x="416" y="28" text-anchor="middle" fill="#17201b">relay</text>
+      <path d="M480 22 H512" stroke="#2e9d5b" stroke-width="3"/>
+      <path d="M506 15 L516 22 L506 29" fill="none" stroke="#2e9d5b" stroke-width="3"/>
+      <rect x="524" y="0" width="124" height="44" rx="10" fill="#17201b"/>
+      <text x="586" y="28" text-anchor="middle" fill="#ffffff">你的出口</text>
+      <text x="0" y="80" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei UI', 'PingFang SC', sans-serif" font-size="19" fill="#5d6862">只有从托盘打开的浏览器和 CLI 走这条路；其他软件照旧。</text>
+    </g>
+
+    <text x="0" y="352" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="17" fill="#5d6862">v0.1.0 · Windows 10/11 · 便携版 · GPL-3.0</text>
+  </g>
+
+  <!-- proof: a check report card -->
+  <g id="report" transform="translate(760 52)">
+    <rect x="0" y="0" width="380" height="336" rx="18" fill="#ffffff" stroke="#d5dad6"/>
+    <!-- tray dot motif: state colour with a white ring -->
+    <circle cx="40" cy="42" r="15" fill="#ffffff" stroke="#d5dad6"/>
+    <circle cx="40" cy="42" r="11" fill="#2e9d5b"/>
+    <text x="66" y="38" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei UI', 'PingFang SC', sans-serif" font-size="20" font-weight="700" fill="#17201b">Agent 模式 · 检测通过</text>
+    <text x="66" y="62" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="16" fill="#5d6862">硬门槛 5/5 · 示例</text>
+    <path d="M24 84 H356" stroke="#e3e7e4"/>
+
+    <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei UI', 'PingFang SC', sans-serif" font-size="20" fill="#17201b">
+      <g transform="translate(24 120)">
+        <circle cx="10" cy="-7" r="8" fill="#2e9d5b"/>
+        <text x="30" y="0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#5d6862">G1</text>
+        <text x="72" y="0">出口 ≠ 本机直连</text>
+      </g>
+      <g transform="translate(24 166)">
+        <circle cx="10" cy="-7" r="8" fill="#2e9d5b"/>
+        <text x="30" y="0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#5d6862">G2</text>
+        <text x="72" y="0">目标站可达，同一出口</text>
+      </g>
+      <g transform="translate(24 212)">
+        <circle cx="10" cy="-7" r="8" fill="#2e9d5b"/>
+        <text x="30" y="0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#5d6862">G3</text>
+        <text x="72" y="0">DNS 由内核代办</text>
+      </g>
+      <g transform="translate(24 258)">
+        <circle cx="10" cy="-7" r="8" fill="#2e9d5b"/>
+        <text x="30" y="0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#5d6862">G4</text>
+        <text x="72" y="0">系统与浏览器时区一致</text>
+      </g>
+      <g transform="translate(24 304)">
+        <circle cx="10" cy="-7" r="8" fill="#2e9d5b"/>
+        <text x="30" y="0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" fill="#5d6862">G5</text>
+        <text x="72" y="0">浏览器语言符合设置</text>
+      </g>
+    </g>
+  </g>
+
+  <!-- the four tray states, as a legend under the card -->
+  <g id="states" transform="translate(782 412)" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei UI', 'PingFang SC', sans-serif" font-size="17" fill="#5d6862">
+    <circle cx="0" cy="-6" r="7" fill="#8a918d"/><text x="14" y="0">日常</text>
+    <circle cx="84" cy="-6" r="7" fill="#2e9d5b"/><text x="98" y="0">通过</text>
+    <circle cx="168" cy="-6" r="7" fill="#e0a100"/><text x="182" y="0">未通过</text>
+    <circle cx="268" cy="-6" r="7" fill="#d64545"/><text x="282" y="0">待恢复</text>
+  </g>
+</svg>

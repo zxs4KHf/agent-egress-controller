@@ -1,0 +1,27 @@
+# Build outputs
+src-tauri/target/
+target/
+dist/
+build/
+*.msi
+*.exe
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.secret
+*.pfx
+*.p12
+
+# Local runtime state
+runtime/
+data/
+logs/
+
+# Maintainer-only material: kept on the maintainer's disk, never published.
+# (the predecessor chain, its migration runbook, local tickets and planning notes)
+legacy/
+.scratch/
+docs/MIGRATION-RUNBOOK.md
+docs/NEXT-STEPS.md

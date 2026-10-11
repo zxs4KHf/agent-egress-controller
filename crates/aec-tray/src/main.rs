@@ -1,0 +1,542 @@
+//! `aec-tray`: the first usable version of Agent Egress Controller. A tray icon whose colour is the
+//! mode, a menu for every action, and a local settings page for the user's own exit.
+//!
+//! The window thread only draws and dispatches; the controller lives on a worker thread
+//! ([`app::Worker`]) so checks never freeze the menu.
+
+#![cfg_attr(not(test), windows_subsystem = "windows")]
+
+#[cfg(windows)]
+mod app;
+mod text;
+#[cfg(windows)]
+mod win;
+
+#[cfg(not(windows))]
+fn main() {
+    eprintln!("aec-tray runs on Windows only");
+}
+
+#[cfg(windows)]
+fn main() {
+    tray::run();
+}
+
+#[cfg(windows)]
+mod tray {
+    use std::cell::RefCell;
+    use std::sync::mpsc::{channel, Sender};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use windows_sys::Win32::Foundation::{
+        GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, WPARAM,
+    };
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+    use windows_sys::Win32::UI::Shell::{
+        Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIIF_WARNING,
+        NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+
+    use aec_core::controller::Mode;
+    use aec_core::setup::SetupServer;
+
+    use crate::app::{Backend, Cmd, Layout, Shared, SharedRef, Worker};
+    use crate::text;
+    use crate::win::{self, wide};
+
+    const WM_TRAY: u32 = WM_APP + 1;
+    const WM_REFRESH: u32 = WM_APP + 2;
+    const WM_QUIT_READY: u32 = WM_APP + 3;
+
+    const ID_ENTER: usize = 1;
+    const ID_RECHECK: usize = 2;
+    const ID_REPORT: usize = 3;
+    const ID_PROMPTS: usize = 4;
+    const ID_EXIT: usize = 5;
+    const ID_ACK: usize = 6;
+    const ID_SETTINGS: usize = 7;
+    const ID_DATA: usize = 8;
+    const ID_QUIT: usize = 9;
+    const ID_ENTRY_BASE: usize = 100;
+    const TIMER_REFRESH: usize = 1;
+
+    const GRAY: (u8, u8, u8) = (138, 145, 141);
+    const GREEN: (u8, u8, u8) = (46, 157, 91);
+    const AMBER: (u8, u8, u8) = (224, 161, 0);
+    const RED: (u8, u8, u8) = (214, 69, 69);
+
+    struct Ui {
+        hwnd: HWND,
+        tx: Sender<Cmd>,
+        shared: SharedRef,
+        layout: Layout,
+        icons: [HICON; 4],
+        setup: Option<SetupServer>,
+        taskbar_created: u32,
+        quitting: bool,
+    }
+
+    thread_local! {
+        static UI: RefCell<Option<Ui>> = const { RefCell::new(None) };
+    }
+
+    /// Borrow the UI state. Never call anything that pumps messages (menus, message boxes,
+    /// ShellExecute) inside `f`: the nested messages would find the state borrowed. Such calls are
+    /// returned as an [`Effect`] and run after the borrow ends.
+    fn with_ui<R>(f: impl FnOnce(&mut Ui) -> R) -> Option<R> {
+        UI.with(|u| u.try_borrow_mut().ok()?.as_mut().map(f))
+    }
+
+    /// Work that pumps messages, done outside the UI borrow.
+    enum Effect {
+        None,
+        Open(String),
+        Warn(String),
+    }
+
+    fn run_effect(hwnd: HWND, e: Effect) {
+        match e {
+            Effect::None => {}
+            Effect::Open(target) => win::shell_open(&target),
+            Effect::Warn(text) => win::message_box(hwnd, &text, "Agent 出口控制器"),
+        }
+    }
+
+    /// Show the tray menu and act on the choice. The menu's modal loop runs outside the UI borrow.
+    fn show_menu(hwnd: HWND) {
+        let Some((m, s)) = with_ui(|u| u.build_menu()) else {
+            return;
+        };
+        let id = unsafe {
+            let mut pt = POINT { x: 0, y: 0 };
+            GetCursorPos(&mut pt);
+            SetForegroundWindow(hwnd);
+            let id = TrackPopupMenu(
+                m,
+                TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+                pt.x,
+                pt.y,
+                0,
+                hwnd,
+                std::ptr::null(),
+            ) as usize;
+            PostMessageW(hwnd, WM_NULL, 0, 0);
+            DestroyMenu(m);
+            id
+        };
+        if id != 0 {
+            let effect = with_ui(|u| u.command(id, &s)).unwrap_or(Effect::None);
+            run_effect(hwnd, effect);
+        }
+    }
+
+    fn nid(hwnd: HWND) -> NOTIFYICONDATAW {
+        let mut n: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
+        n.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        n.hWnd = hwnd;
+        n.uID = 1;
+        n
+    }
+
+    impl Ui {
+        fn state(&self) -> Shared {
+            self.shared.lock().expect("lock").clone()
+        }
+
+        fn icon_and_tip(&self, s: &Shared) -> (HICON, String) {
+            let icon = if s.busy.is_some() {
+                self.icons[2]
+            } else {
+                match s.mode {
+                    Mode::Daily => self.icons[0],
+                    Mode::AgentReady => self.icons[1],
+                    Mode::AgentUnverified => self.icons[2],
+                    Mode::Entering | Mode::Exiting | Mode::RestoreIncomplete => self.icons[3],
+                }
+            };
+            let tip = format!(
+                "Agent 出口控制器\n{}",
+                s.busy.unwrap_or(text::mode_label(s.mode))
+            );
+            (icon, tip)
+        }
+
+        fn add_icon(&self) {
+            let s = self.state();
+            let (icon, tip) = self.icon_and_tip(&s);
+            let mut n = nid(self.hwnd);
+            n.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+            n.uCallbackMessage = WM_TRAY;
+            n.hIcon = icon;
+            win::fill(&mut n.szTip, &tip);
+            unsafe { Shell_NotifyIconW(NIM_ADD, &n) };
+        }
+
+        fn refresh(&mut self) {
+            let (s, mut note, clip) = {
+                let mut g = self.shared.lock().expect("lock");
+                let note = g.note.take();
+                let clip = g.clipboard.take();
+                (g.clone(), note, clip)
+            };
+            if let Some(text) = clip {
+                if let Err(e) = win::set_clipboard(self.hwnd, &text) {
+                    note = Some(crate::app::Note {
+                        title: "复制失败".into(),
+                        text: e,
+                        error: true,
+                    });
+                }
+            }
+            let (icon, tip) = self.icon_and_tip(&s);
+            let mut n = nid(self.hwnd);
+            n.uFlags = NIF_ICON | NIF_TIP;
+            n.hIcon = icon;
+            win::fill(&mut n.szTip, &tip);
+            if let Some(note) = note {
+                n.uFlags |= NIF_INFO;
+                win::fill(&mut n.szInfoTitle, &note.title);
+                win::fill(&mut n.szInfo, &note.text);
+                n.dwInfoFlags = if note.error { NIIF_WARNING } else { NIIF_INFO };
+            }
+            unsafe { Shell_NotifyIconW(NIM_MODIFY, &n) };
+        }
+
+        fn open_settings(&mut self) -> Effect {
+            if self.setup.is_none() {
+                let token = match aec_core::crypto::random_hex(16) {
+                    Ok(t) => t,
+                    Err(e) => return Effect::Warn(format!("设置页打不开：{e}")),
+                };
+                let hwnd = self.hwnd as usize;
+                let backend = Backend {
+                    data_dir: self.layout.data_dir.clone(),
+                    shared: self.shared.clone(),
+                    notify: Box::new(move || unsafe {
+                        PostMessageW(hwnd as HWND, WM_REFRESH, 0, 0);
+                    }),
+                };
+                match SetupServer::start(0, token, Arc::new(backend)) {
+                    Ok(s) => self.setup = Some(s),
+                    Err(e) => return Effect::Warn(format!("本机设置页没能启动：{e}")),
+                }
+            }
+            self.setup
+                .as_ref()
+                .map_or(Effect::None, |s| Effect::Open(s.url()))
+        }
+
+        fn send(&self, cmd: Cmd) {
+            let _ = self.tx.send(cmd);
+        }
+
+        /// Build the menu for the current state; [`show_menu`] shows it outside the borrow.
+        fn build_menu(&self) -> (HMENU, Shared) {
+            let s = self.state();
+            let idle = s.busy.is_none() && !self.quitting;
+            let agent = matches!(s.mode, Mode::AgentReady | Mode::AgentUnverified);
+            unsafe {
+                let m = CreatePopupMenu();
+                let add = |flags: u32, id: usize, label: &str| {
+                    let w = wide(label);
+                    AppendMenuW(m, flags, id, w.as_ptr());
+                };
+                let on = |ok: bool| if ok { MF_STRING } else { MF_STRING | MF_GRAYED };
+                add(
+                    MF_STRING | MF_GRAYED,
+                    0,
+                    s.busy.unwrap_or(text::mode_label(s.mode)),
+                );
+                if let Some(sum) = &s.summary {
+                    if agent {
+                        add(MF_STRING | MF_GRAYED, 0, sum);
+                    }
+                }
+                AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
+                match s.mode {
+                    Mode::Daily => {
+                        add(
+                            on(idle),
+                            ID_ENTER,
+                            if s.configured {
+                                "进入 Agent 模式"
+                            } else {
+                                "进入 Agent 模式（先设置出口）"
+                            },
+                        );
+                    }
+                    Mode::AgentReady | Mode::AgentUnverified => {
+                        for (i, (_, label)) in s.entries.iter().enumerate() {
+                            add(on(idle), ID_ENTRY_BASE + i, label);
+                        }
+                        AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
+                        add(on(idle), ID_RECHECK, "重新检测");
+                        add(on(idle), ID_EXIT, "退出 Agent 模式（恢复设置）");
+                    }
+                    Mode::RestoreIncomplete => {
+                        add(on(idle), ID_EXIT, "重试恢复");
+                        add(on(idle), ID_ACK, "保持现状，回到日常模式");
+                    }
+                    Mode::Entering | Mode::Exiting => {
+                        add(on(idle), ID_EXIT, "恢复上次未完成的会话");
+                    }
+                }
+                AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
+                add(on(s.has_report), ID_REPORT, "查看检测结果");
+                add(on(idle), ID_PROMPTS, "复制排查提示词");
+                add(MF_STRING, ID_SETTINGS, "设置出口和时区…");
+                add(MF_STRING, ID_DATA, "打开数据和日志目录");
+                AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
+                add(
+                    on(!self.quitting),
+                    ID_QUIT,
+                    if s.mode == Mode::Daily {
+                        "退出程序"
+                    } else {
+                        "恢复设置并退出程序"
+                    },
+                );
+
+                (m, s)
+            }
+        }
+
+        fn command(&mut self, id: usize, s: &Shared) -> Effect {
+            match id {
+                ID_ENTER if !s.configured => return self.open_settings(),
+                ID_ENTER => self.send(Cmd::Enter),
+                ID_RECHECK => self.send(Cmd::Recheck),
+                ID_EXIT => self.send(Cmd::Exit),
+                ID_ACK => self.send(Cmd::Ack),
+                ID_PROMPTS => self.send(Cmd::CopyPrompts),
+                ID_REPORT => {
+                    return Effect::Open(self.layout.report_path().to_string_lossy().into())
+                }
+                ID_SETTINGS => return self.open_settings(),
+                ID_DATA => return Effect::Open(self.layout.data_dir.to_string_lossy().into()),
+                ID_QUIT => self.quit(),
+                n if n >= ID_ENTRY_BASE => {
+                    if let Some((entry, _)) = s.entries.get(n - ID_ENTRY_BASE) {
+                        self.send(Cmd::Open(entry.clone()));
+                    }
+                }
+                _ => {}
+            }
+            Effect::None
+        }
+
+        /// Restore on the worker, then close once it answers.
+        fn quit(&mut self) {
+            self.quitting = true;
+            let (done_tx, done_rx) = channel();
+            self.send(Cmd::Shutdown(done_tx));
+            let hwnd = self.hwnd as usize;
+            std::thread::spawn(move || {
+                let _ = done_rx.recv_timeout(Duration::from_secs(120));
+                unsafe { PostMessageW(hwnd as HWND, WM_QUIT_READY, 0, 0) };
+            });
+        }
+    }
+
+    unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+        match msg {
+            WM_TRAY => {
+                let ev = lp as u32;
+                if ev == WM_RBUTTONUP || ev == WM_LBUTTONUP {
+                    show_menu(hwnd);
+                }
+                0
+            }
+            WM_REFRESH => {
+                if with_ui(|u| u.refresh()).is_none() {
+                    // The state is borrowed further up this stack: try again shortly.
+                    SetTimer(hwnd, TIMER_REFRESH, 150, None);
+                }
+                0
+            }
+            WM_TIMER if wp == TIMER_REFRESH => {
+                KillTimer(hwnd, TIMER_REFRESH);
+                PostMessageW(hwnd, WM_REFRESH, 0, 0);
+                0
+            }
+            WM_QUIT_READY => {
+                DestroyWindow(hwnd);
+                0
+            }
+            // Log-off or shutdown: restore before Windows ends the session. Waiting here is what
+            // keeps the session open long enough; the worker finishes its current step first.
+            WM_QUERYENDSESSION => {
+                let pending = with_ui(|u| {
+                    let (tx, rx) = channel();
+                    let _ = u.tx.send(Cmd::Restore(tx));
+                    rx
+                });
+                if let Some(rx) = pending {
+                    let _ = rx.recv_timeout(Duration::from_secs(25));
+                }
+                1
+            }
+            // Menu ids also arrive as WM_COMMAND, which lets scripts drive the tray in tests.
+            WM_COMMAND => {
+                let id = wp & 0xffff;
+                let effect = with_ui(|u| {
+                    let s = u.state();
+                    u.command(id, &s)
+                });
+                run_effect(hwnd, effect.unwrap_or(Effect::None));
+                0
+            }
+            WM_DESTROY => {
+                let n = nid(hwnd);
+                Shell_NotifyIconW(NIM_DELETE, &n);
+                UI.with(|u| u.borrow_mut().take());
+                PostQuitMessage(0);
+                0
+            }
+            _ => {
+                let recreate = with_ui(|u| u.taskbar_created != 0 && msg == u.taskbar_created)
+                    .unwrap_or(false);
+                if recreate {
+                    // Explorer restarted: the icon has to be added again.
+                    with_ui(|u| u.add_icon());
+                    return 0;
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+        }
+    }
+
+    pub fn run() {
+        let name = wide("Local\\AgentEgressControllerTray");
+        let mutex = unsafe { CreateMutexW(std::ptr::null(), 1, name.as_ptr()) };
+        if mutex.is_null() || unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            win::message_box(
+                std::ptr::null_mut(),
+                "Agent 出口控制器已经在运行，请看任务栏右下角的托盘图标（可能藏在「^」里）。",
+                "Agent 出口控制器",
+            );
+            return;
+        }
+
+        let layout = Layout::detect();
+        let class = wide("AgentEgressControllerTray");
+        let hinstance = unsafe { GetModuleHandleW(std::ptr::null()) };
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: 0,
+            lpfnWndProc: Some(wndproc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hinstance,
+            hIcon: std::ptr::null_mut(),
+            hCursor: std::ptr::null_mut(),
+            hbrBackground: std::ptr::null_mut(),
+            lpszMenuName: std::ptr::null(),
+            lpszClassName: class.as_ptr(),
+            hIconSm: std::ptr::null_mut(),
+        };
+        unsafe { RegisterClassExW(&wc) };
+        let title = wide("Agent Egress Controller");
+        // A hidden top-level window: message-only windows do not get WM_QUERYENDSESSION.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                title.as_ptr(),
+                WS_OVERLAPPED,
+                0,
+                0,
+                0,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                hinstance,
+                std::ptr::null(),
+            )
+        };
+        if hwnd.is_null() {
+            win::message_box(
+                std::ptr::null_mut(),
+                "托盘窗口创建失败。",
+                "Agent 出口控制器",
+            );
+            return;
+        }
+
+        let shared: SharedRef = Arc::new(Mutex::new(Shared {
+            mode: Mode::Daily,
+            busy: Some("正在启动…"),
+            configured: false,
+            entries: Vec::new(),
+            has_report: false,
+            note: None,
+            summary: None,
+            clipboard: None,
+        }));
+        let (tx, rx) = channel::<Cmd>();
+        let (init_tx, init_rx) = channel::<Result<(), String>>();
+        {
+            let (layout, shared, h) = (layout.clone(), shared.clone(), hwnd as usize);
+            std::thread::spawn(move || {
+                let notify = Box::new(move || unsafe {
+                    PostMessageW(h as HWND, WM_REFRESH, 0, 0);
+                });
+                match Worker::new(layout, shared, notify) {
+                    Ok(w) => {
+                        let _ = init_tx.send(Ok(()));
+                        w.run(rx);
+                    }
+                    Err(e) => {
+                        let _ = init_tx.send(Err(e));
+                    }
+                }
+            });
+        }
+        if let Ok(Err(e)) = init_rx.recv() {
+            win::message_box(hwnd, &format!("启动失败：{e}"), "Agent 出口控制器");
+            unsafe { DestroyWindow(hwnd) };
+            return;
+        }
+
+        let tc = wide("TaskbarCreated");
+        let ui = Ui {
+            hwnd,
+            tx,
+            shared: shared.clone(),
+            layout,
+            icons: [
+                win::dot_icon(GRAY),
+                win::dot_icon(GREEN),
+                win::dot_icon(AMBER),
+                win::dot_icon(RED),
+            ],
+            setup: None,
+            taskbar_created: unsafe { RegisterWindowMessageW(tc.as_ptr()) },
+            quitting: false,
+        };
+        ui.add_icon();
+        UI.with(|u| *u.borrow_mut() = Some(ui));
+        let first_run = with_ui(|u| {
+            u.refresh();
+            let s = u.state();
+            // First run: nothing works without an exit, so start there.
+            if !s.configured && s.mode == Mode::Daily {
+                u.open_settings()
+            } else {
+                Effect::None
+            }
+        });
+        run_effect(hwnd, first_run.unwrap_or(Effect::None));
+
+        let mut msg: MSG = unsafe { std::mem::zeroed() };
+        while unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) } > 0 {
+            unsafe {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+}

@@ -1,0 +1,787 @@
+//! Start, stop and inspect this application's own mihomo process (Windows).
+//!
+//! Only a process recorded in `owned.json` and still matching its pid, executable and creation time
+//! is ever terminated. Ports held by anything else are reported and left alone.
+
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::os::windows::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, SetHandleInformation, FILETIME, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+};
+use windows_sys::Win32::System::Console::{
+    GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+};
+use windows_sys::Win32::System::Threading::{
+    GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
+    WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+};
+
+use super::config;
+use super::pin;
+use super::preflight::{self, OwnedProcess, PortState};
+use super::CorePorts;
+use crate::crypto;
+use crate::probe::WriterEvidence;
+use crate::snapshot::rfc3339_utc;
+use crate::store::write_atomic;
+
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const START_TIMEOUT: Duration = Duration::from_secs(15);
+const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Error with a code from the SPEC 4.11 families.
+#[derive(Debug)]
+pub struct CoreError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl CoreError {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for CoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for CoreError {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BinaryState {
+    Ok,
+    Missing,
+    Mismatch { sha256: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoreStatus {
+    pub binary: BinaryState,
+    pub owned: Option<OwnedProcess>,
+    pub alive: bool,
+    pub ports: Vec<(u16, String)>,
+    pub version: Option<String>,
+    pub relay: Option<OwnedProcess>,
+    pub relay_alive: bool,
+}
+
+pub struct CoreManager {
+    pub data_dir: PathBuf,
+    pub bin: PathBuf,
+    /// `aec-relay.exe`, started before the core when a profile (not the DIRECT test) runs.
+    pub relay_bin: PathBuf,
+    pub ports: CorePorts,
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn io<'a>(code: &'static str, path: &'a Path) -> impl FnOnce(std::io::Error) -> CoreError + 'a {
+    move |e| CoreError::new(code, format!("{}: {e}", path.display()))
+}
+
+/// Executable path and creation time of a live process, if this token can open it.
+pub(crate) fn process_identity(pid: u32) -> Option<(String, u64)> {
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let mut buf = vec![0u16; 32768];
+        let mut len = buf.len() as u32;
+        let (mut c, mut e, mut k, mut u): (FILETIME, FILETIME, FILETIME, FILETIME) =
+            std::mem::zeroed();
+        let ok_name = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len) != 0;
+        let ok_time = GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u) != 0;
+        CloseHandle(h);
+        if !(ok_name && ok_time) {
+            return None;
+        }
+        let created = (u64::from(c.dwHighDateTime) << 32) | u64::from(c.dwLowDateTime);
+        Some((String::from_utf16_lossy(&buf[..len as usize]), created))
+    }
+}
+
+/// Keep this process's own standard handles out of the long-lived core.
+///
+/// std spawns with handle inheritance on, so every inheritable handle this process holds goes to
+/// the child, including the write end of a pipe our caller reads our output from. The core would
+/// then hold that pipe open for its whole life and the caller would wait forever (observed
+/// 2026-10-11 with `aec-dev core up --direct | Out-Null`). The child's own stdio is set explicitly,
+/// so clearing the flag on ours loses nothing.
+pub(crate) fn stop_std_handle_inheritance() {
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        unsafe {
+            let h = GetStdHandle(which);
+            if !h.is_null() && h != INVALID_HANDLE_VALUE {
+                SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+}
+
+/// The recorded process is still the same process (no pid reuse).
+pub(crate) fn still_ours(o: &OwnedProcess) -> bool {
+    matches!(process_identity(o.pid), Some((exe, created)) if exe.eq_ignore_ascii_case(&o.exe) && created == o.created)
+}
+
+fn terminate(o: &OwnedProcess) -> Result<(), CoreError> {
+    if !still_ours(o) {
+        return Ok(());
+    }
+    unsafe {
+        let h = OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, o.pid);
+        if h.is_null() {
+            return Err(CoreError::new(
+                "CORE_STOP_FAILED",
+                format!("cannot open pid {}", o.pid),
+            ));
+        }
+        let ok = TerminateProcess(h, 1) != 0;
+        let waited = WaitForSingleObject(h, STOP_TIMEOUT.as_millis() as u32);
+        CloseHandle(h);
+        if !ok || waited != 0 {
+            return Err(CoreError::new(
+                "CORE_STOP_FAILED",
+                format!("pid {} did not exit", o.pid),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Minimal HTTP/1.1 GET against a loopback port; returns status and body.
+pub fn http_get_local(
+    port: u16,
+    path: &str,
+    bearer: Option<&str>,
+) -> Result<(u16, String), String> {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let mut s =
+        TcpStream::connect_timeout(&addr, Duration::from_secs(2)).map_err(|e| e.to_string())?;
+    s.set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|e| e.to_string())?;
+    let auth = bearer
+        .map(|b| format!("Authorization: Bearer {b}\r\n"))
+        .unwrap_or_default();
+    write!(
+        s,
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}Connection: close\r\n\r\n"
+    )
+    .map_err(|e| e.to_string())?;
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&raw);
+    let (head, body) = text.split_once("\r\n\r\n").ok_or("malformed response")?;
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .ok_or("no status code")?;
+    let body = if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        dechunk(body)
+    } else {
+        body.to_string()
+    };
+    Ok((status, body))
+}
+
+fn dechunk(mut body: &str) -> String {
+    let mut out = String::new();
+    while let Some((size, rest)) = body.split_once("\r\n") {
+        let n = usize::from_str_radix(size.trim(), 16).unwrap_or(0);
+        if n == 0 || rest.len() < n {
+            break;
+        }
+        out.push_str(&rest[..n]);
+        body = rest[n..].trim_start_matches("\r\n");
+    }
+    out
+}
+
+fn secret_from(config_text: &str) -> Option<String> {
+    config_text
+        .lines()
+        .find_map(|l| l.strip_prefix("secret: "))
+        .map(|v| v.trim().trim_matches('"').to_string())
+}
+
+impl CoreManager {
+    /// Development layout: binary in `<repo>/runtime/bin`, data in `<repo>/runtime/dev-data`.
+    pub fn dev(repo_root: &Path, data_dir: &Path) -> Self {
+        let relay_bin = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("aec-relay.exe")))
+            .unwrap_or_else(|| PathBuf::from("aec-relay.exe"));
+        Self {
+            data_dir: data_dir.to_path_buf(),
+            bin: repo_root.join("runtime").join("bin").join(pin::EXE_NAME),
+            relay_bin,
+            ports: CorePorts::default(),
+        }
+    }
+
+    fn relay_config_path(&self) -> PathBuf {
+        self.core_dir().join("relay.json")
+    }
+    fn relay_owned_path(&self) -> PathBuf {
+        self.core_dir().join("relay-owned.json")
+    }
+    pub fn relay_log_path(&self) -> PathBuf {
+        let day = rfc3339_utc(now_ms() / 1000)[..10].replace('-', "");
+        self.data_dir.join("logs").join(format!("relay-{day}.log"))
+    }
+    pub fn relay_owned(&self) -> Option<OwnedProcess> {
+        fs::read(self.relay_owned_path())
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+    }
+    fn clear_relay_files(&self) {
+        let _ = fs::remove_file(self.relay_config_path());
+        let _ = fs::remove_file(self.relay_owned_path());
+    }
+
+    fn stop_relay(&self) -> Result<(), CoreError> {
+        if let Some(r) = self.relay_owned() {
+            terminate(&r)?;
+        }
+        self.clear_relay_files();
+        Ok(())
+    }
+
+    /// Start the relay (unless ours already runs), then the core. The relay must listen before the
+    /// core starts, or the core's only upstream is dead by construction (legacy order).
+    pub fn up_with_relay(
+        &self,
+        evidence: &dyn WriterEvidence,
+        relay_cfg: &crate::relay::RelayConfig,
+        make_config: impl FnOnce(&CorePorts, &str) -> Result<String, String>,
+    ) -> Result<OwnedProcess, CoreError> {
+        if self.relay_owned().filter(still_ours).is_none() {
+            self.clear_relay_files();
+            let busy = preflight::check(evidence, &[self.ports.relay], None)
+                .map_err(|e| CoreError::new("PORT_PROBE_FAILED", e.to_string()))?;
+            if let Some((p, PortState::Foreign(o))) = busy.into_iter().next() {
+                return Err(CoreError::new(
+                    "PORT_IN_USE",
+                    format!(
+                        "{p} held by pid {} ({})",
+                        o.pid,
+                        o.exe.as_deref().unwrap_or("path not readable")
+                    ),
+                ));
+            }
+            if !self.relay_bin.is_file() {
+                return Err(CoreError::new(
+                    "RELAY_BINARY_MISSING",
+                    format!("{} not found", self.relay_bin.display()),
+                ));
+            }
+            // The file carries upstream credentials; the relay deletes it as soon as it has read it.
+            write_atomic(
+                &self.relay_config_path(),
+                &serde_json::to_vec(relay_cfg).expect("serializes"),
+            )
+            .map_err(|e| CoreError::new("IO_WRITE", e.to_string()))?;
+            stop_std_handle_inheritance();
+            let child = Command::new(&self.relay_bin)
+                .arg("--config")
+                .arg(self.relay_config_path())
+                .arg("--log")
+                .arg(self.relay_log_path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+                .map_err(io("RELAY_START_FAILED", &self.relay_bin))?;
+            let pid = child.id();
+            drop(child);
+            let Some((exe, created)) = process_identity(pid) else {
+                self.clear_relay_files();
+                return Err(CoreError::new(
+                    "RELAY_START_FAILED",
+                    format!(
+                        "relay pid {pid} exited immediately; see {}",
+                        self.relay_log_path().display()
+                    ),
+                ));
+            };
+            let owned = OwnedProcess {
+                role: "relay".into(),
+                pid,
+                exe,
+                created,
+                started_at_unix_ms: now_ms(),
+            };
+            write_atomic(
+                &self.relay_owned_path(),
+                &serde_json::to_vec_pretty(&owned).expect("serializes"),
+            )
+            .map_err(|e| CoreError::new("IO_WRITE", e.to_string()))?;
+            let deadline = Instant::now() + START_TIMEOUT;
+            loop {
+                let up = preflight::check(evidence, &[self.ports.relay], Some(&owned))
+                    .map(|r| r[0].1 == PortState::Ours)
+                    .unwrap_or(false);
+                if up {
+                    break;
+                }
+                if Instant::now() >= deadline || !still_ours(&owned) {
+                    let _ = self.stop_relay();
+                    return Err(CoreError::new(
+                        "RELAY_START_TIMEOUT",
+                        format!(
+                            "relay did not listen on {} in time; see {}",
+                            self.ports.relay,
+                            self.relay_log_path().display()
+                        ),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        match self.up(evidence, make_config) {
+            Ok(o) => Ok(o),
+            Err(e) => {
+                let _ = self.stop_relay();
+                Err(e)
+            }
+        }
+    }
+
+    pub fn core_dir(&self) -> PathBuf {
+        self.data_dir.join("core")
+    }
+    pub fn config_path(&self) -> PathBuf {
+        self.core_dir().join("config.yaml")
+    }
+    fn owned_path(&self) -> PathBuf {
+        self.core_dir().join("owned.json")
+    }
+    /// Today's core log (UTC day), where the core writes one line per connection.
+    pub fn log_path(&self) -> PathBuf {
+        let day = rfc3339_utc(now_ms() / 1000)[..10].replace('-', "");
+        self.data_dir.join("logs").join(format!("core-{day}.log"))
+    }
+
+    pub fn binary_state(&self) -> BinaryState {
+        if !self.bin.is_file() {
+            return BinaryState::Missing;
+        }
+        match crypto::sha256_file(&self.bin) {
+            Ok(h) if h == pin::EXE_SHA256 => BinaryState::Ok,
+            Ok(h) => BinaryState::Mismatch { sha256: h },
+            Err(e) => BinaryState::Mismatch {
+                sha256: format!("unreadable: {e}"),
+            },
+        }
+    }
+
+    /// Copy a mihomo executable into place after checking it is the pinned build.
+    pub fn install(&self, src: &Path) -> Result<(), CoreError> {
+        let h = crypto::sha256_file(src)
+            .map_err(|e| CoreError::new("CORE_BINARY_MISSING", e.to_string()))?;
+        if h != pin::EXE_SHA256 {
+            return Err(CoreError::new(
+                "CORE_BINARY_MISMATCH",
+                format!(
+                    "{} has sha256 {h}, pinned {} ({})",
+                    src.display(),
+                    pin::EXE_SHA256,
+                    pin::VERSION
+                ),
+            ));
+        }
+        let dir = self.bin.parent().expect("bin has a parent");
+        fs::create_dir_all(dir).map_err(io("IO_WRITE", dir))?;
+        let tmp = self.bin.with_extension("exe.tmp");
+        fs::copy(src, &tmp).map_err(io("IO_WRITE", &tmp))?;
+        fs::rename(&tmp, &self.bin).map_err(io("IO_WRITE", &self.bin))?;
+        Ok(())
+    }
+
+    pub fn owned(&self) -> Option<OwnedProcess> {
+        fs::read(self.owned_path())
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+    }
+
+    fn clear_runtime_files(&self) {
+        let _ = fs::remove_file(self.config_path());
+        let _ = fs::remove_file(self.owned_path());
+    }
+
+    /// Validate a configuration with `mihomo -t` without starting anything.
+    fn test_config(&self) -> Result<(), CoreError> {
+        let out = Command::new(&self.bin)
+            .args(["-t", "-d"])
+            .arg(self.core_dir())
+            .arg("-f")
+            .arg(self.config_path())
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(io("CORE_START_FAILED", &self.bin))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            let text = String::from_utf8_lossy(&out.stdout).into_owned()
+                + &String::from_utf8_lossy(&out.stderr);
+            Err(CoreError::new("CORE_CONFIG_INVALID", config::redact(&text)))
+        }
+    }
+
+    /// Everything `up` checks before it changes anything: binary, and ports free or already ours.
+    pub fn preflight(&self, evidence: &dyn WriterEvidence) -> Result<(), CoreError> {
+        match self.binary_state() {
+            BinaryState::Ok => {}
+            BinaryState::Missing => {
+                return Err(CoreError::new(
+                    "CORE_BINARY_MISSING",
+                    format!(
+                        "{} not found; run `aec-dev core install <exe>`",
+                        self.bin.display()
+                    ),
+                ))
+            }
+            BinaryState::Mismatch { sha256 } => {
+                return Err(CoreError::new(
+                    "CORE_BINARY_MISMATCH",
+                    format!("{} has sha256 {sha256}", self.bin.display()),
+                ))
+            }
+        }
+        let owned = self.owned().filter(still_ours);
+        let ports = preflight::check(evidence, &self.ports.all(), owned.as_ref())
+            .map_err(|e| CoreError::new("PORT_PROBE_FAILED", e.to_string()))?;
+        let busy: Vec<String> = ports
+            .iter()
+            .filter_map(|(p, s)| match s {
+                PortState::Foreign(o) => Some(format!(
+                    "{p} held by pid {} ({})",
+                    o.pid,
+                    o.exe.as_deref().unwrap_or("path not readable")
+                )),
+                _ => None,
+            })
+            .collect();
+        if busy.is_empty() {
+            Ok(())
+        } else {
+            Err(CoreError::new("PORT_IN_USE", busy.join("; ")))
+        }
+    }
+
+    /// Start the core with a generated configuration. `make_config` receives the fresh secret.
+    pub fn up(
+        &self,
+        evidence: &dyn WriterEvidence,
+        make_config: impl FnOnce(&CorePorts, &str) -> Result<String, String>,
+    ) -> Result<OwnedProcess, CoreError> {
+        self.preflight(evidence)?;
+        if let Some(o) = self.owned().filter(still_ours) {
+            return Ok(o);
+        }
+        self.clear_runtime_files();
+
+        let secret = crypto::random_hex(16)
+            .map_err(|e| CoreError::new("CORE_START_FAILED", e.to_string()))?;
+        let text =
+            make_config(&self.ports, &secret).map_err(|e| CoreError::new("CFG_INVALID", e))?;
+        write_atomic(&self.config_path(), text.as_bytes())
+            .map_err(|e| CoreError::new("IO_WRITE", e.to_string()))?;
+        if let Err(e) = self.test_config() {
+            self.clear_runtime_files();
+            return Err(e);
+        }
+
+        let log = self.log_path();
+        fs::create_dir_all(log.parent().expect("log has a parent"))
+            .map_err(io("IO_WRITE", &log))?;
+        let out = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .map_err(io("IO_WRITE", &log))?;
+        let err = out.try_clone().map_err(io("IO_WRITE", &log))?;
+        stop_std_handle_inheritance();
+        let child = Command::new(&self.bin)
+            .arg("-d")
+            .arg(self.core_dir())
+            .arg("-f")
+            .arg(self.config_path())
+            .current_dir(self.core_dir())
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(out))
+            .stderr(Stdio::from(err))
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(io("CORE_START_FAILED", &self.bin))?;
+        let pid = child.id();
+        drop(child);
+        let Some((exe, created)) = process_identity(pid) else {
+            self.clear_runtime_files();
+            return Err(CoreError::new(
+                "CORE_START_FAILED",
+                format!(
+                    "pid {pid} exited immediately; see {}",
+                    self.log_path().display()
+                ),
+            ));
+        };
+        let owned = OwnedProcess {
+            role: "core".into(),
+            pid,
+            exe,
+            created,
+            started_at_unix_ms: now_ms(),
+        };
+        write_atomic(
+            &self.owned_path(),
+            &serde_json::to_vec_pretty(&owned).expect("serializes"),
+        )
+        .map_err(|e| CoreError::new("IO_WRITE", e.to_string()))?;
+
+        let deadline = Instant::now() + START_TIMEOUT;
+        loop {
+            let ready = preflight::check(evidence, &self.ports.all(), Some(&owned))
+                .map(|r| r.iter().all(|(_, s)| *s == PortState::Ours))
+                .unwrap_or(false)
+                && matches!(
+                    http_get_local(self.ports.controller, "/version", Some(&secret)),
+                    Ok((200, _))
+                );
+            if ready {
+                return Ok(owned);
+            }
+            if Instant::now() >= deadline || !still_ours(&owned) {
+                let _ = terminate(&owned);
+                self.clear_runtime_files();
+                return Err(CoreError::new(
+                    "CORE_START_TIMEOUT",
+                    format!(
+                        "core did not become ready within {}s; see {}",
+                        START_TIMEOUT.as_secs(),
+                        self.log_path().display()
+                    ),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+
+    /// Stop the recorded core, wait for its ports to close, delete the generated configuration.
+    pub fn down(&self, evidence: &dyn WriterEvidence) -> Result<bool, CoreError> {
+        let core = self.down_core(evidence);
+        // The relay goes after the core, the reverse of the start order.
+        let relay = self.stop_relay();
+        let stopped = core?;
+        relay?;
+        Ok(stopped)
+    }
+
+    fn down_core(&self, evidence: &dyn WriterEvidence) -> Result<bool, CoreError> {
+        let Some(owned) = self.owned() else {
+            self.clear_runtime_files();
+            return Ok(false);
+        };
+        let was_running = still_ours(&owned);
+        terminate(&owned)?;
+        let deadline = Instant::now() + STOP_TIMEOUT;
+        while Instant::now() < deadline {
+            let held = preflight::check(evidence, &self.ports.all(), Some(&owned))
+                .map(|r| r.iter().any(|(_, s)| *s == PortState::Ours))
+                .unwrap_or(true);
+            if !held {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        self.clear_runtime_files();
+        Ok(was_running)
+    }
+
+    pub fn status(&self, evidence: &dyn WriterEvidence) -> CoreStatus {
+        let owned = self.owned();
+        let alive = owned.as_ref().is_some_and(still_ours);
+        let ports = match preflight::check(evidence, &self.ports.all(), owned.as_ref()) {
+            Ok(r) => r
+                .into_iter()
+                .map(|(p, s)| {
+                    let d = match s {
+                        PortState::Free => "free".to_string(),
+                        PortState::Ours => "ours".to_string(),
+                        PortState::Foreign(o) => {
+                            format!("foreign pid {} ({})", o.pid, o.exe.unwrap_or_default())
+                        }
+                    };
+                    (p, d)
+                })
+                .collect(),
+            Err(e) => vec![(0, format!("probe failed: {e}"))],
+        };
+        let version = if alive {
+            fs::read_to_string(self.config_path())
+                .ok()
+                .and_then(|t| secret_from(&t))
+                .and_then(|s| http_get_local(self.ports.controller, "/version", Some(&s)).ok())
+                .map(|(_, body)| body.trim().to_string())
+        } else {
+            None
+        };
+        let relay = self.relay_owned();
+        let relay_alive = relay.as_ref().is_some_and(still_ours);
+        CoreStatus {
+            binary: self.binary_state(),
+            owned,
+            alive,
+            ports,
+            version,
+            relay,
+            relay_alive,
+        }
+    }
+}
+
+/// Read a file fully; used by tests and the dev command line.
+pub fn read_text(path: &Path) -> Option<String> {
+    let mut s = String::new();
+    File::open(path).ok()?.read_to_string(&mut s).ok()?;
+    Some(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::windows::WindowsHost;
+    use std::net::TcpListener;
+
+    fn temp_manager(tag: &str) -> (CoreManager, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "aec-core-{tag}-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..");
+        let mut m = CoreManager::dev(&repo, &root);
+        m.bin = crate::paths::strip_verbatim(&m.bin.canonicalize().unwrap_or(m.bin.clone()));
+        (m, root)
+    }
+
+    #[test]
+    fn dechunks_bodies() {
+        assert_eq!(dechunk("4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n"), "Wikipedia");
+    }
+
+    #[test]
+    fn reads_secret_line() {
+        assert_eq!(
+            secret_from("a: 1\nsecret: \"abc\"\n").as_deref(),
+            Some("abc")
+        );
+    }
+
+    /// PORT_IN_USE: a port held by another process is reported, and that process keeps its port.
+    #[test]
+    fn foreign_listener_blocks_start_and_survives() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (mut m, root) = temp_manager("busy");
+        m.ports = CorePorts {
+            mixed: port,
+            controller: port,
+            dns: port,
+            relay: 0,
+        };
+        if m.binary_state() != BinaryState::Ok {
+            // Without the binary the check stops earlier; exercise preflight directly instead.
+            let r = preflight::check(&WindowsHost, &[port], None).unwrap();
+            assert!(matches!(r[0].1, PortState::Foreign(_)));
+        } else {
+            let err = m
+                .up(&WindowsHost, |p, s| {
+                    Ok(config::direct_test(p, s, "agent-egress"))
+                })
+                .unwrap_err();
+            assert_eq!(err.code, "PORT_IN_USE", "{err}");
+        }
+        assert!(listener.local_addr().is_ok());
+        assert!(
+            TcpStream::connect(("127.0.0.1", port)).is_ok(),
+            "the foreign listener must still accept"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Full cycle against the real binary on alternative ports. Needs `runtime/bin/aec-mihomo.exe`
+    /// (`aec-dev core install <exe>`); run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore = "needs runtime/bin/aec-mihomo.exe"]
+    fn starts_and_stops_direct_test_core() {
+        let (mut m, root) = temp_manager("cycle");
+        m.ports = CorePorts {
+            mixed: 27893,
+            controller: 27909,
+            dns: 27553,
+            relay: 27325,
+        };
+        assert_eq!(m.binary_state(), BinaryState::Ok);
+        let owned = m
+            .up(&WindowsHost, |p, s| {
+                Ok(config::direct_test(p, s, "agent-egress"))
+            })
+            .unwrap();
+        let st = m.status(&WindowsHost);
+        assert!(
+            st.alive && st.ports.iter().all(|(_, s)| s == "ours"),
+            "{st:?}"
+        );
+        assert!(
+            st.version.as_deref().is_some_and(|v| v.contains("version")),
+            "{st:?}"
+        );
+        let again = m
+            .up(&WindowsHost, |_, _| Err("must not regenerate".into()))
+            .unwrap();
+        assert_eq!(
+            again.pid, owned.pid,
+            "a running core is adopted, not started twice"
+        );
+        assert!(m.down(&WindowsHost).unwrap());
+        assert!(
+            !m.config_path().exists(),
+            "the generated config (with its secret) is deleted"
+        );
+        let st = m.status(&WindowsHost);
+        assert!(
+            !st.alive && st.ports.iter().all(|(_, s)| s == "free"),
+            "{st:?}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+}

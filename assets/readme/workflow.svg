@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="330" viewBox="0 0 1200 330" role="img" aria-labelledby="title desc">
+  <title id="title">一次 Agent 会话的四步</title>
+  <desc id="desc">设置出口（只做一次）→ 进入 Agent 模式：先拍快照，启动本机内核和 relay，按设置改时区，跑检测 → 从托盘打开浏览器或 CLI，它们的信号也纳入检测 → 退出：关掉它打开的浏览器，时区改回快照值并读回确认，停止内核。</desc>
+
+  <rect width="1200" height="330" rx="24" fill="#f4f5f2"/>
+
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei UI', 'PingFang SC', sans-serif">
+    <!-- step 1 -->
+    <g transform="translate(48 48)">
+      <rect width="246" height="234" rx="18" fill="#ffffff" stroke="#d5dad6"/>
+      <circle cx="36" cy="40" r="15" fill="#ffffff" stroke="#d5dad6"/><circle cx="36" cy="40" r="11" fill="#8a918d"/>
+      <text x="62" y="47" font-size="24" font-weight="700" fill="#17201b">1 设置出口</text>
+      <text x="24" y="100" font-size="20" fill="#2b3530">地址、端口、账号</text>
+      <text x="24" y="134" font-size="20" fill="#2b3530">目标时区和语言</text>
+      <text x="24" y="190" font-size="18" fill="#5d6862">密码进凭据管理器</text>
+      <text x="24" y="216" font-size="18" fill="#5d6862">只做一次</text>
+    </g>
+    <path d="M302 165 H330" stroke="#2e9d5b" stroke-width="3"/><path d="M324 157 L334 165 L324 173" fill="none" stroke="#2e9d5b" stroke-width="3"/>
+
+    <!-- step 2 -->
+    <g transform="translate(342 48)">
+      <rect width="246" height="234" rx="18" fill="#ffffff" stroke="#d5dad6"/>
+      <circle cx="36" cy="40" r="15" fill="#ffffff" stroke="#d5dad6"/><circle cx="36" cy="40" r="11" fill="#e0a100"/>
+      <text x="62" y="47" font-size="24" font-weight="700" fill="#17201b">2 进入</text>
+      <text x="24" y="100" font-size="20" fill="#2b3530">先拍环境快照</text>
+      <text x="24" y="134" font-size="20" fill="#2b3530">启动内核和 relay</text>
+      <text x="24" y="168" font-size="20" fill="#2b3530">按设置改时区</text>
+      <text x="24" y="216" font-size="18" fill="#5d6862">然后跑检测</text>
+    </g>
+    <path d="M596 165 H624" stroke="#2e9d5b" stroke-width="3"/><path d="M618 157 L628 165 L618 173" fill="none" stroke="#2e9d5b" stroke-width="3"/>
+
+    <!-- step 3 -->
+    <g transform="translate(636 48)">
+      <rect width="246" height="234" rx="18" fill="#ffffff" stroke="#d5dad6"/>
+      <circle cx="36" cy="40" r="15" fill="#ffffff" stroke="#d5dad6"/><circle cx="36" cy="40" r="11" fill="#2e9d5b"/>
+      <text x="62" y="47" font-size="24" font-weight="700" fill="#17201b">3 使用</text>
+      <text x="24" y="100" font-size="20" fill="#2b3530">托盘打开 Edge、</text>
+      <text x="24" y="134" font-size="20" fill="#2b3530">Chrome、Claude Code</text>
+      <text x="24" y="168" font-size="20" fill="#2b3530">或 Codex</text>
+      <text x="24" y="216" font-size="18" fill="#5d6862">浏览器信号也纳入检测</text>
+    </g>
+    <path d="M890 165 H918" stroke="#2e9d5b" stroke-width="3"/><path d="M912 157 L922 165 L912 173" fill="none" stroke="#2e9d5b" stroke-width="3"/>
+
+    <!-- step 4 -->
+    <g transform="translate(930 48)">
+      <rect width="222" height="234" rx="18" fill="#17201b"/>
+      <circle cx="36" cy="40" r="15" fill="#ffffff"/><circle cx="36" cy="40" r="11" fill="#8a918d"/>
+      <text x="62" y="47" font-size="24" font-weight="700" fill="#ffffff">4 退出</text>
+      <text x="24" y="100" font-size="20" fill="#e6ebe8">关掉它开的浏览器</text>
+      <text x="24" y="134" font-size="20" fill="#e6ebe8">时区改回并读回确认</text>
+      <text x="24" y="168" font-size="20" fill="#e6ebe8">停止内核</text>
+      <text x="24" y="216" font-size="18" fill="#a9b4ae">注销关机前也会自动做</text>
+    </g>
+  </g>
+</svg>

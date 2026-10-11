@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = ["crates/aec-core", "crates/aec-dev", "crates/aec-tray"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_Networking_WinInet",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_NetworkManagement_Ndis",
+  "Win32_Networking_WinHttp",
+  "Win32_Networking_WinSock",
+  "Win32_Security",
+  "Win32_Security_Credentials",
+  "Win32_Security_Cryptography",
+  "Win32_Graphics_Gdi",
+  "Win32_System_DataExchange",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Ole",
+  "Win32_UI_Shell",
+  "Win32_System_Console",
+  "Win32_System_Environment",
+  "Win32_System_Memory",
+  "Win32_System_Registry",
+  "Win32_System_Threading",
+  "Win32_System_Time",
+  "Win32_UI_WindowsAndMessaging",
+] }

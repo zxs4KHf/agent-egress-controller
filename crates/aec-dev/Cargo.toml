@@ -1,0 +1,20 @@
+[package]
+name = "aec-dev"
+description = "Development command line for the Agent Egress Controller core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "aec-dev"
+path = "src/main.rs"
+
+[[bin]]
+name = "aec-relay"
+path = "src/relay_main.rs"
+
+[dependencies]
+aec-core = { path = "../aec-core" }
+serde.workspace = true
+serde_json.workspace = true

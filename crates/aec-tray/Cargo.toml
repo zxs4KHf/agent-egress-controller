@@ -1,0 +1,18 @@
+[package]
+name = "aec-tray"
+description = "Agent Egress Controller tray application (first usable version)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "aec-tray"
+path = "src/main.rs"
+
+[dependencies]
+aec-core = { path = "../aec-core" }
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
