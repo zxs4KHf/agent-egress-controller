@@ -55,6 +55,6 @@ select 组导入后可从托盘选择成员，仅 switchable: true 会显示选�
 
 升级先退出旧程序并恢复，备份 data，将新 zip 解压到新目录，再复制需要保留的数据。旧模板档案在读取时转换，保存才更新。换用户或机器需重新填写密码，credentialRef 不能替代跨机器密码。
 
-给其他用户交付全新 zip、SHA256SUMS、无私人凭据的路由示例和自己的服务说明。不要交付维护者 data、浏览器 profile、日志、快照、真实出口或带密码 YAML。仓库 `crates/aec-core/tests/fixtures/routing.yaml` 是纯合成示例，不能直接联网。
+给其他用户交付全新 zip、SHA256SUMS、无私人凭据的路由示例和自己的服务说明。不要交付维护者 data、浏览器 profile、日志、快照、真实出口或带密码 YAML。内核/relay 启动时会使用临时凭据配置，正常退出会清理；崩溃后需先恢复，不能把运行中的 core 目录当作无敏感信息的示例。仓库 `crates/aec-core/tests/fixtures/routing.yaml` 是纯合成示例，不能直接联网。
 
 卸载前退出并完成恢复，再删目录；凭据条目以 AgentEgressController: 开头，可手动清理。排查提示词只复制、不自动发送，分享前自行决定是否遮盖 IP。
