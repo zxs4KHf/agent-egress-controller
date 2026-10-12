@@ -1,157 +1,58 @@
-# 任务说明：给托盘加「Claude 桌面版」入口
+# Issue #1：Claude 桌面版遵循 ISP 出口与分流
 
-> 写给接手这个任务的 AI Agent（Codex、Claude Code 等）和它的使用者。照着做完、验证通过后，用 Pull Request 提交到 `zxs4KHf/agent-egress-controller`。
+## 目标和范围
 
-## 0. 背景
+2026-10-12 维护者明确确认：**不需要「打开 Claude 桌面版」入口，只需正常使用的 Claude 桌面版遵循 ISP 出口和现有分流规则。** 本文件保留原路径供 [Issue #1](https://github.com/zxs4KHf/agent-egress-controller/issues/1) 的链接使用；标题和范围以本版本为准。
 
-0.1.0 能从托盘打开 Edge、Chrome、Claude Code（终端）和 Codex（终端），让它们走用户配置的出口。**Claude 桌面版（Windows）还没有入口**：它不是浏览器，也不是命令行。0.1.0 又不改系统代理（见 `docs/adr/0004-*.md` 和 `docs/ROADMAP.md`），所以直接双击打开的桌面版不会走出口。
+0.2.0 已实现可选 Windows 系统代理接管、按项接管门、G6、退出恢复和外部改写告警。需要桌面应用接入时开启接管，让遵循系统代理的请求进入同一个 mihomo mixed-port、同一张数据路由表。配置用户自己的 ISP 出口，必要时通过 IPRoyal 官方中转连接这个出口，不能把中转 IP 当作最终出口。
 
-目标：在托盘的 Agent 模式菜单里加一项「打开 Claude 桌面版」，打开的桌面版走出口，并且时区、语言和其他入口一致；退出 Agent 模式时，按现有规则处理它。
+不新增 Entry::App、默认入口迁移、Claude 启动/退出管理或代理启动参数；不要求关闭现有 Claude，不修改 Claude 的文件、配置和全局环境变量。已有 Edge/Chrome/CLI 入口行为保持原有约束。不能结束非本应用启动的进程，也不能绕过接管门改系统代理。
 
-**范围外**：系统代理接管（路线图 0.3），以及任何修改 Claude 桌面版安装文件或配置文件的做法。
+## 实现
 
-## 1. 先读
+- 系统接入和分流复用现有 0.2.0 能力，不另建代理链。
+- 内置分流的附加域名建议包含 `anthropic.com`、`claude.ai`、`claude.com`、`claudeusercontent.com`，覆盖子域名。AI 规则先于国内规则和 MATCH。导入表保持原顺序/选择，不自动插入规则。
+- 增加 R11 只读桌面流量核验。Windows TCP 表读取 → 已验证自有内核 `GET /connections` → 再读 TCP 表；稳定的客户端源 IP/端口、入站端口、PID/创建时间/可执行路径共同归属桌面连接。
+- 只读核验检查实际出站链符合路由数据和显式 select 成员；Claude 服务域名走 DIRECT/REJECT 告警。空闲、无归属、已关闭连接、IP-only、无法判定的 Geo/IP 规则、未知安装形态或读取失败均未知。
+- R11 显示在托盘完整报告和排查提示词；`aec-dev desktop check [--json] [--data-dir <目录>]` 可独立运行，只读且不更新状态/日志。通过退出码 0，警告/未知为 1，参数错误为 2。
+- 至少观测到一个 Claude 服务域名且所有稳定样本可核验才通过。R11 不参与绿灯硬门槛，也不证明所有请求均走代理。实际 ISP 身份和出口 IP 仍结合 G1/G2，精确预期 IP 按档案严格比较。
 
-按顺序读，读完再动手：
+对应代码：`crates/aec-core/src/desktop.rs`、`windows.rs`、`core/process.rs`、`live.rs`，以及 `aec-dev/src/main.rs`、托盘和排查提示词文字。完整用户步骤见 [USER-GUIDE.md](../USER-GUIDE.md#claude-桌面版接入与核验)。发布的 0.2.0 zip 没有新增 R11/命令；源码和下一版本包含。
 
-1. [AGENTS.md](../../AGENTS.md)：硬规则和提交前检查。**必须遵守。**
-2. [CONTEXT.md](../../CONTEXT.md)：术语，尤其是「入口」「接管门」「外部写入者」。
-3. [docs/SPEC.md](../SPEC.md)：4.4 状态机（E5 启动入口，X1 关闭入口），4.5 环境验收。
-4. 代码：
-   - `crates/aec-core/src/profile.rs`：`Entry` 枚举、默认档案、`validate`；
-   - `crates/aec-core/src/entries.rs`：浏览器的参数、实例判定 `decide`、`LaunchRecord`；
-   - `crates/aec-core/src/live.rs`：`launch_browser`、`launch_cli`、`close_entry`、`spawn_detached`；
-   - `crates/aec-core/src/controller.rs`：`open_entry`、`full_report` 怎么区分浏览器入口；
-   - `crates/aec-tray/src/text.rs`：`entry_label`（菜单文字）。
+## 已验证与待验收
 
-## 2. 第一步：先手工验证可行性（不写代码）
+**[已验证]** 本机安装 Claude 2.31226.1，采用 `AnthropicClaude/app-2.31226.1/claude.exe` 的安装形态。仅检查过版本、进程与软件网络代码，没有修改应用。该事实不等于真实消息经本程序 ISP 出口的验收。
 
-Claude 桌面版是 Electron 应用。**[推断]** Electron 支持 Chromium 的 `--proxy-server`、`--proxy-bypass-list`、`--lang` 命令行开关，所以可以像浏览器一样，在启动参数里指定代理。这一点必须先实测，结论决定后面怎么做。
+**[已验证]** 单元测试覆盖 API 走固定出口与非 AI DIRECT、内核探测/Claude Code 不冒充桌面证据、源端口/入站/源 IP 不符、进程身份复用、已关闭连接、选择切换后的旧连接、IP-only、Geo/IP 不确定和读取失败。接管/恢复/外部冲突继续由 FakePlatform/FakeHost 测试覆盖。
 
-已知安装形态（Squirrel，按当前用户安装）：
+**[已验证]** `desktop_connection_snapshot_correlates_with_native_tcp_identity` 使用 pinned mihomo 和本地假目标，真实关联 `GET /connections` 与 Windows TCP 进程创建身份；测试进程不会被识别为 Claude 桌面版。测试不改全局状态、不访问 Anthropic、不发送真实消息。
 
-```
-%LOCALAPPDATA%\AnthropicClaude\
-├── claude.exe          ← 启动器：启动后马上退出，不能拿它的 pid 做跟踪
-├── Update.exe
-└── app-<版本号>\claude.exe   ← 真正的程序，可能有多个版本目录，取版本号最大的
-```
+**[待验收]** 普通 Windows 10/11 用户机器上，接管门允许系统代理 → G6 通过 → 用户正常操作 Claude → R11 有真实桌面连接且符合规则 → G1/G2 确认配置的 ISP 出口 → 退出读回恢复。不能把本地假目标测试写成真实 Claude 对话实测。遇到旧连接池，用户可以自行重连或退出重开，本程序不代操作。
 
-步骤：
+## 交付检查
 
-1. 下载 Release 里的便携版（或从源码 `cargo run -p aec-tray`），设置好自己的出口，从托盘「进入 Agent 模式」。
-2. **完全退出** Claude 桌面版：包括托盘里的 Claude 图标。确认任务管理器里没有 `claude.exe`。
-3. 在 PowerShell 里手动启动（`$app` 换成版本号最大的目录）：
-   ```powershell
-   $app = Get-ChildItem "$env:LOCALAPPDATA\AnthropicClaude" -Directory -Filter 'app-*' | Sort-Object { [version]($_.Name -replace '^app-') } | Select-Object -Last 1
-   & "$($app.FullName)\claude.exe" --proxy-server=http://127.0.0.1:17893 --proxy-bypass-list="<-loopback>;127.0.0.1;localhost" --lang=en-US
-   ```
-4. 在桌面版里发一条消息。然后看内核日志（托盘「打开数据和日志目录」→ `logs\core-<日期>.log`），找 `claude.ai` 和 `anthropic.com` 的连接：
-   - 应该看到 `using agent-egress[relay]`，说明走了出口；
-   - 如果只有 `DIRECT`，或者完全没有这些域名，说明没走代理。
-5. 记录结果（这些是 PR 里要写的证据）：
-   - Claude 版本号（`app-` 后面的数字）；
-   - 日志里命中的几行；
-   - 桌面版能否正常登录和对话。
-
-**判定**：
-
-- **走了出口** → 做第 3 节（方案 A）。
-- **没走出口** → 不要写代码硬改。去 Issue 里报告实测结果（命令、日志、版本号），等维护者决定。在 0.3 系统代理接管做出来之前，临时办法见第 6 节。
-
-## 3. 方案 A：实现桌面应用入口
-
-### 3.1 档案（`profile.rs`）
-
-- `Entry` 新增一个变体，例如：
-  ```rust
-  #[serde(rename_all = "camelCase")]
-  App { id: String, app: DesktopApp, #[serde(default)] extra_args: Vec<String> }
-  ```
-  `DesktopApp` 先只有 `Claude`（序列化为 `"claude"`）。保持 `deny_unknown_fields`。
-- 默认档案（`ProfileSet::default`）在 `codex-cli` 后面加一项 `{ "type": "app", "id": "claude-desktop", "app": "claude" }`。
-- **老用户兼容**：已有的 `profiles.json` 里没有这一项。加载档案时，缺少的默认入口要补进去：只补缺失的 id，不改用户已有的项。补齐逻辑写成纯函数并配测试，放在 `store.rs` 或 `profile.rs`。
-- 更新 `validate` 和已有测试（JSON 往返、字段错误）。
-
-### 3.2 定位和启动（`entries.rs` + `live.rs`）
-
-- 定位写成纯函数：输入是 `%LOCALAPPDATA%` 和「列目录」闭包，输出是 `app-*` 里版本号最大的 `claude.exe`。用假目录测试：没有安装、只有启动器、多个版本、版本号比较（`2.10.0` 大于 `2.9.0`）。
-- 参数写成纯函数并测试：
-  - `--proxy-server=http://127.0.0.1:<mixed 端口>`；
-  - `--proxy-bypass-list=<profile.proxy_scope.bypass 用分号拼接>`；
-  - `--lang=<profile.locale.browser_lang>`；
-  - 最后追加 `extra_args`。
-- 环境变量：照 CLI 入口的做法注入 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY`（复用 `cli::entry_env`）。这样桌面版的 Node 部分发出的请求也走出口。
-- **已在运行的实例**：Electron 是单实例，已有实例时，新启动会把参数交给旧实例然后退出，代理参数就失效了。处理方式和浏览器一样：
-  - 发现有不是本应用启动的 `claude.exe` 在运行时，返回 `ENTRY_BUSY`，提示用户先完全退出 Claude（包括托盘图标）；
-  - **绝不替用户关掉它。**
-  - 判断方法：按进程映像路径匹配 `AnthropicClaude\app-*\claude.exe`。
-- 用 `spawn_detached`（标准输入输出置空，不继承句柄）启动真正的 `app-*\claude.exe`，**不要用启动器**。记录 `OwnedProcess`，role 用 `entry:app:<id>`。
-- 找不到安装时返回 `ENTRY_NOT_INSTALLED`，消息里说明「不会自动下载」。
-
-### 3.3 退出时关闭（`live.rs::close_entry`）
-
-- 和浏览器一样：只对自己启动、并且身份核对一致（pid 加创建时间）的进程发 WM_CLOSE，等它退出，**不强杀**。
-- Electron 的主窗口关了，进程可能还留在托盘里。等不到退出时返回 `ENTRY_STILL_RUNNING`，让用户自己退出。不要升级成结束进程。
-
-### 3.4 检测（`controller.rs::full_report`）
-
-- 桌面版没有检查页，所以**不产生** G5 和 R3–R5。这和 CLI 入口一样。确认 `is_browser` 的判断不会把 `App` 当成浏览器，否则会一直等 30 秒的浏览器报告。
-- G1–G4 不变：G1–G3 是内核层面的检测，桌面版走同一个内核；G4 看系统时区，桌面版直接使用系统时区。
-
-### 3.5 托盘文字（`aec-tray/src/text.rs`）
-
-- `entry_label` 给 `App { app: Claude }` 返回「打开 Claude 桌面版」。
-- 已有的 `match` 都要覆盖新变体，编译器会提示漏掉的地方。
-
-### 3.6 文档
-
-- `docs/SPEC.md` 4.4/4.5：写明桌面应用入口的启动、实例判定、关闭规则，以及它不参与 G5。
-- `CONTEXT.md`：「入口」词条补上桌面应用。
-- `CHANGELOG.md` 的「未发布」：新增「Claude 桌面版入口」。
-- README 的「它怎么工作」里，入口列表加上 Claude 桌面版。
-
-## 4. 验证（PR 里逐条给证据）
-
-在仓库根目录：
-
-```bash
+```powershell
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+cargo test -- --include-ignored
 ```
 
-真机验证（在 PR 里写成 **[已验证]**，附命令输出、日志片段或截图；**截图和日志里的出口 IP 要打码**）：
+真实内核测试需已有 `runtime/bin/aec-mihomo.exe` v1.19.31，SHA256 与 pin 一致；不自动下载。PR 区分 [已验证]、[推断]/[待验收]，CI 通过后交付。回滚只需撤回新增只读核验/文档，档案格式与接管/恢复逻辑没有改变。
 
-1. 先完全退出 Claude，然后：进入 Agent 模式 →「打开 Claude 桌面版」→ 能登录、能对话 → 内核日志里 `claude.ai` 和 `anthropic.com` 都是 `using agent-egress[relay]`。
-2. Claude 已经开着的时候点这个菜单：提示先退出 Claude，并且**没有关掉它**。
-3. 退出 Agent 模式：桌面版被关闭；如果关不掉，提示用户自己退出。之后没有残留的 aec 进程。
-4. 用 0.1.0 的旧 `profiles.json` 启动：菜单里出现新入口，用户原来的入口和设置没有被改动。
-5. 没装 Claude 桌面版的机器（或临时改名安装目录）：提示「未安装，不会自动下载」。
+**[已验证，2026-10-12]** `cargo fmt --all --check` 和 `cargo clippy --all-targets -- -D warnings` 退出码 0；`cargo test` 共 170 项通过、5 项忽略；`cargo test -- --include-ignored` 共 175 项通过、0 失败。`cargo run -p aec-dev --bin aec-dev -- desktop check --json` 在没有自有内核的当前数据目录返回 `R11: unknown / owned_core_unavailable`、退出码 1，运行前后数据文件 SHA256 和系统代理注册表五项对比均未变化。这是只读命令验收，不是真实 Claude 消息出口验收。
 
-做不到的项写成 **[推断]** 并说明原因，不要省略。
+## 被废弃的旧方案及原因
 
-## 5. 提交
+- 专用菜单与 `--proxy-server` 启动：维护者明确不需要启动入口，普通启动应用接入系统代理已经是本次目标。
+- Entry::App、默认入口迁移、owned 进程和 WM_CLOSE：本次不管理 Claude 生命周期，不能取得现有进程的关闭权。
+- 以健康内核探测/G6 配置就判桌面通过：没有应用来源证据，违反「不伪造通过」。
+- 为保证所有子组件而改 Claude 配置、全局代理变量或使用 TUN：超出项目边界；独立 Node/MCP/Cowork 路径必须另行验收。
 
-1. Fork `zxs4KHf/agent-egress-controller`，从 `main` 开分支 `feat/claude-desktop-entry`。
-2. 提交信息用英文祈使句，例如 `Add a Claude desktop app entry`。一个 PR 只做这一件事。
-3. 开 Pull Request 到 `main`：
-   - 按模板写清「改了什么 / 为什么 / 怎么验证 / 怎么回滚」；
-   - 关联对应的 Issue；
-   - CI 必须是绿的。
-4. **不要提交**：
-   - 自己的出口地址、账号、密码；
-   - `data\` 目录、日志、`runtime\`；
-   - 没打码的截图；
-   - mihomo 二进制。
+## 一手来源与边界
 
-## 6. 临时办法（方案 A 实测不可行时）
+- [Electron ProxyConfig](https://www.electronjs.org/docs/latest/api/structures/proxy-config)：system 模式读取操作系统配置；应用的代理配置和命令行参数可改变行为，不能据此断言特定 Claude 版本的每个子组件都遵循系统代理。
+- [Electron setProxy](https://www.electronjs.org/docs/latest/api/session#sessetproxyconfig)：代理切换后连接池可能沿用旧代理。
+- [mihomo v1.19.31 connections API](https://github.com/MetaCubeX/mihomo/blob/v1.19.31/hub/route/connections.go)、[Metadata](https://github.com/MetaCubeX/mihomo/blob/v1.19.31/constant/metadata.go)、[TrackerInfo](https://github.com/MetaCubeX/mihomo/blob/v1.19.31/tunnel/statistic/tracker.go)：只读当前连接快照、源/入站端口与出站链。无需启用内核的全局进程扫描。
 
-在 0.3 系统代理接管做出来之前，可以手动设置系统代理：
-
-1. 进入 Agent 模式。
-2. Windows「设置 → 网络和 Internet → 代理 → 手动设置代理」，地址填 `127.0.0.1`，端口填 `17893`，打开。
-3. 正常打开 Claude 桌面版使用。
-4. **用完先关掉这个手动代理，再退出 Agent 模式。** 否则退出后所有软件都连不上网，因为本机代理已经停了。
-
-注意：这样做的时候，电脑上**所有**遵守系统代理的软件都会走出口。本程序不会帮你恢复这个手动设置，也不会检测到它。这正是 0.1.0 不自动做这件事的原因。
+来源核对日期：2026-10-12。Squirrel 形态之外的 Windows Store/MSIX 版本暂不做 R11 归属；不代表它不能走系统代理，只代表本程序没有该形态的身份验收证据。

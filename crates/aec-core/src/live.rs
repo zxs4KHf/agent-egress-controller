@@ -1,8 +1,7 @@
 //! The real machine behind the [`Platform`] trait (Windows).
 //!
-//! Real global writes: the time zone only, and only when the controller calls `write_global`,
-//! which it does behind an open takeover gate. The system proxy is never written in this version
-//! (explicit-only scope); its writer arrives with ticket 16.
+//! Real global writes: time zone and optional system proxy, only when the controller calls
+//! `write_global` behind the per-item takeover gate.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -391,7 +390,13 @@ impl Platform for LivePlatform {
             system_dns: crate::windows::system_dns_servers().map_err(|e| e.to_string()),
             generated_at: rfc3339_utc(self.now_ms() / 1000),
         };
-        checks::run(&input, &crate::http::WinHttpClient)
+        let mut report = checks::run(&input, &crate::http::WinHttpClient);
+        report.results.push(crate::desktop::observe(
+            profile,
+            self.core.ports.mixed,
+            &crate::desktop::WindowsDesktopProbe(&self.core),
+        ));
+        report
     }
 
     fn launch_entry(&self, profile: &AgentProfile, entry_id: &str) -> Result<OwnedProcess, Fault> {

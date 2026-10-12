@@ -1681,6 +1681,31 @@ mod tests {
     }
 
     #[test]
+    fn desktop_system_scope_needs_no_entry_and_restores_without_closing_foreign_apps() {
+        let d = tmp("desktop-scope");
+        let p = FakePlatform::new();
+        p.entries.borrow_mut().push(999); // Represents a user's already-running desktop app.
+        let before = p.host.borrow().proxy.clone();
+        let mut c = open(p, &d, true);
+        let prof = system_scope();
+        let out = c.enter(&prof, EnterOptions::default()).unwrap();
+        assert_eq!(g6(out.report.as_ref().unwrap()).status, Status::Pass);
+        assert!(c
+            .state()
+            .journal
+            .iter()
+            .all(|j| !matches!(j, JournalEntry::Entry { .. })));
+        assert_eq!(
+            c.platform().host.borrow().proxy.proxy_server.as_deref(),
+            Some("127.0.0.1:17893")
+        );
+        let restored = c.exit().unwrap();
+        assert_eq!(restored.mode_after, Mode::Daily);
+        assert_eq!(c.platform().host.borrow().proxy, before);
+        assert_eq!(*c.platform().entries.borrow(), vec![999]);
+    }
+
+    #[test]
     fn external_proxy_change_is_reported_without_competing_writes() {
         let d = tmp("keep");
         let mut c = open(FakePlatform::new(), &d, true);

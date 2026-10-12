@@ -49,6 +49,39 @@ select 组导入后可从托盘选择成员，仅 switchable: true 会显示选�
 
 桌面应用是否遵循 Windows 系统代理由应用决定。需要时开启接管；接管门要求显式开启、快照可用、该项无外部写入者，阻止时 G6 为未知。全局代理改写只告警并撤销就绪，不自动抢回；处理冲突后退出并重新进入。
 
+### Claude 桌面版接入与核验
+
+无需托盘启动入口，也不改变 Claude 的安装文件、配置、语言或进程归属。0.2.0 已有系统代理接管；下面的 R11 和 `desktop check` 是源码/下一版本的新增功能，0.2.0 发布包尚未包含。
+
+1. 设置页填写自己的 ISP 出口。需要中转时启用隧道；中转服务器不是最终出口。
+2. 选择「分流」，保留附加域名 `anthropic.com`、`claude.ai`、`claude.com`、`claudeusercontent.com`。`DOMAIN-SUFFIX,anthropic.com` 覆盖 `api.anthropic.com`；仅有 `www.anthropic.com` 不覆盖它。AI 域名规则应先于 GEOSITE/GEOIP 和 MATCH。导入表不会自动补规则或被覆盖，需要自己检查 Claude 域名命中的组、成员和固定 ISP 节点。
+3. 开启「系统代理接管」，进入 Agent 模式，确认 G6 通过。其他代理工具不能同时争抢系统代理；接管门被阻止时按证据处理冲突，本程序不会自动抢回。
+4. 正常打开和使用 Claude 桌面版。在有请求或长连接期间点「重新检测」，看 R11 的进程 PID、目标域名、预期出站和实际链。ISP 地址/网络身份用 G1/G2 核对，配置了精确预期 IP 才做严格比对。程序不会替用户发测试消息。
+
+也可在便携目录运行以下只读命令；开发环境改用 `cargo run -p aec-dev --bin aec-dev -- desktop check --json --data-dir <目录>`。必须选择实际托盘使用的 `data`，不是另一个测试目录。
+
+```powershell
+.\aec-dev.exe desktop check --json --data-dir .\data
+```
+
+命令退出码：R11 通过为 0，警告/未知或读取失败为 1，参数错误为 2。它不会写状态、日志、系统设置，不启动、关闭或重启 Claude。托盘完整检测也显示 R11；R11 是只读抽样，不参与绿灯硬门槛。
+
+| R11 结果/原因 | 意义与处理 |
+| --- | --- |
+| 通过 | 至少观测到一个 Claude 服务域名连接，当前稳定样本的域名规则和实际出站链一致；仅该样本有证据，不代表所有请求或 ISP 身份已经证明 |
+| `no_desktop_traffic` 未知 | 未抓到可归属的服务连接；可能空闲、连接已关闭、走别的代理或忽略系统代理，不能据此判定通过或断网 |
+| `owned_core_unavailable` 未知 | 当前目录没有可验证的本应用内核/端口，或连接表不可读取；检查数据目录和 Agent 模式 |
+| `desktop_probe_failed` 未知 | Windows TCP 读取失败；不把失败当作通过 |
+| `desktop_route_unproven` 未知 | 请求只带 IP、域名不可判定，或前置 Geo/IP 规则需要额外匹配证据 |
+| `claude_target_not_proxied` 警告 | 观测到 Claude 服务域名走 DIRECT/REJECT；检查规则顺序和组成员，程序保留自定义表，不自动改路由 |
+| `routing_mismatch` 警告 | 当前出站链不符合档案，或长连接还在使用切换前的 select 成员；核对组选择并让应用重新建立连接 |
+
+核验只读 Windows 的 IPv4 TCP 表和本应用内核的 `GET /connections`。按客户端源 IP/端口匹配，并要求两次 TCP 读取的 PID、可执行文件路径和进程创建时间一致，控制口及 mixed-port 仍由本应用记录的内核持有。支持 `%LOCALAPPDATA%\AnthropicClaude\app-<数字版本>\claude.exe` 的 Windows 安装形态；Claude Code、启动器、其他安装形态及无法读取身份的进程均不冒充桌面版证据。不读取对话正文、请求头、Claude 配置或令牌，不使用过期日志推断 PID。
+
+Electron 的 [系统代理模式](https://www.electronjs.org/docs/latest/api/structures/proxy-config)使用操作系统配置，但应用可自行覆盖；[代理切换说明](https://www.electronjs.org/docs/latest/api/session#sessetproxyconfig)也指出旧连接池可能继续使用旧代理。没有 R11 证据时先核对 G6 和应用代理设置，必要时由用户自行退出并重新打开 Claude。Node、MCP 子进程、Cowork VM 等路径需分别验收，不用全局环境变量、TUN 或修改 Claude 文件来强制接管。
+
+退出 Agent 模式会恢复已接管的系统代理并停止本应用内核，Claude 仍由用户管理。原有长连接不保证随代理设置恢复立即切换；继续使用时让应用重连。
+
 ## 退出、更新与交付
 
 退出会请求关闭本应用启动且身份一致的浏览器，按快照恢复已实际接管的项，停止本应用内核与 relay。CLI 由用户关闭。恢复冲突保留外部状态，失败变红，提供重试或明确接受现状；崩溃后先恢复未完成会话，再删数据。

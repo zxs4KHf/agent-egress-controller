@@ -182,6 +182,7 @@ fn title(id: &str) -> String {
             "R2" => "延迟".into(),
             "R9" => "非目标流量出口".into(),
             "R10" => "时区归属".into(),
+            "R11" => "Claude 桌面版分流（当前连接抽样）".into(),
             other => other.into(),
         },
     }
@@ -199,6 +200,7 @@ fn expectation(id: &str, p: &AgentProfile) -> String {
             "G3" => format!("每个目标域名都以主机名交给内核，并经策略组「{group}」出站；内核 DNS 端口在监听。"),
             "G4" => format!("系统时区为 {}（{}）。", p.locale.timezone.windows_id, p.locale.timezone.iana),
             "R10" => "时区由本应用在本次会话中设置，而不是由其他程序维持。".into(),
+            "R11" => "Claude 桌面版当前连接的进程身份、本机源地址与本应用内核连接表对应；命中的出站链符合档案，Claude 服务域名未走 DIRECT。仅证明观测到的连接，ISP 身份仍须结合 G1/G2；没有连接证据就是未知。".into(),
             "R1" => "两个查询来源给出的出口 ASN 和国家一致，并与档案预期一致。".into(),
             "R2" => "经出口访问目标的中位延迟不超过 1500 ms。".into(),
             _ => "见 docs/SPEC.md 4.5 对该检查项的定义。".into(),

@@ -389,6 +389,44 @@ impl CoreManager {
         Ok(())
     }
 
+    /// Read live connections only from the verified owned core. No credentials or raw API body
+    /// enter error messages; never contact a foreign controller, even for observation.
+    pub fn connections(&self, evidence: &dyn WriterEvidence) -> Result<String, CoreError> {
+        let owned = self
+            .owned()
+            .filter(still_ours)
+            .ok_or_else(|| CoreError::new("CORE_NOT_RUNNING", "no owned core is running"))?;
+        let verify = || {
+            let ports = preflight::check(
+                evidence,
+                &[self.ports.mixed, self.ports.controller],
+                Some(&owned),
+            )
+            .map_err(|_| CoreError::new("PORT_PROBE_FAILED", "cannot verify core ports"))?;
+            if !still_ours(&owned) || !ports.iter().all(|(_, s)| matches!(s, PortState::Ours)) {
+                return Err(CoreError::new(
+                    "PORT_IN_USE",
+                    "core process or ports no longer belong to this session",
+                ));
+            }
+            Ok(())
+        };
+        verify()?;
+        let secret = fs::read_to_string(self.config_path())
+            .ok()
+            .and_then(|s| secret_from(&s))
+            .ok_or_else(|| CoreError::new("CFG_INVALID", "control secret is unavailable"))?;
+        let response = http_get_local(self.ports.controller, "/connections", Some(&secret));
+        verify()?;
+        match response {
+            Ok((200, body)) => Ok(body),
+            _ => Err(CoreError::new(
+                "CORE_OBSERVE_FAILED",
+                "connection snapshot unavailable",
+            )),
+        }
+    }
+
     fn relay_config_path(&self) -> PathBuf {
         self.core_dir().join("relay.json")
     }
@@ -974,6 +1012,121 @@ mod tests {
             secret_from("a: 1\nsecret: \"abc\"\n").as_deref(),
             Some("abc")
         );
+    }
+
+    #[test]
+    fn desktop_observation_never_contacts_a_foreign_controller_or_reused_pid() {
+        use crate::testing::FakeHost;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (mut m, root) = temp_manager("observe-foreign");
+        m.ports.controller = listener.local_addr().unwrap().port();
+        let (exe, created) = process_identity(std::process::id()).unwrap();
+        let mut owned = OwnedProcess {
+            role: "core".into(),
+            pid: std::process::id(),
+            exe: exe.clone(),
+            created,
+            started_at_unix_ms: now_ms(),
+        };
+        let mut host = FakeHost::default();
+        host.listeners.insert(
+            m.ports.mixed,
+            crate::model::ListenerOwner {
+                port: m.ports.mixed,
+                pid: owned.pid,
+                exe: Some(exe),
+            },
+        );
+        host.listeners.insert(
+            m.ports.controller,
+            crate::model::ListenerOwner {
+                port: m.ports.controller,
+                pid: 99999,
+                exe: Some(r"C:\other\mihomo.exe".into()),
+            },
+        );
+        fs::create_dir_all(m.core_dir()).unwrap();
+        fs::write(m.owned_path(), serde_json::to_vec(&owned).unwrap()).unwrap();
+        assert_eq!(m.connections(&host).unwrap_err().code, "PORT_IN_USE");
+        owned.created += 1;
+        fs::write(m.owned_path(), serde_json::to_vec(&owned).unwrap()).unwrap();
+        assert_eq!(m.connections(&host).unwrap_err().code, "CORE_NOT_RUNNING");
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs runtime/bin/aec-mihomo.exe; local sockets and read-only Windows TCP probe"]
+    fn desktop_connection_snapshot_correlates_with_native_tcp_identity() {
+        let (mut m, root) = temp_manager("desktop-observe");
+        m.ports = CorePorts {
+            mixed: 31893,
+            controller: 31909,
+            dns: 31553,
+            relay: 31325,
+            tunnel: 31326,
+        };
+        let result = std::panic::catch_unwind(|| {
+            m.up(&WindowsHost, |ports, secret| {
+                let mut y = config::direct_test(ports, secret, "agent-egress")
+                    .replace("use-hosts: false", "use-hosts: true");
+                // Local-only fake destination, not a request to Anthropic or a real Claude session.
+                y.push_str("hosts:\n  'claude.ai': 127.0.0.1\n");
+                Ok(y)
+            })
+            .unwrap();
+            let destination = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut client = TcpStream::connect(("127.0.0.1", m.ports.mixed)).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            write!(
+                client,
+                "CONNECT claude.ai:{} HTTP/1.1\r\nHost: claude.ai\r\n\r\n",
+                destination.local_addr().unwrap().port()
+            )
+            .unwrap();
+            let mut response = Vec::new();
+            while !response.ends_with(b"\r\n\r\n") {
+                let mut b = [0];
+                client.read_exact(&mut b).unwrap();
+                response.push(b[0]);
+            }
+            assert!(String::from_utf8(response).unwrap().contains("200"));
+            let (_peer, _) = destination.accept().unwrap();
+            let records =
+                crate::desktop::parse_connections(&m.connections(&WindowsHost).unwrap()).unwrap();
+            let local = client.local_addr().unwrap();
+            assert!(records
+                .iter()
+                .any(|c| c.metadata.source_port == local.port().to_string()
+                    && c.metadata.inbound_port == m.ports.mixed.to_string()
+                    && c.metadata.host == "claude.ai"));
+            let flows = crate::windows::desktop_proxy_flows(m.ports.mixed).unwrap();
+            assert!(flows
+                .iter()
+                .any(|f| f.local == local && f.pid == std::process::id() && f.created != 0));
+            let p = crate::profile::ProfileSet::default().agent.remove(0);
+            let r = crate::desktop::observe(
+                &p,
+                m.ports.mixed,
+                &crate::desktop::WindowsDesktopProbe(&m),
+            );
+            assert_eq!(
+                r.status,
+                crate::checks::Status::Unknown,
+                "a test runner is not Claude Desktop"
+            );
+        });
+        let _ = m.down(&WindowsHost);
+        let _ = fs::remove_dir_all(root);
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
     }
 
     /// PORT_IN_USE: a port held by another process is reported, and that process keeps its port.
