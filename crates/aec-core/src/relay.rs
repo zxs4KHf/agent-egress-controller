@@ -27,6 +27,14 @@ pub struct Upstream {
     pub user: Option<String>,
     #[serde(default)]
     pub pass: Option<String>,
+    /// Reach the upstream through this loopback SOCKS5 entrance (the core's tunnel, ADR-0009)
+    /// instead of dialling it directly.
+    #[serde(default)]
+    pub via: Option<String>,
+    /// Per-step wait for this upstream, replacing the pool's connect timeout. Set for tunnelled
+    /// candidates, where every step costs an extra round trip.
+    #[serde(default)]
+    pub step_timeout_ms: Option<u64>,
 }
 
 impl Upstream {
@@ -36,7 +44,12 @@ impl Upstream {
             UpstreamProto::Socks5 => "socks5",
             UpstreamProto::Http => "http",
         };
-        format!("{}:{}({p})", self.host, self.port)
+        let via = if self.via.is_some() {
+            " via tunnel"
+        } else {
+            ""
+        };
+        format!("{}:{}({p}){via}", self.host, self.port)
     }
 }
 
@@ -152,7 +165,8 @@ pub fn dial_pool<S>(
     let deadline = start + budget;
     let mut tried = Vec::new();
     for _ in 0..max_rounds {
-        for i in pool.order(now()) {
+        let order = pool.order(now());
+        for (position, &i) in order.iter().enumerate() {
             if now() + MIN_ATTEMPT_BUDGET >= deadline {
                 tried.push("dial budget exhausted".to_string());
                 return DialOutcome {
@@ -163,7 +177,22 @@ pub fn dial_pool<S>(
                 };
             }
             let t0 = now();
-            match dial(i, deadline) {
+            // A silent encrypted entrance must leave time for the same exit's direct path.
+            // Share the first half among tunnel attempts; the second half remains available to
+            // direct candidates. Pools without direct fallback retain the whole budget.
+            let attempt_deadline = if pool.upstreams[i].via.is_some()
+                && order[position + 1..]
+                    .iter()
+                    .any(|&j| pool.upstreams[j].via.is_none())
+            {
+                start + budget / 2
+            } else {
+                deadline
+            };
+            if now() + MIN_ATTEMPT_BUDGET >= attempt_deadline {
+                continue;
+            }
+            match dial(i, attempt_deadline) {
                 Ok(s) => {
                     pool.note_ok(i);
                     return DialOutcome {
@@ -214,10 +243,13 @@ fn read_exact_staged(
     timeout: Duration,
     stage: &str,
 ) -> io::Result<Vec<u8>> {
-    s.set_read_timeout(Some(timeout.max(Duration::from_millis(1))))?;
+    let read_deadline = Instant::now() + timeout;
     let mut buf = vec![0u8; n];
     let mut got = 0;
     while got < n {
+        s.set_read_timeout(Some(
+            step(timeout, read_deadline)?.max(Duration::from_millis(1)),
+        ))?;
         match s.read(&mut buf[got..]) {
             Ok(0) => {
                 return Err(io::Error::new(
@@ -232,7 +264,30 @@ fn read_exact_staged(
     Ok(buf)
 }
 
+/// A TCP stream to the upstream itself: dialled directly, or opened through the tunnel's loopback
+/// SOCKS5 entrance with no authentication (the entrance is ours and only listens on loopback).
 fn connect_tcp(up: &Upstream, timeout: Duration, deadline: Instant) -> io::Result<TcpStream> {
+    if let Some(via) = &up.via {
+        let addr: SocketAddr = via.parse().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("tunnel entrance {via} is not an address"),
+            )
+        })?;
+        let mut s = TcpStream::connect_timeout(&addr, step(timeout, deadline)?)
+            .map_err(|e| io::Error::new(e.kind(), format!("tunnel entrance {via}: {e}")))?;
+        s.set_nodelay(true)?;
+        s.write_all(&[5, 1, 0])?;
+        let rep = read_exact_staged(&mut s, 2, step(timeout, deadline)?, "tunnel greeting")?;
+        if rep != [5, 0] {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("tunnel entrance answered {rep:02x?} to the greeting"),
+            ));
+        }
+        socks5_request(&mut s, &up.host, up.port, timeout, deadline, "tunnel")?;
+        return Ok(s);
+    }
     let addr: SocketAddr = (up.host.as_str(), up.port)
         .to_socket_addrs()?
         .next()
@@ -240,6 +295,60 @@ fn connect_tcp(up: &Upstream, timeout: Duration, deadline: Instant) -> io::Resul
     let s = TcpStream::connect_timeout(&addr, step(timeout, deadline)?)?;
     s.set_nodelay(true)?;
     Ok(s)
+}
+
+/// Send a SOCKS5 CONNECT for `host:port` (by name) and read the whole reply.
+fn socks5_request(
+    s: &mut TcpStream,
+    host: &str,
+    port: u16,
+    timeout: Duration,
+    deadline: Instant,
+    label: &str,
+) -> io::Result<()> {
+    let hb = host.as_bytes();
+    let mut req = vec![5, 1, 0, 3, hb.len() as u8];
+    req.extend_from_slice(hb);
+    req.extend_from_slice(&port.to_be_bytes());
+    s.write_all(&req)?;
+    let rep = read_exact_staged(
+        s,
+        4,
+        step(timeout, deadline)?,
+        &format!("{label} CONNECT reply"),
+    )?;
+    if rep[1] != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!("{label} SOCKS5 CONNECT failed with code {}", rep[1]),
+        ));
+    }
+    let rest = match rep[3] {
+        1 => 6,
+        4 => 18,
+        3 => {
+            read_exact_staged(
+                s,
+                1,
+                step(timeout, deadline)?,
+                &format!("{label} reply name length"),
+            )?[0] as usize
+                + 2
+        }
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{label} reply ATYP {other}"),
+            ))
+        }
+    };
+    read_exact_staged(
+        s,
+        rest,
+        step(timeout, deadline)?,
+        &format!("{label} CONNECT reply address"),
+    )?;
+    Ok(())
 }
 
 fn base64(input: &[u8]) -> String {
@@ -381,47 +490,13 @@ fn connect_socks5(
                     ));
                 }
             }
-            let hb = host.as_bytes();
-            let mut req = vec![5, 1, 0, 3, hb.len() as u8];
-            req.extend_from_slice(hb);
-            req.extend_from_slice(&port.to_be_bytes());
-            s.write_all(&req)?;
-            let rep = read_exact_staged(
+            socks5_request(
                 &mut s,
-                4,
-                step(timeout, deadline)?,
-                &format!("upstream {label} CONNECT reply"),
-            )?;
-            if rep[1] != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    format!("upstream SOCKS5 CONNECT failed with code {}", rep[1]),
-                ));
-            }
-            let rest = match rep[3] {
-                1 => 6,
-                4 => 18,
-                3 => {
-                    read_exact_staged(
-                        &mut s,
-                        1,
-                        step(timeout, deadline)?,
-                        "upstream reply name length",
-                    )?[0] as usize
-                        + 2
-                }
-                other => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("upstream reply ATYP {other}"),
-                    ))
-                }
-            };
-            read_exact_staged(
-                &mut s,
-                rest,
-                step(timeout, deadline)?,
-                &format!("upstream {label} CONNECT reply address"),
+                host,
+                port,
+                timeout,
+                deadline,
+                &format!("upstream {label}"),
             )?;
             Ok(s)
         })();
@@ -440,6 +515,7 @@ pub fn dial_upstream(
     timeout: Duration,
     deadline: Instant,
 ) -> io::Result<TcpStream> {
+    let timeout = up.step_timeout_ms.map_or(timeout, Duration::from_millis);
     match up.proto {
         UpstreamProto::Http => connect_http(up, host, port, timeout, deadline),
         UpstreamProto::Socks5 => connect_socks5(up, host, port, timeout, deadline),

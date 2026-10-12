@@ -18,10 +18,17 @@ pub struct CorePorts {
     /// The relay's SOCKS5 listener; only used when the core runs a profile (not the DIRECT test).
     #[serde(default = "default_relay_port")]
     pub relay: u16,
+    /// The core's loopback entrance to the tunnel; only listened on when a profile enables one.
+    #[serde(default = "default_tunnel_port")]
+    pub tunnel: u16,
 }
 
 fn default_relay_port() -> u16 {
     17325
+}
+
+fn default_tunnel_port() -> u16 {
+    17326
 }
 
 impl Default for CorePorts {
@@ -31,6 +38,7 @@ impl Default for CorePorts {
             controller: 17909,
             dns: 17553,
             relay: default_relay_port(),
+            tunnel: default_tunnel_port(),
         }
     }
 }

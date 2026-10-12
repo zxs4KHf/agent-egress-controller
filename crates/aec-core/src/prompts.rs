@@ -188,7 +188,7 @@ fn title(id: &str) -> String {
 }
 
 fn expectation(id: &str, p: &AgentProfile) -> String {
-    let group = &p.routing.target_group;
+    let group = p.routing.primary_group_name().unwrap_or("relay");
     match id.split_once(':') {
         Some(("G2", d)) => format!("经本应用内核访问 https://{d}/cdn-cgi/trace 能收到响应，并且它看到的出口 IP 与其他目标一致。"),
         _ => match id {

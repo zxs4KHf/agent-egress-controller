@@ -127,11 +127,16 @@ Controller（Rust，唯一对外的业务入口）
   "schemaVersion": 1, "id": "agent-default", "kind": "agent", "name": "Agent",
   "egress": {
     "candidates": [ { "id": "c1", "host": "…", "port": 12324, "proto": "socks5|http", "credentialRef": "c1|null" } ],
-    "relay": { "connectTimeoutMs": 1200, "dialBudgetMs": 4000, "cooldownMs": 3000, "maxInflight": 3, "maxRounds": 3 },
+    "relay": { "connectTimeoutMs": 1200, "dialBudgetMs": 4000, "cooldownMs": 3000, "maxInflight": 12, "maxRounds": 3 },
     "expected": { "ip": "…|null", "countryCode": "US|null", "asn": 0 }
   },
   "proxyScope": { "mode": "explicit_only | system_and_explicit", "bypass": ["<-loopback>", "127.0.0.1", "localhost"] },
-  "routing": { "targetGroup": "agent-egress", "rulesTemplate": "default-v1" },
+  "routing": {
+    "outbounds": [],
+    "groups": [{"name":"agent-egress", "type":"select", "members":["relay"], "check":null, "switchable":false, "selected":null}],
+    "rules": [{"kind":"domain_suffix", "value":"claude.ai", "target":"agent-egress", "note":null, "noResolve":false}],
+    "final":"agent-egress"
+  },
   "locale": {
     "timezone": { "windowsId": "Eastern Standard Time", "iana": "America/New_York" },
     "browserLang": "en-US", "acceptLanguage": "en-US,en"
@@ -151,6 +156,14 @@ Controller（Rust，唯一对外的业务入口）
 - 浏览器入口默认不加 WebRTC 限制参数（2026-10-10 用户决定）。WebRTC 只由 R3 只读检测并告警；`extraArgs` 允许用户自行添加 `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`，R3 的排查提示词会提到这个选项。
 - 浏览器可执行文件只在标准安装位置和注册表 App Paths 中查找，找不到就报 `ENTRY_NOT_INSTALLED`，不下载。
 - CLI 入口按 PATH 解析，但跳过 legacy `shim` 目录，避免套两层代理；子进程注入 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY`、`NODE_USE_ENV_PROXY=1`，沿用 legacy 已验证的变量集合。
+
+路由完整定义见 ADR-0008/0009：具名 HTTP/SOCKS5/AEAD SS 出站，select/fallback/url-test 组，有序 domain/domain_suffix/domain_keyword/ip_cidr/geosite/geoip 规则与最后兜底。凭据只能用 `credentialRef`；可选 `cipher` 与 `dialerProxy` 用于加密传输链。所有引用校验、共享命名空间、空组与环在启动前检查。预设只创建初始路由数据，旧模板字段只在档案加载迁移处识别。
+
+`egress.tunnel` 可选结构：`{enabled, preset, servers:[{host,port}], cipher, credentialRef, directFallback, stepTimeoutMs}`。这是 relay 候选池的统一加密第一跳，与路由表中的具名传输出站独立。GEOSITE/GEOIP 需要用户提供可信的数据文件；程序不自动下载。直接与隧道路径仍连接用户配置的同一个出口，是否符合预期 IP 以 G1/G2 的真实证据为准。
+
+`aec-dev profile import <yaml>` 只导入路由并迁移凭据，不采用源文件的 DNS、TUN 或监听端口。支持常规块列表规则注释；拒绝未知出站/组字段、provider、UDP 和不支持规则，避免静默改变语义。导入前保存原档案副本，凭据与档案保存失败会清理此次新增凭据。`profile verify` 只读比对出站字段、组及完整规则序列，不存凭据。
+
+托盘列出 `switchable: true` 的 select 组，调用本应用控制口 `PUT /proxies/<group>`。切换前撤销就绪，成功保存 `selected` 并重检，重启内核后恢复选择；现有连接不被强制断开。运行期选择改变后不能沿用旧报告声称就绪。
 
 **DailyProfile**
 
@@ -234,7 +247,7 @@ Controller（Rust，唯一对外的业务入口）
 | --- | --- | --- | --- | --- |
 | G1 `egress.effective` | 经 mixed-port 请求**目标域名自己的** trace，取得 `ipProxy`；标准模式下同时直连 `www.cloudflare.com/cdn-cgi/trace` 取得 `ipDirect` | 取得 `ipProxy`；与 `expected.ip`/`countryCode` 一致（已设置时）；与 `ipDirect` 不同（已取得时） | 与 expected 不一致，或等于 `ipDirect` | 所有目标 trace 都超时或失败 |
 | G2 `target.reachable`（每个目标域名一行） | 经代理请求 `https://<domain>/cdn-cgi/trace`；`trace: false` 的目标改用 `HEAD /` | 收到 HTTP 响应（< 500），并且 trace 的 ip 等于 `ipProxy` | 连接失败或超时（重试 1 次后）、5xx，或 trace ip 与 `ipProxy` 不同（分流漏网） | 内核 controller 不可用，无法判断请求是否经过内核 |
-| G3 `dns.path` | 内核 DNS 在监听；本轮检查期间内核连接日志里的目标连接（2026-10-11 由 `/connections` 改为连接日志，见票据 06） | 每个目标的连接元数据带域名，链路命中 `routing.targetGroup` | 命中 DIRECT 或其他组，或只带 IP（客户端在本地解析） | 拿不到 controller 或连接记录 |
+| G3 `dns.path` | 内核 DNS 在监听；本轮检查期间内核连接日志里的目标连接 | 每个目标带域名，链路命中有序路由数据决定的目标 | 命中 DIRECT、REJECT、错误目标或只带 IP | 拿不到连接记录，或前置 Geo/IP 规则无法从域名证据判断 |
 | G4 `locale.timezone` | 系统时区 Windows ID；有检查页结果时，加上浏览器的 `Intl` 时区 | 都与档案一致 | 不一致 | 读取失败；或接管门关闭、当前时区又不等于目标（原因写「全局状态未接管」） |
 | G5 `locale.language`（每个浏览器入口一行，只在本次启动了浏览器入口时适用） | 检查页上报的 `navigator.language`/`languages`，以及服务端收到的 `Accept-Language` | 与 `browserLang`/`acceptLanguage` 一致 | 不一致 | 15 秒内没有收到检查页上报 |
 

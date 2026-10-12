@@ -6,30 +6,53 @@
 use std::sync::{Arc, Mutex};
 
 use aec_core::profile::{FieldError, ProfileSet};
-use aec_core::setup::{self, ExitForm, SetupBackend, SetupServer, SetupView};
+use aec_core::setup::{self, CredentialChange, ExitForm, SetupBackend, SetupServer, SetupView};
 
-struct Memory(Mutex<(ProfileSet, Option<String>, bool)>);
+struct Memory {
+    set: ProfileSet,
+    user: Option<String>,
+    tunnel_stored: bool,
+    takeover: bool,
+}
 
-impl SetupBackend for Memory {
+struct Preview(Mutex<Memory>);
+
+impl SetupBackend for Preview {
     fn view(&self) -> SetupView {
         let g = self.0.lock().unwrap();
-        setup::view(&g.0, g.1.as_deref(), g.2, false)
+        setup::view(
+            &g.set,
+            &setup::ViewInput {
+                stored_user: g.user.as_deref(),
+                tunnel_password_stored: g.tunnel_stored,
+                takeover_enabled: g.takeover,
+                locked: false,
+            },
+        )
     }
     fn save(&self, form: ExitForm) -> Result<(), Vec<FieldError>> {
         let mut g = self.0.lock().unwrap();
-        let user = g.1.clone();
-        let (change, takeover) = setup::apply(&mut g.0, &form, user.as_deref())?;
-        if let setup::CredentialChange::Store { ref user, .. } = change {
-            g.1 = Some(user.clone());
+        let (user, stored) = (g.user.clone(), g.tunnel_stored);
+        let a = setup::apply(&mut g.set, &form, user.as_deref(), stored)?;
+        if let CredentialChange::Store { ref user, .. } = a.exit {
+            g.user = Some(user.clone());
         }
-        g.2 = takeover;
-        println!("saved: {change:?}");
+        if matches!(a.tunnel, CredentialChange::Store { .. }) {
+            g.tunnel_stored = true;
+        }
+        g.takeover = a.takeover;
+        println!("saved: exit {:?}, tunnel {:?}", a.exit, a.tunnel);
         Ok(())
     }
 }
 
 fn main() {
-    let backend = Arc::new(Memory(Mutex::new((ProfileSet::default(), None, false))));
+    let backend = Arc::new(Preview(Mutex::new(Memory {
+        set: ProfileSet::default(),
+        user: None,
+        tunnel_stored: false,
+        takeover: false,
+    })));
     let srv = SetupServer::start(0, "preview".into(), backend).expect("listen");
     println!("{}", srv.url());
     loop {

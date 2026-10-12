@@ -1,0 +1,49 @@
+# Public synthetic fixture: documentation-only addresses and test credentials.
+proxies:
+  - name: ISP
+    type: http
+    server: 198.51.100.10
+    port: 12323
+    username: fixture-user
+    password: fixture-password
+    udp: false
+    dialer-proxy: transport
+  - name: local
+    type: socks5
+    server: 127.0.0.1
+    port: 7890
+    udp: false
+  - name: encrypted
+    type: ss
+    server: tunnel.example.com
+    port: 8388
+    cipher: chacha20-ietf-poly1305
+    password: fixture-password
+    udp: false
+proxy-groups:
+  - name: AI sites
+    type: select
+    proxies: [ISP, relay]
+  - name: transport
+    type: url-test
+    url: https://example.com/health
+    interval: 30
+    tolerance: 80
+    proxies: [encrypted, DIRECT]
+  - name: daily
+    type: fallback
+    url: https://example.com/health
+    interval: 15
+    tolerance: 0
+    proxies: [local, DIRECT]
+  - name: special
+    type: select
+    proxies: [AI sites, daily]
+rules:
+  # Keep the target on the ISP exit.
+  - DOMAIN,api.example.com,AI sites # exact match first
+  - DOMAIN-SUFFIX,example.com,AI sites
+  - DOMAIN-KEYWORD,special,special
+  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
+  - IP-CIDR6,::1/128,DIRECT,no-resolve
+  - MATCH,daily

@@ -88,6 +88,59 @@ pub struct CoreManager {
     pub ports: CorePorts,
 }
 
+/// Domestic-direct data shipped next to the core binary (MetaCubeX meta-rules-dat). mihomo reads
+/// them from its working directory and would otherwise try to download them.
+pub const GEODATA_FILES: [&str; 2] = ["GeoSite.dat", "GeoIP.dat"];
+
+impl CoreManager {
+    fn geodata_source(&self) -> PathBuf {
+        self.bin
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// The shipped data files are present (checked before anything changes).
+    pub fn geodata_ready(&self) -> Result<(), CoreError> {
+        let dir = self.geodata_source();
+        let missing: Vec<&str> = GEODATA_FILES
+            .iter()
+            .copied()
+            .filter(|f| !dir.join(f).is_file())
+            .collect();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(CoreError::new(
+                "CORE_GEODATA_MISSING",
+                format!(
+                    "geodata rules need {} next to the core in {}; provide trusted data files manually (never downloaded automatically)",
+                    missing.join(" and "),
+                    dir.display()
+                ),
+            ))
+        }
+    }
+
+    /// Put the data files where the core looks, when the copy there is missing or differs in size.
+    fn install_geodata(&self) -> Result<(), CoreError> {
+        self.geodata_ready()?;
+        let (from, to) = (self.geodata_source(), self.core_dir());
+        fs::create_dir_all(&to).map_err(io("IO_WRITE", &to))?;
+        for f in GEODATA_FILES {
+            let (src, dst) = (from.join(f), to.join(f));
+            let same = match (fs::metadata(&src), fs::metadata(&dst)) {
+                (Ok(a), Ok(b)) => a.len() == b.len(),
+                _ => false,
+            };
+            if !same {
+                fs::copy(&src, &dst).map_err(io("IO_WRITE", &dst))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -175,21 +228,44 @@ pub fn http_get_local(
     path: &str,
     bearer: Option<&str>,
 ) -> Result<(u16, String), String> {
+    http_local(port, "GET", path, bearer, "")
+}
+
+fn http_local(
+    port: u16,
+    method: &str,
+    path: &str,
+    bearer: Option<&str>,
+    body: &str,
+) -> Result<(u16, String), String> {
+    if !path.starts_with('/')
+        || path.contains(['\r', '\n', ' '])
+        || bearer.is_some_and(|s| s.contains(['\r', '\n']))
+    {
+        return Err("invalid local request".into());
+    }
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let mut s =
         TcpStream::connect_timeout(&addr, Duration::from_secs(2)).map_err(|e| e.to_string())?;
     s.set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|e| e.to_string())?;
+    s.set_write_timeout(Some(Duration::from_secs(3)))
         .map_err(|e| e.to_string())?;
     let auth = bearer
         .map(|b| format!("Authorization: Bearer {b}\r\n"))
         .unwrap_or_default();
     write!(
         s,
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}Connection: close\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
     )
     .map_err(|e| e.to_string())?;
     let mut raw = Vec::new();
-    s.read_to_end(&mut raw).map_err(|e| e.to_string())?;
+    s.take(1024 * 1024 + 1)
+        .read_to_end(&mut raw)
+        .map_err(|e| e.to_string())?;
+    if raw.len() > 1024 * 1024 {
+        return Err("local response too large".into());
+    }
     let text = String::from_utf8_lossy(&raw);
     let (head, body) = text.split_once("\r\n\r\n").ok_or("malformed response")?;
     let status = head
@@ -228,19 +304,89 @@ fn secret_from(config_text: &str) -> Option<String> {
         .map(|v| v.trim().trim_matches('"').to_string())
 }
 
+fn encode_segment(name: &str) -> String {
+    use std::fmt::Write as _;
+    let mut encoded = String::new();
+    for b in name.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+            encoded.push(b as char);
+        } else {
+            let _ = write!(encoded, "%{b:02X}");
+        }
+    }
+    encoded
+}
+
 impl CoreManager {
     /// Development layout: binary in `<repo>/runtime/bin`, data in `<repo>/runtime/dev-data`.
     pub fn dev(repo_root: &Path, data_dir: &Path) -> Self {
+        let portable_bin = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .filter(|p| p.join(crate::paths::PORTABLE_FLAG).is_file())
+            .map(|p| p.join("bin").join(pin::EXE_NAME));
         let relay_bin = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.join("aec-relay.exe")))
             .unwrap_or_else(|| PathBuf::from("aec-relay.exe"));
         Self {
             data_dir: data_dir.to_path_buf(),
-            bin: repo_root.join("runtime").join("bin").join(pin::EXE_NAME),
+            bin: portable_bin
+                .unwrap_or_else(|| repo_root.join("runtime").join("bin").join(pin::EXE_NAME)),
             relay_bin,
             ports: CorePorts::default(),
         }
+    }
+
+    /// PUT only to this application's verified control port, never to a foreign listener.
+    pub fn select(
+        &self,
+        evidence: &dyn WriterEvidence,
+        group: &str,
+        member: &str,
+    ) -> Result<(), CoreError> {
+        let owned = self
+            .owned()
+            .filter(still_ours)
+            .ok_or_else(|| CoreError::new("CORE_NOT_RUNNING", "no owned core is running"))?;
+        let ports = preflight::check(evidence, &[self.ports.controller], Some(&owned))
+            .map_err(|_| CoreError::new("PORT_PROBE_FAILED", "cannot verify control port owner"))?;
+        if !matches!(ports.first(), Some((_, PortState::Ours))) {
+            return Err(CoreError::new(
+                "PORT_IN_USE",
+                "control port is not owned by this core",
+            ));
+        }
+        let secret = fs::read_to_string(self.config_path())
+            .ok()
+            .and_then(|s| secret_from(&s))
+            .ok_or_else(|| CoreError::new("CFG_INVALID", "control secret is unavailable"))?;
+        let path = format!("/proxies/{}", encode_segment(group));
+        let body = serde_json::json!({"name": member}).to_string();
+        match http_local(self.ports.controller, "PUT", &path, Some(&secret), &body) {
+            Ok((200 | 204, _)) => Ok(()),
+            Ok((status, _)) => Err(CoreError::new(
+                "CORE_SWITCH_FAILED",
+                format!("control API returned HTTP {status}"),
+            )),
+            Err(_) => Err(CoreError::new(
+                "CORE_SWITCH_FAILED",
+                "control API did not complete",
+            )),
+        }
+    }
+
+    pub fn apply_selections(
+        &self,
+        evidence: &dyn WriterEvidence,
+        routing: &crate::profile::Routing,
+    ) -> Result<(), CoreError> {
+        for group in &routing.groups {
+            if let Some(member) = &group.selected {
+                self.select(evidence, &group.name, member)?;
+            }
+        }
+        Ok(())
     }
 
     fn relay_config_path(&self) -> PathBuf {
@@ -510,6 +656,29 @@ impl CoreManager {
             .map_err(|e| CoreError::new("CORE_START_FAILED", e.to_string()))?;
         let text =
             make_config(&self.ports, &secret).map_err(|e| CoreError::new("CFG_INVALID", e))?;
+        // Listeners the profile adds (the tunnel entrance) must be free now and ours once started.
+        let extra = super::config::extra_listen_ports(&text);
+        if !extra.is_empty() {
+            let held = preflight::check(evidence, &extra, None)
+                .map_err(|e| CoreError::new("PORT_PROBE_FAILED", e.to_string()))?;
+            if let Some((p, PortState::Foreign(o))) = held
+                .into_iter()
+                .find(|(_, s)| matches!(s, PortState::Foreign(_)))
+            {
+                return Err(CoreError::new(
+                    "PORT_IN_USE",
+                    format!(
+                        "{p} held by pid {} ({})",
+                        o.pid,
+                        o.exe.as_deref().unwrap_or("path not readable")
+                    ),
+                ));
+            }
+        }
+        let watched: Vec<u16> = self.ports.all().into_iter().chain(extra).collect();
+        if text.contains("\ngeodata-mode: true\n") {
+            self.install_geodata()?;
+        }
         write_atomic(&self.config_path(), text.as_bytes())
             .map_err(|e| CoreError::new("IO_WRITE", e.to_string()))?;
         if let Err(e) = self.test_config() {
@@ -566,7 +735,7 @@ impl CoreManager {
 
         let deadline = Instant::now() + START_TIMEOUT;
         loop {
-            let ready = preflight::check(evidence, &self.ports.all(), Some(&owned))
+            let ready = preflight::check(evidence, &watched, Some(&owned))
                 .map(|r| r.iter().all(|(_, s)| *s == PortState::Ours))
                 .unwrap_or(false)
                 && matches!(
@@ -699,6 +868,107 @@ mod tests {
     }
 
     #[test]
+    fn local_put_encodes_names_and_sends_a_json_body() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            let header = String::from_utf8(request).unwrap();
+            assert!(header.starts_with("PUT /proxies/AI%20%2F%E7%BB%84 HTTP/1.1\r\n"));
+            assert!(header.contains("Authorization: Bearer test-token\r\n"));
+            let len: usize = header
+                .lines()
+                .find_map(|l| l.strip_prefix("Content-Length: "))
+                .unwrap()
+                .parse()
+                .unwrap();
+            let mut body = vec![0; len];
+            stream.read_exact(&mut body).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()["name"],
+                "member\"x"
+            );
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        let path = format!("/proxies/{}", encode_segment("AI /组"));
+        let body = serde_json::json!({"name":"member\"x"}).to_string();
+        assert_eq!(
+            http_local(port, "PUT", &path, Some("test-token"), &body)
+                .unwrap()
+                .0,
+            204
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs runtime/bin/aec-mihomo.exe"]
+    fn imported_routing_validates_and_restores_saved_selection() {
+        use crate::profile::{Candidate, ProfileSet, UpstreamProto};
+        let (mut m, root) = temp_manager("import-cycle");
+        m.ports = CorePorts {
+            mixed: 30893,
+            controller: 30909,
+            dns: 30553,
+            relay: 30325,
+            tunnel: 30326,
+        };
+        let plan = crate::import::parse(include_str!("../../tests/fixtures/routing.yaml"), "test")
+            .unwrap();
+        let mut p = ProfileSet::default().agent.remove(0);
+        p.egress.candidates.push(Candidate {
+            id: "exit".into(),
+            host: "198.51.100.1".into(),
+            port: 12324,
+            proto: UpstreamProto::Socks5,
+            credential_ref: None,
+        });
+        p.routing = plan.routing;
+        p.routing.groups[0].selected = Some("relay".into());
+        struct Creds;
+        impl config::CredentialSource for Creds {
+            fn get(&self, _: &str) -> Option<(String, String)> {
+                Some(("fixture-user".into(), "fixture-password".into()))
+            }
+        }
+        let result = std::panic::catch_unwind(|| {
+            for _ in 0..2 {
+                m.up(&WindowsHost, |ports, secret| {
+                    config::from_profile(&p, ports, secret, &Creds).map_err(|e| e.to_string())
+                })
+                .unwrap();
+                m.apply_selections(&WindowsHost, &p.routing).unwrap();
+                let secret = secret_from(&fs::read_to_string(m.config_path()).unwrap()).unwrap();
+                let (status, body) =
+                    http_get_local(m.ports.controller, "/proxies/AI%20sites", Some(&secret))
+                        .unwrap();
+                assert_eq!(status, 200);
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&body).unwrap()["now"],
+                    "relay"
+                );
+                m.down(&WindowsHost).unwrap();
+            }
+        });
+        let _ = m.down(&WindowsHost);
+        let _ = fs::remove_dir_all(root);
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[test]
     fn reads_secret_line() {
         assert_eq!(
             secret_from("a: 1\nsecret: \"abc\"\n").as_deref(),
@@ -717,6 +987,7 @@ mod tests {
             controller: port,
             dns: port,
             relay: 0,
+            tunnel: 0,
         };
         if m.binary_state() != BinaryState::Ok {
             // Without the binary the check stops earlier; exercise preflight directly instead.
@@ -749,6 +1020,7 @@ mod tests {
             controller: 27909,
             dns: 27553,
             relay: 27325,
+            tunnel: 27326,
         };
         assert_eq!(m.binary_state(), BinaryState::Ok);
         let owned = m

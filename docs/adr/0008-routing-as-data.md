@@ -1,6 +1,6 @@
 # ADR-0008：路由表改为数据，模板退为预设
 
-- 状态：Proposed
+- 状态：Accepted，0.2.0 已实现
 - 日期：2026-10-12
 - 相关：SPEC 4.3、4.13；ADR-0003、ADR-0006
 
@@ -26,9 +26,9 @@
 
 1. **`routing` 从模板名改为数据。** 字段变为 `outbounds`、`groups`、`rules`、`final`。
 2. **模板退为预设。** `default-v1`、`split-v1` 保留，只用于生成初始数据（首次运行、设置页「套用预设」）。运行路径、校验、配置生成器都不再出现模板名；`rulesTemplate` 字段及其枚举校验删除。
-3. **出站模型扩展为具名列表。** `kind ∈ { http, socks5 }`，凭据一律走 `credentialRef`。保留名三个：`relay`（由 `egress.candidates` 生成）、`DIRECT`、`REJECT`。加密隧道不在这里表达，见 ADR-0009。
+3. **出站模型扩展为具名列表。** HTTP、SOCKS5，以及 ADR-0009 定义的 AEAD Shadowsocks 传输出站，凭据一律走 `credentialRef`。保留名三个：`relay`（由 `egress.candidates` 生成）、`DIRECT`、`REJECT`。面向候选池的统一第一跳另外由 `egress.tunnel` 表达。
 4. **组模型**：`{ name, type: select | fallback | url-test, check: { url, intervalSec, toleranceMs }, members: [], switchable: bool, selected: Option<String> }`。
-5. **规则模型**：`{ kind, value, target, note }`，`kind ∈ { domain, domain_suffix, domain_keyword, ip_cidr }`。`note` 渲染成生成配置里的注释行——一张分流表一半的价值在注释记录的实测结论，丢掉就只剩一张域名清单。
+5. **规则模型**：`{ kind, value, target, note, noResolve }`，支持 `domain`、`domain_suffix`、`domain_keyword`、`ip_cidr`，另支持现有国内分流所需的 `geosite`、`geoip`。IPv6 CIDR 渲染为 IP-CIDR6。`note` 渲染成生成配置里的注释行；常规 YAML 块规则列表的独立注释和尾注保留，flow 列表没有逐条注释关联。
 6. **兜底不再强制非 DIRECT。** 删除 `FallbackUpstream` 文档里「拒绝直接连接」的约束，改由规则数据自己决定：很多人的日常组就是「日常代理，不通时 DIRECT」。
 7. **导入而不是手抄。** 新增 `aec-dev profile import <config.yaml>`：用 YAML 库解析 mihomo/Clash 配置，出站、组、规则逐条搬运，凭据写进 Windows 凭据管理器，档案里只留 `credentialRef`。
 8. **可切换组走内核控制口。** aec-core 增加最小的控制口客户端（目前只有 `GET /version`）；托盘按 `switchable` 生成菜单项，切换用 `PUT /proxies/<group>`，结果写回档案的 `selected`。
@@ -59,8 +59,13 @@
 4. `live.rs`：预检改为探测兜底组的成员；
 5. 控制口客户端与托盘可切换组。
 
-### 未决
+### 0.2.0 落地说明
 
-- 日常组除 `DIRECT` 之外是否预留一个由用户填写的成员。
+- 日常组除 `DIRECT` 之外可选用户填写的本机代理 `daily-proxy`；不可用时允许 DIRECT，恢复由组健康检查决定。
 - DNS 模式：保持 aec 的 `redir-host`。不开 TUN 时 `fake-ip` 没有意义。
 - 改系统代理属于全局状态，归 ADR-0004 的接管门管，不在本 ADR 范围内。
+- 旧档案仅在 `ProfileStore::load` 内转换，不在读取时改写文件；正常保存后只有四个路由数据字段。运行路径不判断模板名。
+- 导入只接受能完整表达的自包含表。不支持的字段、provider、UDP、规则以及 MATCH 后的不可达规则会拒绝整次导入。原档案先备份，新增凭据写入失败或保存失败时逐条回滚。
+- 不对可选日常代理进行阻断式拨号预检。结构、凭据和数据文件先预检，健康检查交给内核；具体目标的运行证据由 G2/G3 验收。DIRECT 日常兜底不会因为用户关闭本机代理而阻止进入。
+- 切换只访问身份核实一致的本应用内核控制端口。切换前撤销旧检测的就绪状态，成功后保存 `selected` 并重新检测；保存失败尝试切回原成员。启动时恢复已保存选择。
+- [已验证] 2026-10-12 对只读源表自动比对：10 个具名出站保留（另加内置 relay）、4 个组一致、72 条规则顺序一致，固定版本 `mihomo -t` 返回 0；隔离实例访问 `claude.ai/cdn-cgi/trace` 与源实例出口相同。私有源表及凭据不入库，通用 fixture 和验收程序随仓库发布，见 [验收记录](../RELEASE-0.2.0.md)。

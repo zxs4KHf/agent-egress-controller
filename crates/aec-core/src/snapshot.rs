@@ -23,8 +23,17 @@ impl Default for GateState {
     }
 }
 
-const TAKEOVER_OFF: &str = "takeover of global state is not enabled in settings";
+const TIMEZONE_OFF: &str = "changing the system time zone is not enabled in settings";
+const SYSTEM_PROXY_OFF: &str =
+    "system-level routing (taking over the system proxy) is not enabled in settings";
 const NOT_PERSISTED: &str = "entry snapshot is not persisted yet";
+
+/// What the user switched on, per global item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Enabled {
+    pub system_proxy: bool,
+    pub timezone: bool,
+}
 
 /// One global item's own gate.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -47,12 +56,16 @@ impl ItemGate {
 /// Which global items a foreign writer can be expected to rewrite.
 ///
 /// The legacy chain's mutexes and its startup items drive both the system proxy and the time zone,
-/// so they hold back both. A process that merely holds the port the system proxy points at is
-/// evidence about the proxy and says nothing about who sets the time zone — treating it as a
-/// blocker for both is what kept the time zone from ever being written.
+/// and keep doing so while they run, so they hold back both.
+///
+/// A process that merely holds the port the system proxy points at (a Clash-style client with its
+/// own "system proxy" switch) blocks nothing (ADR-0010). Its setting is what the snapshot records
+/// and what leaving Agent mode puts back; while Agent mode runs, the controller keeps the system
+/// proxy on the core and backs off if that client keeps rewriting it. Treating it as a blocker
+/// made system-level routing impossible for exactly the users who have such a client.
 fn writer_items(kind: WriterKind) -> &'static [GlobalItem] {
     match kind {
-        WriterKind::ProxyListener => &[GlobalItem::SystemProxy],
+        WriterKind::ProxyListener => &[],
         WriterKind::LegacyGuardMutex | WriterKind::LegacyTrayMutex | WriterKind::StartupItem => {
             &[GlobalItem::SystemProxy, GlobalItem::Timezone]
         }
@@ -73,19 +86,20 @@ pub struct TakeoverGate {
 }
 
 impl TakeoverGate {
-    /// `enabled`: the user switched "take over global state" on. `snapshot_persisted`: the entry
-    /// snapshot is on disk. The writer scan must be complete and empty.
-    pub fn evaluate(enabled: bool, scan: &WriterScan, snapshot_persisted: bool) -> Self {
+    /// `enabled`: what the user switched on, per item. `snapshot_persisted`: the entry snapshot is
+    /// on disk. The writer scan must be complete and hold no writer that blocks the item.
+    pub fn evaluate(enabled: Enabled, scan: &WriterScan, snapshot_persisted: bool) -> Self {
         let (mut proxy, mut tz): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
         {
             let mut push = |item: GlobalItem, reason: String| match item {
                 GlobalItem::SystemProxy => proxy.push(reason),
                 GlobalItem::Timezone => tz.push(reason),
             };
-            if !enabled {
-                for item in [GlobalItem::SystemProxy, GlobalItem::Timezone] {
-                    push(item, TAKEOVER_OFF.to_string());
-                }
+            if !enabled.system_proxy {
+                push(GlobalItem::SystemProxy, SYSTEM_PROXY_OFF.to_string());
+            }
+            if !enabled.timezone {
+                push(GlobalItem::Timezone, TIMEZONE_OFF.to_string());
             }
             for w in &scan.writers {
                 for item in writer_items(w.kind) {
@@ -158,7 +172,7 @@ impl EnvironmentSnapshot {
         unix_ms: u64,
         status: &EnvironmentStatus,
         profile_id: Option<String>,
-        takeover_enabled: bool,
+        enabled: Enabled,
     ) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
@@ -171,7 +185,7 @@ impl EnvironmentSnapshot {
             system_proxy_registry: status.system_proxy_registry.clone(),
             timezone: status.timezone.clone(),
             foreign_writers: status.foreign_writers.clone(),
-            takeover_gate: TakeoverGate::evaluate(takeover_enabled, &status.foreign_writers, false),
+            takeover_gate: TakeoverGate::evaluate(enabled, &status.foreign_writers, false),
         }
     }
 
@@ -237,11 +251,16 @@ mod tests {
         assert!(!is_snapshot_id("1791701261000-00a1"));
     }
 
+    const ON: Enabled = Enabled {
+        system_proxy: true,
+        timezone: true,
+    };
+
     #[test]
     fn gate_lists_every_unmet_condition() {
         let clear = WriterScan::default();
         assert_eq!(
-            TakeoverGate::evaluate(true, &clear, true).state,
+            TakeoverGate::evaluate(ON, &clear, true).state,
             GateState::Open
         );
         let busy = WriterScan {
@@ -251,9 +270,29 @@ mod tests {
             }],
             errors: vec!["startup items: denied".into()],
         };
-        let g = TakeoverGate::evaluate(false, &busy, false);
+        let g = TakeoverGate::evaluate(Enabled::default(), &busy, false);
         assert_eq!(g.state, GateState::Closed);
-        assert_eq!(g.reasons.len(), 4, "{g:?}");
+        // Two switches off, one writer, one incomplete probe, snapshot not on disk.
+        assert_eq!(g.reasons.len(), 5, "{g:?}");
+    }
+
+    #[test]
+    fn each_item_has_its_own_switch() {
+        let clear = WriterScan::default();
+        let tz_only = Enabled {
+            system_proxy: false,
+            timezone: true,
+        };
+        let g = TakeoverGate::evaluate(tz_only, &clear, true);
+        assert!(g.allows(GlobalItem::Timezone));
+        assert!(!g.allows(GlobalItem::SystemProxy));
+        let proxy_only = Enabled {
+            system_proxy: true,
+            timezone: false,
+        };
+        let g = TakeoverGate::evaluate(proxy_only, &clear, true);
+        assert!(!g.allows(GlobalItem::Timezone));
+        assert!(g.allows(GlobalItem::SystemProxy));
     }
 
     fn scan_of(kind: WriterKind) -> WriterScan {
@@ -266,15 +305,14 @@ mod tests {
         }
     }
 
+    /// ADR-0010: a Clash-style client holding the current proxy port is what gets snapshotted and
+    /// restored, not a reason to refuse.
     #[test]
-    fn a_proxy_listener_holds_back_only_the_system_proxy() {
-        let g = TakeoverGate::evaluate(true, &scan_of(WriterKind::ProxyListener), true);
-        assert_eq!(g.state, GateState::Closed, "the aggregate stays closed");
-        assert!(!g.allows(GlobalItem::SystemProxy));
-        assert!(g.allows(GlobalItem::Timezone), "{g:?}");
-        assert_eq!(g.reasons.len(), 1, "{g:?}");
-        assert_eq!(g.timezone.reasons.len(), 0);
-        assert_eq!(g.system_proxy.reasons.len(), 1);
+    fn a_proxy_listener_blocks_nothing() {
+        let g = TakeoverGate::evaluate(ON, &scan_of(WriterKind::ProxyListener), true);
+        assert_eq!(g.state, GateState::Open, "{g:?}");
+        assert!(g.allows(GlobalItem::SystemProxy));
+        assert!(g.allows(GlobalItem::Timezone));
     }
 
     #[test]
@@ -284,7 +322,7 @@ mod tests {
             WriterKind::LegacyTrayMutex,
             WriterKind::StartupItem,
         ] {
-            let g = TakeoverGate::evaluate(true, &scan_of(kind), true);
+            let g = TakeoverGate::evaluate(ON, &scan_of(kind), true);
             assert!(!g.allows(GlobalItem::SystemProxy), "{kind:?}");
             assert!(!g.allows(GlobalItem::Timezone), "{kind:?}");
         }
@@ -296,7 +334,7 @@ mod tests {
             writers: Vec::new(),
             errors: vec!["startup items: denied".into()],
         };
-        let g = TakeoverGate::evaluate(true, &scan, true);
+        let g = TakeoverGate::evaluate(ON, &scan, true);
         assert!(!g.allows(GlobalItem::SystemProxy));
         assert!(!g.allows(GlobalItem::Timezone));
         assert_eq!(g.reasons.len(), 1, "the same reason is listed once");
@@ -310,7 +348,7 @@ mod tests {
             1_000,
             &collect(&host, None),
             Some("agent-default".into()),
-            false,
+            Enabled::default(),
         );
         assert!(s.is_restorable());
         assert_eq!(s.takeover_gate.state, GateState::Closed);
@@ -323,7 +361,7 @@ mod tests {
             1_000,
             &collect(&host, None),
             None,
-            false,
+            Enabled::default(),
         );
         assert!(!s.is_restorable());
     }

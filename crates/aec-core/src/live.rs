@@ -291,21 +291,6 @@ fn fault(e: impl std::fmt::Display, code: &str) -> Fault {
     Fault::new(code, e.to_string())
 }
 
-/// Whether the fallback upstream accepts a connection right now.
-///
-/// A refused connection and a host that does not resolve are different answers: the first is a
-/// link that is not up, the second is a profile that names something unreachable at all. Both
-/// stop Agent mode, with different codes.
-fn fallback_reachable(host: &str, port: u16) -> Result<bool, String> {
-    use std::net::ToSocketAddrs;
-    let addr = (host, port)
-        .to_socket_addrs()
-        .map_err(|e| format!("{host}:{port}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("{host}:{port} resolved to no address"))?;
-    Ok(std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(1500)).is_ok())
-}
-
 impl Platform for LivePlatform {
     fn now_ms(&self) -> u64 {
         SystemTime::now()
@@ -335,25 +320,13 @@ impl Platform for LivePlatform {
                 &WindowsCredentials,
             )
             .map_err(|e| fault(e, "CFG_INVALID"))?;
-            if let Some(fb) = &profile.routing.fallback {
-                match fallback_reachable(&fb.host, fb.port) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        return Err(Fault::new(
-                            "FALLBACK_DOWN",
-                            format!(
-                                "nothing is answering on the fallback upstream {}:{}; non-target traffic would have no upstream, so Agent mode is not started",
-                                fb.host, fb.port
-                            ),
-                        ))
-                    }
-                    Err(e) => {
-                        return Err(Fault::new(
-                            "FALLBACK_UNKNOWN",
-                            format!("the fallback upstream could not be probed: {e}"),
-                        ))
-                    }
-                }
+            // The user's own proxy (split mode) is not probed here: when it is down, non-target
+            // traffic goes direct and the core notices it coming back within 15 seconds, so a
+            // client that is switched off is no reason to refuse Agent mode.
+            if profile.routing.uses_geodata() {
+                self.core
+                    .geodata_ready()
+                    .map_err(|e| Fault::new(e.code, e.message))?;
             }
             if !self.core.relay_bin.is_file() {
                 return Err(Fault::new(
@@ -368,7 +341,11 @@ impl Platform for LivePlatform {
     }
 
     fn core_up(&self, profile: &AgentProfile, direct_test: bool) -> Result<(), Fault> {
-        let group = profile.routing.target_group.clone();
+        let group = profile
+            .routing
+            .primary_group_name()
+            .unwrap_or("agent-egress")
+            .to_string();
         let result = if direct_test {
             self.core
                 .up(&WindowsHost, |p, s| Ok(config::direct_test(p, s, &group)))
@@ -379,9 +356,14 @@ impl Platform for LivePlatform {
                 config::from_profile(profile, p, s, &WindowsCredentials).map_err(|e| e.to_string())
             })
         };
-        result
-            .map(|_| ())
-            .map_err(|e| Fault::new(e.code, e.message))
+        result.map_err(|e| Fault::new(e.code, e.message))?;
+        if !direct_test {
+            if let Err(e) = self.core.apply_selections(&WindowsHost, &profile.routing) {
+                let _ = self.core.down(&WindowsHost);
+                return Err(Fault::new(e.code, e.message));
+            }
+        }
+        Ok(())
     }
 
     fn core_down(&self) -> Result<(), Fault> {
@@ -497,10 +479,8 @@ impl Platform for LivePlatform {
         match value {
             GlobalValue::Timezone { windows_id } => crate::windows::set_timezone(windows_id)
                 .map_err(|e| fault(e, "ADAPTER_WRITE_FAILED")),
-            GlobalValue::SystemProxy { .. } => Err(Fault::new(
-                "NOT_IN_THIS_VERSION",
-                "this version never writes the system proxy (explicit-only scope)",
-            )),
+            GlobalValue::SystemProxy { value } => crate::windows::set_system_proxy(value)
+                .map_err(|e| fault(e, "ADAPTER_WRITE_FAILED")),
         }
     }
 }

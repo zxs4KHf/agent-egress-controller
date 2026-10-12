@@ -61,6 +61,7 @@ mod tray {
     const ID_DATA: usize = 8;
     const ID_QUIT: usize = 9;
     const ID_ENTRY_BASE: usize = 100;
+    const ID_SWITCH_BASE: usize = 10000;
     const TIMER_REFRESH: usize = 1;
 
     const GRAY: (u8, u8, u8) = (138, 145, 141);
@@ -272,6 +273,14 @@ mod tray {
                         for (i, (_, label)) in s.entries.iter().enumerate() {
                             add(on(idle), ID_ENTRY_BASE + i, label);
                         }
+                        for (i, (group, member, selected)) in s.switches.iter().enumerate() {
+                            let flags = on(idle) | if *selected { MF_CHECKED } else { 0 };
+                            add(
+                                flags,
+                                ID_SWITCH_BASE + i,
+                                &format!("路由：{group} → {member}"),
+                            );
+                        }
                         AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
                         add(on(idle), ID_RECHECK, "重新检测");
                         add(on(idle), ID_EXIT, "退出 Agent 模式（恢复设置）");
@@ -287,7 +296,7 @@ mod tray {
                 AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
                 add(on(s.has_report), ID_REPORT, "查看检测结果");
                 add(on(idle), ID_PROMPTS, "复制排查提示词");
-                add(MF_STRING, ID_SETTINGS, "设置出口和时区…");
+                add(MF_STRING, ID_SETTINGS, "设置出口和分流…");
                 add(MF_STRING, ID_DATA, "打开数据和日志目录");
                 AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
                 add(
@@ -318,6 +327,14 @@ mod tray {
                 ID_SETTINGS => return self.open_settings(),
                 ID_DATA => return Effect::Open(self.layout.data_dir.to_string_lossy().into()),
                 ID_QUIT => self.quit(),
+                n if n >= ID_SWITCH_BASE => {
+                    if let Some((group, member, _)) = s.switches.get(n - ID_SWITCH_BASE) {
+                        self.send(Cmd::Switch {
+                            group: group.clone(),
+                            member: member.clone(),
+                        });
+                    }
+                }
                 n if n >= ID_ENTRY_BASE => {
                     if let Some((entry, _)) = s.entries.get(n - ID_ENTRY_BASE) {
                         self.send(Cmd::Open(entry.clone()));
@@ -471,6 +488,7 @@ mod tray {
             busy: Some("正在启动…"),
             configured: false,
             entries: Vec::new(),
+            switches: Vec::new(),
             has_report: false,
             note: None,
             summary: None,
@@ -499,6 +517,17 @@ mod tray {
             win::message_box(hwnd, &format!("启动失败：{e}"), "Agent 出口控制器");
             unsafe { DestroyWindow(hwnd) };
             return;
+        }
+        // System-proxy observation every 30 seconds. It does nothing unless Agent mode
+        // runs with the system proxy taken over; it stops when the worker is gone.
+        {
+            let keep_tx = tx.clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(Duration::from_secs(30));
+                if keep_tx.send(Cmd::Keep).is_err() {
+                    break;
+                }
+            });
         }
 
         let tc = wide("TaskbarCreated");

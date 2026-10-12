@@ -14,6 +14,7 @@ pub mod credentials;
 pub mod crypto;
 pub mod entries;
 pub mod http;
+pub mod import;
 #[cfg(windows)]
 pub mod live;
 pub mod log;
@@ -29,6 +30,7 @@ pub mod snapshot;
 pub mod status;
 pub mod store;
 pub mod testing;
+pub mod tunnel;
 pub mod writers;
 
 #[cfg(windows)]

@@ -12,6 +12,8 @@ fn up(port: u16, proto: UpstreamProto) -> Upstream {
         proto,
         user: None,
         pass: None,
+        via: None,
+        step_timeout_ms: None,
     }
 }
 
@@ -436,6 +438,87 @@ fn s9_s11_s12_all_candidates_failing_is_reported_truthfully() {
     assert!(
         !text.contains("s3cret-pass") && !text.contains("user1"),
         "credentials leaked: {text}"
+    );
+}
+
+fn via(mut u: Upstream, entrance: u16) -> Upstream {
+    u.via = Some(format!("127.0.0.1:{entrance}"));
+    u.step_timeout_ms = Some(1500);
+    u
+}
+
+#[test]
+fn tunnelled_candidate_reaches_the_exit_through_the_entrance() {
+    let echo = echo_server();
+    let (heads_tx, heads) = mpsc::channel();
+    let exit = http_upstream(heads_tx);
+    let (offers_tx, offers) = mpsc::channel();
+    let entrance = socks5_upstream(false, offers_tx);
+    let (logs, sink) = Logs::new();
+    let relay = start(
+        cfg(vec![via(
+            with_auth(up(exit, UpstreamProto::Http)),
+            entrance,
+        )]),
+        sink,
+    )
+    .unwrap();
+    let (mut s, code) = socks_connect(relay.addr, "127.0.0.1", echo);
+    assert_eq!(code, 0);
+    assert_eq!(roundtrip(&mut s), b"ping through the relay");
+    assert_eq!(
+        offers.recv_timeout(Duration::from_secs(2)).unwrap(),
+        vec![0],
+        "the entrance is asked for no authentication"
+    );
+    assert!(heads
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap()
+        .starts_with(&format!("CONNECT 127.0.0.1:{echo} ")));
+    assert!(logs.text().contains("(http) via tunnel"), "{}", logs.text());
+}
+
+#[test]
+fn a_dead_tunnel_falls_back_to_the_direct_candidate() {
+    let echo = echo_server();
+    let (tx, _rx) = mpsc::channel();
+    let exit = socks5_upstream(false, tx);
+    let (logs, sink) = Logs::new();
+    let direct = up(exit, UpstreamProto::Socks5);
+    let relay = start(cfg(vec![via(direct.clone(), dead_port()), direct]), sink).unwrap();
+    let (mut s, code) = socks_connect(relay.addr, "127.0.0.1", echo);
+    assert_eq!(code, 0);
+    assert_eq!(roundtrip(&mut s), b"ping through the relay");
+    assert_eq!(relay.pool.counts(0).1, 1, "the tunnelled attempt failed");
+    assert_eq!(relay.pool.counts(1).0, 1, "the direct one carried it");
+    assert!(logs.text().contains("(1 failed attempt(s) before)"));
+}
+
+#[test]
+fn a_silent_tunnel_reserves_budget_for_direct_fallback() {
+    let clock = Clock::new();
+    let direct = up(12324, UpstreamProto::Socks5);
+    let pool = Pool::new(vec![via(direct.clone(), 17326), direct]).unwrap();
+    let mut dial = |i: usize, deadline: Instant| {
+        if i == 0 {
+            clock.advance(deadline.saturating_duration_since(clock.now()));
+            Err(io::Error::new(io::ErrorKind::TimedOut, "silent tunnel"))
+        } else {
+            Ok(())
+        }
+    };
+    let out = dial_pool(
+        &pool,
+        Duration::from_secs(4),
+        1,
+        Duration::from_secs(3),
+        &|| clock.now(),
+        &mut dial,
+    );
+    assert_eq!(
+        out.winner,
+        Some(1),
+        "a stalled tunnel must not consume the direct attempt's budget"
     );
 }
 

@@ -1,6 +1,7 @@
-//! Windows implementation of the read-only probes. Apart from [`set_timezone`], which the controller
-//! calls only behind an open takeover gate, nothing in this module writes the registry, creates a
-//! mutex or changes any setting.
+//! Windows implementation of the read-only probes. Apart from [`set_timezone`] and
+//! [`set_system_proxy`], which the controller calls only behind an open takeover gate (and to put
+//! back what it snapshotted), nothing in this module writes the registry, creates a mutex or
+//! changes any setting.
 
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
@@ -15,7 +16,8 @@ use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
 };
 use windows_sys::Win32::Networking::WinInet::{
-    InternetQueryOptionW, INTERNET_OPTION_PER_CONNECTION_OPTION, INTERNET_PER_CONN_AUTOCONFIG_URL,
+    InternetQueryOptionW, InternetSetOptionW, INTERNET_OPTION_PER_CONNECTION_OPTION,
+    INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED, INTERNET_PER_CONN_AUTOCONFIG_URL,
     INTERNET_PER_CONN_FLAGS, INTERNET_PER_CONN_FLAGS_UI, INTERNET_PER_CONN_OPTIONW,
     INTERNET_PER_CONN_OPTION_LISTW, INTERNET_PER_CONN_PROXY_BYPASS, INTERNET_PER_CONN_PROXY_SERVER,
 };
@@ -297,6 +299,54 @@ impl WindowsHost {
             }
         }
     }
+}
+
+/// Write the system proxy for the default (LAN) connection, with the same four values the reader
+/// returns, then tell running programs that the settings changed. Called only by the controller,
+/// behind an open takeover gate, and when restoring a snapshot it took itself.
+pub fn set_system_proxy(value: &ProxySettings) -> ProbeResult<()> {
+    let server = value.proxy_server.as_deref().map(wide);
+    let bypass = value.bypass.as_deref().map(wide);
+    let pac = value.auto_config_url.as_deref().map(wide);
+    let ptr = |w: &Option<Vec<u16>>| w.as_ref().map_or(null_mut(), |v| v.as_ptr() as *mut u16);
+    let write = |flags_option: u32| -> ProbeResult<()> {
+        unsafe {
+            let mut options: [INTERNET_PER_CONN_OPTIONW; 4] = zeroed();
+            options[0].dwOption = flags_option;
+            options[0].Value.dwValue = value.flags;
+            options[1].dwOption = INTERNET_PER_CONN_PROXY_SERVER;
+            options[1].Value.pszValue = ptr(&server);
+            options[2].dwOption = INTERNET_PER_CONN_PROXY_BYPASS;
+            options[2].Value.pszValue = ptr(&bypass);
+            options[3].dwOption = INTERNET_PER_CONN_AUTOCONFIG_URL;
+            options[3].Value.pszValue = ptr(&pac);
+            let list = INTERNET_PER_CONN_OPTION_LISTW {
+                dwSize: size_of::<INTERNET_PER_CONN_OPTION_LISTW>() as u32,
+                pszConnection: null_mut(),
+                dwOptionCount: options.len() as u32,
+                dwOptionError: 0,
+                pOptions: options.as_mut_ptr(),
+            };
+            if InternetSetOptionW(
+                null(),
+                INTERNET_OPTION_PER_CONNECTION_OPTION,
+                &list as *const _ as *const c_void,
+                list.dwSize,
+            ) == 0
+            {
+                return Err(last_error("InternetSetOptionW(PER_CONNECTION_OPTION)"));
+            }
+            Ok(())
+        }
+    };
+    // Same order as the reader: FLAGS_UI is what the Settings UI shows; older systems know FLAGS.
+    write(INTERNET_PER_CONN_FLAGS_UI).or_else(|_| write(INTERNET_PER_CONN_FLAGS))?;
+    unsafe {
+        // Without these, programs that already cached the proxy keep using the old one.
+        InternetSetOptionW(null(), INTERNET_OPTION_SETTINGS_CHANGED, null(), 0);
+        InternetSetOptionW(null(), INTERNET_OPTION_REFRESH, null(), 0);
+    }
+    Ok(())
 }
 
 impl SystemProxyReader for WindowsHost {

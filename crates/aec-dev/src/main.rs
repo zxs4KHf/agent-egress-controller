@@ -85,6 +85,10 @@ const USAGE: &str = "usage:
   aec-dev status [--json]          read system proxy, time zone and foreign writers
   aec-dev profile init             write default profiles if none exist
   aec-dev profile check            validate the profile file field by field
+  aec-dev profile import <yaml> [--dry-run]
+                                   import routing only, preserving the exit; reject unsupported fields
+  aec-dev profile verify <yaml>    compare source and rendered routing without storing credentials
+  --data-dir <directory>            select the data directory (default: portable data or runtime/dev-data)
   aec-dev snapshot [--current]     record an environment snapshot (reads the system, writes only the data dir)
   aec-dev snapshots                list stored snapshots
   aec-dev core install <exe>       copy a mihomo executable into runtime\\bin after checking the pinned sha256
@@ -135,7 +139,11 @@ fn prompt_cmd(args: &[String], data_dir: &Path) -> ExitCode {
     };
     let st = status::collect(&host(), Some(data_dir));
     // Takeover is not configurable before ticket 13, so the gate is evaluated with it off.
-    let gate = TakeoverGate::evaluate(false, &st.foreign_writers, true);
+    let gate = TakeoverGate::evaluate(
+        aec_core::snapshot::Enabled::default(),
+        &st.foreign_writers,
+        true,
+    );
     let data_dir_text = data_dir.display().to_string();
     let ctx = PromptContext {
         mode: c.state().mode.as_str(),
@@ -423,6 +431,7 @@ fn core_cmd(args: &[String], data_dir: &Path) -> ExitCode {
                     controller,
                     dns,
                     relay,
+                    ..Default::default()
                 }
             }
             _ => {}
@@ -432,7 +441,11 @@ fn core_cmd(args: &[String], data_dir: &Path) -> ExitCode {
     let group = ProfileStore::new(data_dir)
         .load()
         .ok()
-        .and_then(|s| s.agent.first().map(|p| p.routing.target_group.clone()))
+        .and_then(|s| {
+            s.agent
+                .first()
+                .and_then(|p| p.routing.primary_group_name().map(str::to_string))
+        })
         .unwrap_or_else(|| "agent-egress".into());
     let fail = |e: &dyn std::fmt::Display| {
         eprintln!("error: {e}");
@@ -474,9 +487,10 @@ fn core_cmd(args: &[String], data_dir: &Path) -> ExitCode {
             }
             Err(e) => fail(&e),
         },
-        // Profile mode: relay in front of the profile's candidates, then the core. Until ticket 13
-        // only candidates without a credentialRef can be used.
+        // Profile mode: relay in front of the profile's candidates, then the core. Credentials come
+        // from Credential Manager, as in the tray.
         Some(sub @ ("up" | "config")) => {
+            let creds = aec_core::credentials::WindowsCredentials;
             let profile = match ProfileStore::new(data_dir).load() {
                 Ok(set) => set
                     .agent
@@ -485,23 +499,15 @@ fn core_cmd(args: &[String], data_dir: &Path) -> ExitCode {
                     .expect("profile sets have an agent profile"),
                 Err(e) => return fail(&e),
             };
-            let relay = match config::relay_config(&profile, &m.ports, &config::NoCredentials) {
+            let relay = match config::relay_config(&profile, &m.ports, &creds) {
                 Ok(r) => r,
                 Err(e) => return fail(&e),
             };
             if sub == "config" {
-                print!(
-                    "{}",
-                    config::redact(
-                        &config::from_profile(
-                            &profile,
-                            &m.ports,
-                            "<generated at start>",
-                            &config::NoCredentials,
-                        )
-                        .expect("relay_config succeeded")
-                    )
-                );
+                match config::from_profile(&profile, &m.ports, "<generated at start>", &creds) {
+                    Ok(y) => print!("{}", config::redact(&y)),
+                    Err(e) => return fail(&e),
+                }
                 println!(
                     "# relay {} -> {}",
                     relay.listen,
@@ -515,10 +521,13 @@ fn core_cmd(args: &[String], data_dir: &Path) -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             match m.up_with_relay(&host(), &relay, |p, s| {
-                config::from_profile(&profile, p, s, &config::NoCredentials)
-                    .map_err(|e| e.to_string())
+                config::from_profile(&profile, p, s, &creds).map_err(|e| e.to_string())
             }) {
                 Ok(o) => {
+                    if let Err(e) = m.apply_selections(&host(), &profile.routing) {
+                        let _ = m.down(&host());
+                        return fail(&e);
+                    }
                     println!(
                         "relay on {} and core pid {} running (mixed {})",
                         relay.listen, o.pid, m.ports.mixed
@@ -560,9 +569,73 @@ fn host() -> impl status::Host {
     return aec_core::testing::FakeHost::default();
 }
 
-fn profile_cmd(sub: Option<&str>, data_dir: &Path) -> ExitCode {
+fn profile_cmd(args: &[String], data_dir: &Path) -> ExitCode {
     let store = ProfileStore::new(data_dir);
-    match sub {
+    match args.first().map(String::as_str) {
+        #[cfg(windows)]
+        Some(action @ ("import" | "verify")) => {
+            let import = || -> Result<(), String> {
+                let source = args
+                    .get(1)
+                    .filter(|s| !s.starts_with("--"))
+                    .ok_or("a YAML path is required")?;
+                let text = std::fs::read_to_string(source).map_err(|_| "cannot read YAML file")?;
+                let namespace = aec_core::crypto::random_hex(16)
+                    .map_err(|_| "cannot allocate credential namespace")?;
+                let plan = aec_core::import::parse(&text, &namespace)?;
+                if action == "verify" {
+                    plan.verify(&text)?;
+                }
+                let counts = (
+                    plan.routing.outbounds.len(),
+                    plan.routing.groups.len(),
+                    plan.routing.rules.len() + 1,
+                );
+                if action == "verify" || args.iter().any(|s| s == "--dry-run") {
+                    println!(
+                        "validated: {} outbounds, {} groups, {} rules; nothing saved",
+                        counts.0, counts.1, counts.2
+                    );
+                    return Ok(());
+                }
+                let state_path = data_dir.join("state.json");
+                if state_path.exists() {
+                    let state: aec_core::controller::ControllerState = serde_json::from_slice(
+                        &std::fs::read(state_path).map_err(|_| "cannot read controller state")?,
+                    )
+                    .map_err(|_| "invalid controller state")?;
+                    if state.mode != aec_core::controller::Mode::Daily {
+                        return Err("exit Agent mode before importing routing".into());
+                    }
+                }
+                let set = if store.path().exists() {
+                    store.load().map_err(|e| e.to_string())?
+                } else {
+                    profile::ProfileSet::default()
+                };
+                if store.path().exists() {
+                    let previous = std::fs::read(store.path())
+                        .map_err(|_| "cannot back up existing profile")?;
+                    aec_core::store::write_atomic(
+                        &store
+                            .path()
+                            .with_extension(format!("json.before-import-{namespace}")),
+                        &previous,
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                plan.commit(set, &store, &aec_core::credentials::WindowsCredentials)?;
+                println!("imported: {} outbounds, {} groups, {} rules into {}; configure the exit in the tray before entering Agent mode", counts.0, counts.1, counts.2, store.path().display());
+                Ok(())
+            };
+            match import() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("import failed: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Some("init") => match store.init_if_missing() {
             Ok(true) => {
                 println!("wrote default profiles to {}", store.path().display());
@@ -614,7 +687,13 @@ fn snapshot_cmd(make_current: bool, data_dir: &Path) -> ExitCode {
         .and_then(|s| s.agent.first().map(|p| p.id.clone()));
     let st = status::collect(&host(), Some(data_dir));
     let (id, ms) = store.next_id();
-    let snap = EnvironmentSnapshot::from_status(id, ms, &st, profile_id, false);
+    let snap = EnvironmentSnapshot::from_status(
+        id,
+        ms,
+        &st,
+        profile_id,
+        aec_core::snapshot::Enabled::default(),
+    );
     match store.save(&snap, make_current) {
         Ok(removed) => {
             println!(
@@ -671,11 +750,29 @@ fn snapshots_cmd(data_dir: &Path) -> ExitCode {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let specified_dir = if let Some(i) = args.iter().position(|a| a == "--data-dir") {
+        if i + 1 == args.len() {
+            eprintln!("--data-dir requires a directory");
+            return ExitCode::from(2);
+        }
+        let path = PathBuf::from(args.remove(i + 1));
+        args.remove(i);
+        Some(path)
+    } else {
+        None
+    };
     let has = |flag: &str| args.iter().any(|a| a == flag);
     // Test hook: AEC_DEV_DATA_DIR points the command line at a scratch data directory.
-    let data_dir = std::env::var_os("AEC_DEV_DATA_DIR")
-        .map(PathBuf::from)
+    let data_dir = specified_dir
+        .or_else(|| std::env::var_os("AEC_DEV_DATA_DIR").map(PathBuf::from))
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(Path::to_path_buf))
+                .filter(|p| p.join(aec_core::paths::PORTABLE_FLAG).is_file())
+                .map(|p| p.join("data"))
+        })
         .unwrap_or_else(|| {
             RunMode::Dev {
                 repo_root: repo_root(),
@@ -696,7 +793,7 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Some("profile") => profile_cmd(args.get(1).map(String::as_str), &data_dir),
+        Some("profile") => profile_cmd(&args[1..], &data_dir),
         Some("snapshot") => snapshot_cmd(has("--current"), &data_dir),
         Some("snapshots") => snapshots_cmd(&data_dir),
         #[cfg(windows)]

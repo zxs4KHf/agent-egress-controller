@@ -3,7 +3,7 @@
 
 use std::fmt::Write as _;
 
-use crate::profile::AgentProfile;
+use crate::profile::{AgentProfile, RoutingGroupKind, RoutingRuleKind};
 
 use super::CorePorts;
 
@@ -40,15 +40,7 @@ pub enum ConfigError {
         candidate: String,
         reference: String,
     },
-    UnknownTemplate {
-        template: String,
-    },
-    FallbackMissing {
-        template: String,
-    },
-    NameCollision {
-        name: String,
-    },
+    InvalidRouting(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -62,17 +54,7 @@ impl std::fmt::Display for ConfigError {
                 f,
                 "candidate '{candidate}' needs credential '{reference}', which is not stored"
             ),
-            ConfigError::UnknownTemplate { template } => {
-                write!(f, "rule template '{template}' is not known to this version")
-            }
-            ConfigError::FallbackMissing { template } => write!(
-                f,
-                "rule template '{template}' needs a fallback upstream; without one, non-target traffic has nowhere to go"
-            ),
-            ConfigError::NameCollision { name } => write!(
-                f,
-                "'{name}' cannot be both the target group and the fallback upstream name"
-            ),
+            ConfigError::InvalidRouting(message) => write!(f, "invalid routing: {message}"),
         }
     }
 }
@@ -140,46 +122,45 @@ fn local_cidr_rules(y: &mut String) {
     }
 }
 
-/// Rules for a profile, chosen by its template.
-///
-/// `default-v1` sends everything an Agent entry opens through the target group, so a single browser
-/// session never shows two exit addresses. `split-v1` sends the target domains there and everything
-/// else to the fallback upstream, which keeps domestic traffic off the fixed exit.
-///
-/// An unknown template is an error, and so is `split-v1` without a fallback: both would otherwise
-/// end up matching everything against a rule the profile did not ask for.
-fn rules(profile: &AgentProfile) -> Result<String, ConfigError> {
-    use crate::profile::{TEMPLATE_DEFAULT, TEMPLATE_SPLIT};
-    let group = &profile.routing.target_group;
+/// Render rules in their declared order. Notes are comments, never YAML values or extra rules.
+fn rules(profile: &AgentProfile) -> String {
     let mut y = String::from("rules:\n");
-    local_cidr_rules(&mut y);
-    match profile.routing.rules_template.as_str() {
-        TEMPLATE_DEFAULT => {
-            let _ = writeln!(y, "  - {}", quote(&format!("MATCH,{group}")));
-        }
-        TEMPLATE_SPLIT => {
-            if profile.routing.fallback.is_none() {
-                return Err(ConfigError::FallbackMissing {
-                    template: TEMPLATE_SPLIT.to_string(),
-                });
+    for rule in &profile.routing.rules {
+        if let Some(note) = &rule.note {
+            for line in note.lines() {
+                let _ = writeln!(y, "  # {}", line.trim_start_matches([' ', '#']));
             }
-            for t in &profile.targets {
-                let _ = writeln!(
-                    y,
-                    "  - {}",
-                    quote(&format!("DOMAIN-SUFFIX,{},{}", t.domain, group))
-                );
-            }
-            let _ = writeln!(y, "  - {}", quote(&format!("MATCH,{FALLBACK_PROXY}")));
         }
-        other => {
-            return Err(ConfigError::UnknownTemplate {
-                template: other.to_string(),
-            })
-        }
+        let kind = match rule.kind {
+            RoutingRuleKind::Domain => "DOMAIN",
+            RoutingRuleKind::DomainSuffix => "DOMAIN-SUFFIX",
+            RoutingRuleKind::DomainKeyword => "DOMAIN-KEYWORD",
+            RoutingRuleKind::IpCidr if rule.value.contains(':') => "IP-CIDR6",
+            RoutingRuleKind::IpCidr => "IP-CIDR",
+            RoutingRuleKind::Geosite => "GEOSITE",
+            RoutingRuleKind::Geoip => "GEOIP",
+        };
+        let suffix = if rule.no_resolve { ",no-resolve" } else { "" };
+        let _ = writeln!(
+            y,
+            "  - {}",
+            quote(&format!(
+                "{kind},{},{target}{suffix}",
+                rule.value,
+                target = rule.target
+            ))
+        );
     }
-    Ok(y)
+    let _ = writeln!(
+        y,
+        "  - {}",
+        quote(&format!("MATCH,{}", profile.routing.final_target))
+    );
+    y
 }
+
+/// Name used by the built-in split preset, not by the routing renderer.
+pub const OTHER_GROUP: &str = "aec-other";
 
 /// Test configuration: the egress group contains only DIRECT. Ticket 03/04 use it to exercise the
 /// failure path ("exit equals the direct address") without any upstream or credential.
@@ -198,25 +179,13 @@ pub fn direct_test(ports: &CorePorts, secret: &str, group: &str) -> String {
     y
 }
 
-/// Name of the upstream that carries everything that is not a target domain (`split-v1`).
-pub const FALLBACK_PROXY: &str = "fallback";
-
 /// Name of the upstream the core sees for the candidate pool: this application's relay.
 pub const RELAY_PROXY: &str = "relay";
 
-fn proxy_type(proto: crate::profile::UpstreamProto) -> &'static str {
-    use crate::profile::UpstreamProto;
-    match proto {
-        UpstreamProto::Socks5 => "socks5",
-        UpstreamProto::Http => "http",
-    }
-}
-
 /// Core configuration for a profile.
 ///
-/// The candidate pool reaches the core only as the local relay (SPEC 4.13). The fallback upstream
-/// is different: the core dials it itself, so a fallback that needs credentials carries them here
-/// — [`redact`] is what keeps them out of anything displayed or logged.
+/// The candidate pool reaches the core only as the local relay (SPEC 4.13). Named routing
+/// outbounds are dialled by the core and may carry credentials in its transient config file.
 pub fn from_profile(
     profile: &AgentProfile,
     ports: &CorePorts,
@@ -226,52 +195,165 @@ pub fn from_profile(
     if profile.egress.candidates.is_empty() {
         return Err(ConfigError::NoCandidates);
     }
-    let group = &profile.routing.target_group;
-    if group == FALLBACK_PROXY {
-        return Err(ConfigError::NameCollision {
-            name: group.clone(),
-        });
+    let route_errors = crate::profile::validate_routing(&profile.routing);
+    if let Some(error) = route_errors.first() {
+        return Err(ConfigError::InvalidRouting(format!(
+            "{}: {}",
+            error.path, error.message
+        )));
     }
+    let tunnel = profile.egress.tunnel.as_ref().filter(|t| t.enabled);
+    let tunnel_pass = match tunnel {
+        Some(t) => Some(
+            creds
+                .get(&t.credential_ref)
+                .ok_or_else(|| ConfigError::MissingCredential {
+                    candidate: "egress.tunnel".into(),
+                    reference: t.credential_ref.clone(),
+                })?
+                .1,
+        ),
+        None => None,
+    };
     let mut y = header(ports, secret);
+    if profile.routing.uses_geodata() {
+        // GeoSite.dat / GeoIP.dat sit next to the config (CoreManager copies them in); the core
+        // must never fetch them by itself.
+        y.push_str("geodata-mode: true\ngeo-auto-update: false\n");
+    }
     let _ = writeln!(
         y,
         "proxies:\n  - name: {}\n    type: socks5\n    server: \"127.0.0.1\"\n    port: {}\n    udp: false",
         quote(RELAY_PROXY),
         ports.relay
     );
-    if let Some(fb) = &profile.routing.fallback {
+    for outbound in &profile.routing.outbounds {
         let _ = writeln!(
             y,
             "  - name: {}\n    type: {}\n    server: {}\n    port: {}\n    udp: false",
-            quote(FALLBACK_PROXY),
-            proxy_type(fb.proto),
-            quote(&fb.host),
-            fb.port
+            quote(&outbound.name),
+            match outbound.kind {
+                crate::profile::RoutingOutboundKind::Http => "http",
+                crate::profile::RoutingOutboundKind::Socks5 => "socks5",
+                crate::profile::RoutingOutboundKind::Shadowsocks => "ss",
+            },
+            quote(&outbound.server),
+            outbound.port
         );
-        if let Some(reference) = &fb.credential_ref {
+        if let Some(dialer) = &outbound.dialer_proxy {
+            let _ = writeln!(y, "    dialer-proxy: {}", quote(dialer));
+        }
+        if let Some(cipher) = &outbound.cipher {
+            let _ = writeln!(y, "    cipher: {}", quote(cipher));
+        }
+        if let Some(reference) = &outbound.credential_ref {
             let (user, pass) =
                 creds
                     .get(reference)
                     .ok_or_else(|| ConfigError::MissingCredential {
-                        candidate: "routing.fallback".into(),
+                        candidate: outbound.name.clone(),
                         reference: reference.clone(),
                     })?;
+            if outbound.kind != crate::profile::RoutingOutboundKind::Shadowsocks {
+                let _ = writeln!(y, "    username: {}", quote(&user));
+            }
+            let _ = writeln!(y, "    password: {}", quote(&pass));
+        }
+    }
+    if let (Some(t), Some(pass)) = (tunnel, &tunnel_pass) {
+        for (i, s) in t.servers.iter().enumerate() {
             let _ = writeln!(
                 y,
-                "    username: {}\n    password: {}",
-                quote(&user),
-                quote(&pass)
+                "  - name: {}\n    type: ss\n    server: {}\n    port: {}\n    cipher: {}\n    password: {}\n    udp: false",
+                quote(&format!("{TUNNEL_PROXY_PREFIX}{}", i + 1)),
+                quote(&s.host),
+                s.port,
+                quote(&t.cipher),
+                quote(pass)
             );
         }
     }
-    let _ = writeln!(
-        y,
-        "proxy-groups:\n  - name: {}\n    type: select\n    proxies:\n      - {}",
-        quote(group),
-        quote(RELAY_PROXY)
-    );
-    y.push_str(&rules(profile)?);
+    y.push_str(if profile.routing.groups.is_empty() && tunnel.is_none() {
+        "proxy-groups: []\n"
+    } else {
+        "proxy-groups:\n"
+    });
+    for group in &profile.routing.groups {
+        let kind = match group.kind {
+            RoutingGroupKind::Select => "select",
+            RoutingGroupKind::Fallback => "fallback",
+            RoutingGroupKind::UrlTest => "url-test",
+        };
+        let _ = writeln!(y, "  - name: {}\n    type: {kind}", quote(&group.name));
+        if let Some(check) = &group.check {
+            let _ = writeln!(
+                y,
+                "    url: {}\n    interval: {}\n    tolerance: {}",
+                quote(&check.url),
+                check.interval_sec,
+                check.tolerance_ms
+            );
+        }
+        y.push_str("    proxies:\n");
+        for member in &group.members {
+            let _ = writeln!(y, "      - {}", quote(member));
+        }
+    }
+    if let Some(t) = tunnel {
+        // fallback: the first server that answers the health check carries the tunnel; a dead
+        // server is skipped without touching the relay.
+        let _ = writeln!(
+            y,
+            "  - name: {}\n    type: fallback\n    url: {}\n    interval: 120\n    proxies:",
+            quote(TUNNEL_GROUP),
+            quote(TUNNEL_CHECK_URL)
+        );
+        for i in 0..t.servers.len() {
+            let _ = writeln!(
+                y,
+                "      - {}",
+                quote(&format!("{TUNNEL_PROXY_PREFIX}{}", i + 1))
+            );
+        }
+        // The relay's way in: a loopback-only listener whose every connection goes to the tunnel,
+        // whatever the rules below say.
+        let _ = writeln!(
+            y,
+            "listeners:\n  - name: {}\n    type: mixed\n    listen: \"127.0.0.1\"\n    port: {}\n    udp: false\n    proxy: {}",
+            quote(TUNNEL_LISTENER),
+            ports.tunnel,
+            quote(TUNNEL_GROUP)
+        );
+    }
+    y.push_str(&rules(profile));
     Ok(y)
+}
+
+/// Names the tunnel uses inside the core's configuration.
+pub const TUNNEL_GROUP: &str = "aec-tunnel";
+pub const TUNNEL_PROXY_PREFIX: &str = "aec-tunnel-";
+const TUNNEL_LISTENER: &str = "aec-tunnel-in";
+const TUNNEL_CHECK_URL: &str = "http://www.gstatic.com/generate_204";
+
+/// Ports a generated configuration listens on beyond [`CorePorts::all`]: the tunnel entrance, when
+/// the profile has one. The core counts as started only once these listen too.
+pub fn extra_listen_ports(config: &str) -> Vec<u16> {
+    let mut out = Vec::new();
+    let mut in_listeners = false;
+    for line in config.lines() {
+        if !line.starts_with(' ') {
+            in_listeners = line.trim_end() == "listeners:";
+            continue;
+        }
+        if in_listeners {
+            if let Some(p) = line.trim().strip_prefix("port: ") {
+                if let Ok(p) = p.parse() {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The relay's configuration for a profile: the candidate pool with credentials resolved, and the
@@ -305,7 +387,23 @@ pub fn relay_config(
             proto: c.proto,
             user,
             pass,
+            via: None,
+            step_timeout_ms: None,
         });
+    }
+    // With a tunnel, every candidate is tried through it first; the direct attempts follow only when
+    // the profile allows them. The exit host is the same either way, so S1 still holds.
+    if let Some(t) = profile.egress.tunnel.as_ref().filter(|t| t.enabled) {
+        let tunnelled = candidates.iter().cloned().map(|mut u| {
+            u.via = Some(format!("127.0.0.1:{}", ports.tunnel));
+            u.step_timeout_ms = Some(t.step_timeout_ms.into());
+            u
+        });
+        candidates = if t.direct_fallback {
+            tunnelled.chain(candidates.iter().cloned()).collect()
+        } else {
+            tunnelled.collect()
+        };
     }
     let r = &profile.egress.relay;
     Ok(crate::relay::RelayConfig {
@@ -344,7 +442,7 @@ pub fn redact(config: &str) -> String {
 mod tests {
     use super::*;
     use crate::profile::{
-        Candidate, FallbackUpstream, ProfileSet, Target, UpstreamProto, TEMPLATE_SPLIT,
+        Candidate, ProfileSet, Routing, RoutingOutbound, RoutingOutboundKind, Target, UpstreamProto,
     };
 
     struct Creds;
@@ -375,13 +473,114 @@ mod tests {
         p
     }
 
-    fn fallback() -> FallbackUpstream {
-        FallbackUpstream {
-            host: "203.0.113.10".into(),
+    fn fallback() -> RoutingOutbound {
+        RoutingOutbound {
+            name: "daily-proxy".into(),
+            server: "203.0.113.10".into(),
             port: 1080,
-            proto: UpstreamProto::Http,
+            kind: RoutingOutboundKind::Http,
             credential_ref: None,
+            cipher: None,
+            dialer_proxy: None,
         }
+    }
+
+    struct TunnelCreds;
+    impl CredentialSource for TunnelCreds {
+        fn get(&self, r: &str) -> Option<(String, String)> {
+            match r {
+                "c1" => Some(("u".into(), "exit-pass".into())),
+                "tunnel" => Some(("ss".into(), "tunnel-pass".into())),
+                _ => None,
+            }
+        }
+    }
+
+    fn with_tunnel(direct_fallback: bool) -> AgentProfile {
+        let mut p = profile();
+        p.egress.tunnel = Some(crate::profile::Tunnel {
+            enabled: true,
+            preset: None,
+            servers: vec![
+                crate::profile::TunnelServer {
+                    host: "tunnel-a.example".into(),
+                    port: 8388,
+                },
+                crate::profile::TunnelServer {
+                    host: "tunnel-b.example".into(),
+                    port: 8388,
+                },
+            ],
+            cipher: "chacha20-ietf-poly1305".into(),
+            credential_ref: "tunnel".into(),
+            direct_fallback,
+            step_timeout_ms: 2500,
+        });
+        p
+    }
+
+    #[test]
+    fn tunnel_runs_in_the_core_and_the_exit_credentials_stay_out() {
+        let y = from_profile(&with_tunnel(true), &CorePorts::default(), "s", &TunnelCreds).unwrap();
+        for needle in [
+            "  - name: \"aec-tunnel-1\"\n    type: ss\n    server: \"tunnel-a.example\"\n    port: 8388\n    cipher: \"chacha20-ietf-poly1305\"\n    password: \"tunnel-pass\"",
+            "  - name: \"aec-tunnel\"\n    type: fallback",
+            "      - \"aec-tunnel-2\"",
+            "listeners:\n  - name: \"aec-tunnel-in\"\n    type: mixed\n    listen: \"127.0.0.1\"\n    port: 17326\n    udp: false\n    proxy: \"aec-tunnel\"",
+            "- \"MATCH,agent-egress\"",
+        ] {
+            assert!(y.contains(needle), "missing {needle:?} in\n{y}");
+        }
+        assert!(
+            !y.contains("exit-pass") && !y.contains("198.51.100.7"),
+            "the exit stays in the relay"
+        );
+        assert!(!redact(&y).contains("tunnel-pass"));
+        assert_eq!(extra_listen_ports(&y), vec![17326]);
+        assert!(extra_listen_ports(
+            &from_profile(&profile(), &CorePorts::default(), "s", &NoCredentials).unwrap()
+        )
+        .is_empty());
+
+        let mut off = with_tunnel(true);
+        off.egress.tunnel.as_mut().unwrap().enabled = false;
+        let y = from_profile(&off, &CorePorts::default(), "s", &NoCredentials).unwrap();
+        assert!(!y.contains("aec-tunnel") && !y.contains("listeners:"));
+    }
+
+    #[test]
+    fn tunnel_without_its_password_fails_closed() {
+        let err = from_profile(&with_tunnel(true), &CorePorts::default(), "s", &Creds).unwrap_err();
+        assert_eq!(
+            err,
+            ConfigError::MissingCredential {
+                candidate: "egress.tunnel".into(),
+                reference: "tunnel".into()
+            }
+        );
+    }
+
+    #[test]
+    fn relay_tries_the_tunnel_first_then_direct() {
+        let r = relay_config(&with_tunnel(true), &CorePorts::default(), &TunnelCreds).unwrap();
+        let shape: Vec<(u16, Option<&str>, Option<u64>)> = r
+            .candidates
+            .iter()
+            .map(|u| (u.port, u.via.as_deref(), u.step_timeout_ms))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (12324, Some("127.0.0.1:17326"), Some(2500)),
+                (12323, Some("127.0.0.1:17326"), Some(2500)),
+                (12324, None, None),
+                (12323, None, None),
+            ]
+        );
+        assert_eq!(r.candidates[0].pass.as_deref(), Some("exit-pass"));
+        let only = relay_config(&with_tunnel(false), &CorePorts::default(), &TunnelCreds).unwrap();
+        assert!(only.candidates.iter().all(|u| u.via.is_some()));
+        assert_eq!(only.candidates.len(), 2);
     }
 
     #[test]
@@ -436,8 +635,6 @@ mod tests {
     #[test]
     fn split_template_sends_targets_to_the_group_and_the_rest_to_the_fallback() {
         let mut p = profile();
-        p.routing.rules_template = TEMPLATE_SPLIT.into();
-        p.routing.fallback = Some(fallback());
         p.targets = ["claude.ai", "chatgpt.com"]
             .iter()
             .map(|d| Target {
@@ -445,21 +642,41 @@ mod tests {
                 trace: true,
             })
             .collect();
+        p.routing = Routing::preset(
+            "agent-egress",
+            &p.targets,
+            true,
+            &["openai.com".into(), "claude.ai".into()],
+            true,
+            Some(fallback()),
+        );
         let y = from_profile(&p, &CorePorts::default(), "s", &NoCredentials).unwrap();
         for needle in [
-            "  - name: \"fallback\"\n    type: http\n    server: \"203.0.113.10\"\n    port: 1080\n    udp: false",
+            "geodata-mode: true\ngeo-auto-update: false\n",
+            "  - name: \"daily-proxy\"\n    type: http\n    server: \"203.0.113.10\"\n    port: 1080\n    udp: false",
+            "  - name: \"aec-other\"\n    type: fallback\n    url: \"https://www.gstatic.com/generate_204\"\n    interval: 15\n    tolerance: 0\n    proxies:\n      - \"daily-proxy\"\n      - \"DIRECT\"",
             "- \"DOMAIN-SUFFIX,claude.ai,agent-egress\"",
             "- \"DOMAIN-SUFFIX,chatgpt.com,agent-egress\"",
-            "- \"MATCH,fallback\"",
+            "- \"DOMAIN-SUFFIX,openai.com,agent-egress\"",
+            "- \"GEOSITE,cn,DIRECT\"",
+            "- \"GEOIP,CN,DIRECT,no-resolve\"",
+            "- \"MATCH,aec-other\"",
         ] {
             assert!(y.contains(needle), "missing {needle:?} in\n{y}");
         }
-        // The catch-all must come after the target rules, and the loopback bypass before both.
+        assert_eq!(
+            y.matches("DOMAIN-SUFFIX,claude.ai,").count(),
+            1,
+            "a domain in both lists appears once"
+        );
+        // Loopback bypass first, then the fixed-exit domains, then domestic, then the catch-all:
+        // no later rule can take an AI domain elsewhere.
         let order: Vec<usize> = [
             "IP-CIDR,127.0.0.0/8",
             "DOMAIN-SUFFIX,claude.ai",
-            "DOMAIN-SUFFIX,chatgpt.com",
-            "MATCH,fallback",
+            "DOMAIN-SUFFIX,openai.com",
+            "GEOSITE,cn",
+            "MATCH,aec-other",
         ]
         .iter()
         .map(|n| y.find(n).unwrap_or_else(|| panic!("missing {n}")))
@@ -468,45 +685,63 @@ mod tests {
     }
 
     #[test]
+    fn split_without_a_proxy_sends_the_rest_direct() {
+        let mut p = profile();
+        p.routing = Routing::preset("agent-egress", &p.targets, true, &[], false, None);
+        let y = from_profile(&p, &CorePorts::default(), "s", &NoCredentials).unwrap();
+        assert!(y.contains("- \"MATCH,DIRECT\""), "{y}");
+        assert!(
+            !y.contains("aec-other") && !y.contains("geodata-mode"),
+            "{y}"
+        );
+    }
+
+    #[test]
+    fn default_template_keeps_everything_on_the_exit_but_domestic() {
+        let mut p = profile();
+        let y = from_profile(&p, &CorePorts::default(), "s", &NoCredentials).unwrap();
+        assert!(y.contains("- \"MATCH,agent-egress\""), "{y}");
+        assert!(
+            !y.contains("\"daily-proxy\""),
+            "no optional daily proxy in the default: {y}"
+        );
+        p.routing = Routing::preset("agent-egress", &p.targets, false, &[], true, None);
+        let y = from_profile(&p, &CorePorts::default(), "s", &NoCredentials).unwrap();
+        let (geo, all) = (
+            y.find("GEOSITE,cn").unwrap(),
+            y.find("MATCH,agent-egress").unwrap(),
+        );
+        assert!(geo < all);
+    }
+
+    #[test]
     fn templates_and_names_fail_closed() {
         let mut p = profile();
-        p.routing.rules_template = "split-v2".into();
-        assert_eq!(
-            from_profile(&p, &CorePorts::default(), "s", &NoCredentials).unwrap_err(),
-            ConfigError::UnknownTemplate {
-                template: "split-v2".into()
-            }
-        );
-        let mut p = profile();
-        p.routing.rules_template = TEMPLATE_SPLIT.into();
-        p.routing.fallback = None;
-        assert_eq!(
-            from_profile(&p, &CorePorts::default(), "s", &NoCredentials).unwrap_err(),
-            ConfigError::FallbackMissing {
-                template: TEMPLATE_SPLIT.into()
-            }
-        );
-        let mut p = profile();
-        p.routing.target_group = FALLBACK_PROXY.into();
-        assert_eq!(
-            from_profile(&p, &CorePorts::default(), "s", &NoCredentials).unwrap_err(),
-            ConfigError::NameCollision {
-                name: FALLBACK_PROXY.into()
-            }
-        );
+        p.routing.final_target = "missing".into();
+        assert!(matches!(
+            from_profile(&p, &CorePorts::default(), "s", &NoCredentials),
+            Err(ConfigError::InvalidRouting(_))
+        ));
+        for name in ["relay", TUNNEL_GROUP] {
+            let mut p = profile();
+            p.routing.groups[0].name = name.into();
+            assert!(matches!(
+                from_profile(&p, &CorePorts::default(), "s", &NoCredentials),
+                Err(ConfigError::InvalidRouting(_))
+            ));
+        }
     }
 
     #[test]
     fn fallback_credentials_come_from_the_store_and_are_redacted() {
         let mut p = profile();
-        p.routing.rules_template = TEMPLATE_SPLIT.into();
         let mut fb = fallback();
         fb.credential_ref = Some("c1".into());
-        p.routing.fallback = Some(fb);
+        p.routing = Routing::preset("agent-egress", &p.targets, true, &[], false, Some(fb));
         assert_eq!(
             from_profile(&p, &CorePorts::default(), "s", &NoCredentials).unwrap_err(),
             ConfigError::MissingCredential {
-                candidate: "routing.fallback".into(),
+                candidate: "daily-proxy".into(),
                 reference: "c1".into()
             }
         );
@@ -537,7 +772,7 @@ mod tests {
         assert_eq!(r.candidates[1].user, None);
         assert_eq!(
             (r.dial_budget_ms, r.max_inflight, r.max_rounds),
-            (4000, 3, 3)
+            (4000, 12, 3)
         );
     }
 

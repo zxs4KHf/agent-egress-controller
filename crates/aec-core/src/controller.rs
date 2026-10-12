@@ -23,7 +23,7 @@ use crate::log::{Level, Logger};
 use crate::model::ProxySettings;
 use crate::profile::Entry;
 use crate::profile::{validate_agent_profile, AgentProfile, ProxyScopeMode};
-use crate::snapshot::{EnvironmentSnapshot, TakeoverGate};
+use crate::snapshot::{Enabled, EnvironmentSnapshot, GateState, ItemGate, TakeoverGate};
 use crate::status::EnvironmentStatus;
 use crate::store::{write_atomic, SnapshotStore, StoreError};
 
@@ -123,6 +123,9 @@ pub struct ControllerState {
     /// Foreign writers seen when entering.
     #[serde(default)]
     pub foreign_writers: Vec<String>,
+    /// The system proxy item of the takeover gate as evaluated when entering; G6 depends on it.
+    #[serde(default)]
+    pub system_proxy_gate: ItemGate,
 }
 
 impl Default for ControllerState {
@@ -139,6 +142,7 @@ impl Default for ControllerState {
             correlation_id: None,
             timezone_writable: false,
             foreign_writers: Vec::new(),
+            system_proxy_gate: ItemGate::default(),
         }
     }
 }
@@ -309,8 +313,19 @@ fn is_ready(report: &CheckReport) -> bool {
             .all(|r| r.status == Status::Pass)
 }
 
+/// What [`Controller::keep_system_proxy`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeepOutcome {
+    /// An external change was observed. No system setting is rewritten (ADR-0004).
+    Changed {
+        found: String,
+    },
+    Failed(String),
+}
+
 pub struct Controller<P: Platform> {
     platform: P,
+    last_proxy_change: Option<GlobalValue>,
     settings: Settings,
     state_path: PathBuf,
     snapshots: SnapshotStore,
@@ -341,6 +356,7 @@ impl<P: Platform> Controller<P> {
         let recovery_pending = state.mode != Mode::Daily;
         let c = Self {
             platform,
+            last_proxy_change: None,
             settings,
             snapshots: SnapshotStore::new(data_dir),
             log: Logger::new(data_dir),
@@ -408,6 +424,25 @@ impl<P: Platform> Controller<P> {
         self.persist()
     }
 
+    /// What the user switched on: the time zone in the settings, system-level routing in the profile.
+    pub fn enabled(&self, profile: &AgentProfile) -> Enabled {
+        Enabled {
+            system_proxy: profile.proxy_scope.mode == ProxyScopeMode::SystemAndExplicit,
+            timezone: self.settings.takeover_enabled,
+        }
+    }
+
+    /// The system proxy this application sets for a profile: the core's mixed port, with the
+    /// profile's bypass list, and nothing automatic left on.
+    fn system_proxy_target(&self, profile: &AgentProfile) -> ProxySettings {
+        ProxySettings {
+            flags: crate::model::proxy_flags::DIRECT | crate::model::proxy_flags::PROXY,
+            proxy_server: Some(format!("127.0.0.1:{}", self.platform.core_port())),
+            bypass: Some(profile.proxy_scope.bypass.join(";")),
+            auto_config_url: None,
+        }
+    }
+
     /// Global changes the profile asks for.
     fn plan(
         &self,
@@ -429,12 +464,7 @@ impl<P: Platform> Controller<P> {
         }
         if profile.proxy_scope.mode == ProxyScopeMode::SystemAndExplicit {
             if let Some(p) = before.system_proxy.value() {
-                let target = ProxySettings {
-                    flags: crate::model::proxy_flags::DIRECT | crate::model::proxy_flags::PROXY,
-                    proxy_server: Some(format!("127.0.0.1:{}", self.platform.core_port())),
-                    bypass: Some(profile.proxy_scope.bypass.join(";")),
-                    auto_config_url: None,
-                };
+                let target = self.system_proxy_target(profile);
                 if *p != target {
                     plan.push((
                         GlobalValue::SystemProxy { value: p.clone() },
@@ -467,6 +497,7 @@ impl<P: Platform> Controller<P> {
         );
 
         // E1 preflight: nothing has changed yet, so a failure simply returns.
+        self.last_proxy_change = None;
         let problems: Vec<_> = validate_agent_profile(profile)
             .into_iter()
             .filter(|e| !(opts.direct_test && e.path == "agent.egress.candidates"))
@@ -500,13 +531,9 @@ impl<P: Platform> Controller<P> {
         self.set(Mode::Entering, Some(Phase::Snapshot))?;
         let status = self.platform.read_status();
         let (id, ms) = self.snapshots.next_id();
-        let snap = EnvironmentSnapshot::from_status(
-            id,
-            ms,
-            &status,
-            Some(profile.id.clone()),
-            self.settings.takeover_enabled,
-        );
+        let enabled = self.enabled(profile);
+        let snap =
+            EnvironmentSnapshot::from_status(id, ms, &status, Some(profile.id.clone()), enabled);
         if !snap.is_restorable() {
             return self.abort(
                 profile,
@@ -520,11 +547,8 @@ impl<P: Platform> Controller<P> {
             return self.abort(profile, Fault::new("IO_WRITE", e.to_string()));
         }
         self.state.active_snapshot_id = Some(snap.id.clone());
-        let gate = TakeoverGate::evaluate(
-            self.settings.takeover_enabled,
-            &status.foreign_writers,
-            true,
-        );
+        let gate = TakeoverGate::evaluate(enabled, &status.foreign_writers, true);
+        self.state.system_proxy_gate = gate.system_proxy.clone();
         self.state.timezone_writable = gate.allows(GlobalItem::Timezone);
         self.state.foreign_writers = status
             .foreign_writers
@@ -697,12 +721,135 @@ impl<P: Platform> Controller<P> {
         let (hard, soft): (Vec<_>, Vec<_>) = browser_results
             .into_iter()
             .partition(|r| r.kind == Kind::Hard);
+        let hard_count = hard.len();
         for (i, r) in hard.into_iter().enumerate() {
             report.results.insert(at + 1 + i, r);
+        }
+        if let Some(g6) = self.system_scope_check(profile) {
+            report
+                .results
+                .insert((at + 1 + hard_count).min(report.results.len()), g6);
         }
         report.results.extend(tz);
         report.results.extend(soft);
         complete_report(report, profile)
+    }
+
+    /// G6 (SPEC 4.5): with system-level routing on, the system proxy must point at the core.
+    fn system_scope_check(&self, profile: &AgentProfile) -> Option<CheckResult> {
+        if profile.proxy_scope.mode != ProxyScopeMode::SystemAndExplicit {
+            return None;
+        }
+        let target = self.system_proxy_target(profile);
+        let want = target.proxy_server.clone().unwrap_or_default();
+        let r = match self.platform.read_global(GlobalItem::SystemProxy) {
+            Ok(GlobalValue::SystemProxy { value }) if value == target => {
+                CheckResult::new("G6", Kind::Hard, Status::Pass, None).with(
+                    "system proxy",
+                    format!("points at this application's core ({want})"),
+                )
+            }
+            Ok(GlobalValue::SystemProxy { value }) => {
+                let seen = format!(
+                    "proxy {} (enabled: {}), bypass {}, setup script {}",
+                    value.proxy_server.as_deref().unwrap_or("none"),
+                    value.proxy_enabled(),
+                    value.bypass.as_deref().unwrap_or("none"),
+                    value.auto_config_url.as_deref().unwrap_or("none")
+                );
+                if self.state.system_proxy_gate.state == GateState::Open {
+                    CheckResult::new("G6", Kind::Hard, Status::Fail, Some("system_proxy_changed"))
+                        .with("system proxy", seen)
+                        .with("wanted", want)
+                } else {
+                    let mut r = CheckResult::new(
+                        "G6",
+                        Kind::Hard,
+                        Status::Unknown,
+                        Some("global_state_not_taken_over"),
+                    )
+                    .with("system proxy", seen);
+                    for reason in &self.state.system_proxy_gate.reasons {
+                        r = r.with("gate", reason.clone());
+                    }
+                    r
+                }
+            }
+            Ok(other) => CheckResult::new("G6", Kind::Hard, Status::Unknown, Some("read_failed"))
+                .with("system proxy", format!("unexpected value {other:?}")),
+            Err(f) => CheckResult::new("G6", Kind::Hard, Status::Unknown, Some("read_failed"))
+                .with("system proxy", f.to_string()),
+        };
+        Some(r)
+    }
+
+    /// Observe external system-proxy changes without writing over another application. Invalidate
+    /// readiness immediately and notify once per observed value; a full recheck can restore it.
+    pub fn keep_system_proxy(&mut self) -> Option<KeepOutcome> {
+        if !matches!(self.state.mode, Mode::AgentReady | Mode::AgentUnverified) {
+            return None;
+        }
+        let ours = self.state.journal.iter().rev().find_map(|e| match e {
+            JournalEntry::Global {
+                after: after @ GlobalValue::SystemProxy { .. },
+                dry_run: false,
+                ..
+            } => Some(after.clone()),
+            _ => None,
+        })?;
+        let current = match self.platform.read_global(GlobalItem::SystemProxy) {
+            Ok(v) => v,
+            Err(f) => {
+                self.state.mode = Mode::AgentUnverified;
+                if let Some(report) = &mut self.state.last_report {
+                    if let Some(g6) = report.results.iter_mut().find(|r| r.id == "G6") {
+                        *g6 = CheckResult::new(
+                            "G6",
+                            Kind::Hard,
+                            Status::Unknown,
+                            Some("system_proxy_unreadable"),
+                        );
+                    }
+                }
+                if let Err(persist) = self.persist() {
+                    return Some(KeepOutcome::Failed(persist.to_string()));
+                }
+                return Some(KeepOutcome::Failed(f.to_string()));
+            }
+        };
+        if current == ours {
+            self.last_proxy_change = None;
+            return None;
+        }
+        if self.last_proxy_change.as_ref() == Some(&current) {
+            return None;
+        }
+        self.last_proxy_change = Some(current.clone());
+        let found = match &current {
+            GlobalValue::SystemProxy { value } if value.proxy_enabled() => value
+                .proxy_server
+                .clone()
+                .unwrap_or_else(|| "(empty)".into()),
+            GlobalValue::SystemProxy { .. } => "off".into(),
+            other => format!("{other:?}"),
+        };
+        self.state.mode = Mode::AgentUnverified;
+        if let Some(report) = &mut self.state.last_report {
+            if let Some(g6) = report.results.iter_mut().find(|r| r.id == "G6") {
+                *g6 =
+                    CheckResult::new("G6", Kind::Hard, Status::Fail, Some("system_proxy_changed"))
+                        .with("system proxy", found.clone());
+            }
+        }
+        if let Err(f) = self.persist() {
+            return Some(KeepOutcome::Failed(f.to_string()));
+        }
+        self.event(
+            Level::Warn,
+            "observe.system_proxy.changed",
+            json!({ "found": found }),
+        );
+        Some(KeepOutcome::Changed { found })
     }
 
     fn abort(&mut self, _profile: &AgentProfile, fault: Fault) -> Result<EnterOutcome, Fault> {
@@ -712,8 +859,7 @@ impl<P: Platform> Controller<P> {
             json!({ "code": fault.code, "message": fault.message }),
         );
         let rollback = self.leave("rollback");
-        let gate =
-            TakeoverGate::evaluate(self.settings.takeover_enabled, &Default::default(), false);
+        let gate = TakeoverGate::evaluate(self.enabled(_profile), &Default::default(), false);
         Ok(EnterOutcome {
             mode: rollback.mode_after,
             gate,
@@ -721,6 +867,19 @@ impl<P: Platform> Controller<P> {
             fault: Some(fault),
             rollback: Some(rollback),
         })
+    }
+
+    /// A route selection invalidates earlier evidence before a request to the control API starts.
+    pub fn invalidate_routing_checks(&mut self) -> Result<(), Fault> {
+        if !matches!(self.state.mode, Mode::AgentReady | Mode::AgentUnverified) {
+            return Err(Fault::new(
+                "MODE_INVALID",
+                "route switching requires Agent mode",
+            ));
+        }
+        self.state.mode = Mode::AgentUnverified;
+        self.state.last_report = None;
+        self.persist()
     }
 
     /// Re-run the checks while in Agent mode.
@@ -1000,6 +1159,7 @@ impl<P: Platform> Controller<P> {
             self.state.correlation_id = None;
             self.state.timezone_writable = false;
             self.state.foreign_writers.clear();
+            self.state.system_proxy_gate = ItemGate::default();
         }
         let _ = self.persist();
         RestoreReport { items, mode_after }
@@ -1045,6 +1205,7 @@ mod tests {
         hard: Status,
         writes: RefCell<Vec<GlobalValue>>,
         fail_restore_write: Cell<bool>,
+        fail_read_global: Cell<bool>,
         /// Entry pids currently "running".
         entries: RefCell<Vec<u32>>,
         /// Entries refuse to close while set.
@@ -1077,6 +1238,7 @@ mod tests {
                 hard: Status::Pass,
                 writes: RefCell::new(Vec::new()),
                 fail_restore_write: Cell::new(false),
+                fail_read_global: Cell::new(false),
                 entries: RefCell::new(Vec::new()),
                 stubborn: Cell::new(false),
                 signals: RefCell::new(Some(good_signals())),
@@ -1191,6 +1353,9 @@ mod tests {
             Ok(CloseOutcome::Closed)
         }
         fn read_global(&self, item: GlobalItem) -> Result<GlobalValue, Fault> {
+            if self.fail_read_global.get() {
+                return Err(Fault::new("ADAPTER_READ_FAILED", "test"));
+            }
             let h = self.host.borrow();
             Ok(match item {
                 GlobalItem::Timezone => GlobalValue::Timezone {
@@ -1503,6 +1668,107 @@ mod tests {
             (h.timezone.windows_id.as_str(), h.proxy.proxy_server.clone()),
             ("China Standard Time", None)
         );
+    }
+
+    fn system_scope() -> AgentProfile {
+        let mut prof = profile();
+        prof.proxy_scope.mode = ProxyScopeMode::SystemAndExplicit;
+        prof
+    }
+
+    fn g6(r: &CheckReport) -> &CheckResult {
+        r.results.iter().find(|r| r.id == "G6").expect("G6 present")
+    }
+
+    #[test]
+    fn external_proxy_change_is_reported_without_competing_writes() {
+        let d = tmp("keep");
+        let mut c = open(FakePlatform::new(), &d, true);
+        let prof = system_scope();
+        let out = c.enter(&prof, EnterOptions::default()).unwrap();
+        assert_eq!(g6(out.report.as_ref().unwrap()).status, Status::Pass);
+        assert_eq!(
+            c.keep_system_proxy(),
+            None,
+            "nothing to do while it is ours"
+        );
+
+        // A Clash-style client turns its own "system proxy" switch on.
+        let clash = ProxySettings {
+            flags: proxy_flags::DIRECT | proxy_flags::PROXY,
+            proxy_server: Some("127.0.0.1:7890".into()),
+            bypass: None,
+            auto_config_url: None,
+        };
+        c.platform().host.borrow_mut().proxy = clash.clone();
+        let r = c.recheck(&prof).unwrap();
+        assert_eq!(
+            (g6(&r).status, g6(&r).reason.as_deref()),
+            (Status::Fail, Some("system_proxy_changed"))
+        );
+        let _ = c.keep_system_proxy();
+        assert_eq!(
+            c.platform().host.borrow().proxy,
+            clash,
+            "ADR-0004: observe an external writer, never fight it"
+        );
+        assert_eq!(c.state().mode, Mode::AgentUnverified);
+    }
+
+    #[test]
+    fn unreadable_proxy_invalidates_previous_pass_without_writing() {
+        let d = tmp("keep-read-failed");
+        let mut c = open(FakePlatform::new(), &d, true);
+        c.enter(&system_scope(), EnterOptions::default()).unwrap();
+        assert_eq!(c.state().mode, Mode::AgentReady);
+        let writes = c.platform().writes.borrow().len();
+        c.platform().fail_read_global.set(true);
+        assert!(matches!(
+            c.keep_system_proxy(),
+            Some(KeepOutcome::Failed(_))
+        ));
+        assert_eq!(c.state().mode, Mode::AgentUnverified);
+        assert_eq!(
+            g6(c.state().last_report.as_ref().unwrap()).status,
+            Status::Unknown
+        );
+        assert_eq!(c.platform().writes.borrow().len(), writes);
+        let saved: ControllerState =
+            serde_json::from_slice(&std::fs::read(d.join("state.json")).unwrap()).unwrap();
+        assert_eq!(saved.mode, Mode::AgentUnverified);
+    }
+
+    #[test]
+    fn without_system_scope_there_is_no_g6_and_nothing_to_keep() {
+        let d = tmp("nokeep");
+        let mut c = open(FakePlatform::new(), &d, true);
+        let out = c.enter(&profile(), EnterOptions::default()).unwrap();
+        assert!(out.report.unwrap().results.iter().all(|r| r.id != "G6"));
+        assert_eq!(c.keep_system_proxy(), None);
+    }
+
+    #[test]
+    fn system_level_routing_switched_off_reads_as_unknown_not_pass() {
+        let d = tmp("g6off");
+        // System scope in the profile, but the snapshot could not be persisted for this item: use
+        // a legacy mutex, which still holds both items back.
+        let p = FakePlatform::new();
+        p.host
+            .borrow_mut()
+            .mutexes
+            .insert("Local\\AIEgressGuard".into());
+        let mut c = open(p, &d, true);
+        let out = c.enter(&system_scope(), EnterOptions::default()).unwrap();
+        let r = out.report.unwrap();
+        assert_eq!(
+            (g6(&r).status, g6(&r).reason.as_deref()),
+            (Status::Unknown, Some("global_state_not_taken_over"))
+        );
+        assert!(g6(&r)
+            .evidence
+            .iter()
+            .any(|e| e.detail.contains("AIEgressGuard")));
+        assert_eq!(c.keep_system_proxy(), None, "never written, so never kept");
     }
 
     #[test]
