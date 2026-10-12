@@ -309,8 +309,8 @@ pub fn browser_checks(
 pub struct TimezoneContext {
     /// Current system time zone (Windows id).
     pub current: Result<String, String>,
-    /// The takeover gate was open when Agent mode was entered.
-    pub gate_open: bool,
+    /// The time zone item of the takeover gate was open when Agent mode was entered.
+    pub timezone_writable: bool,
     /// This application set the time zone during this session (a real, not dry-run, change).
     pub changed_by_us: bool,
     /// Foreign writers seen when entering; non-empty means someone else may be keeping it.
@@ -343,7 +343,7 @@ pub fn timezone_checks(profile: &AgentProfile, ctx: &TimezoneContext) -> Vec<Che
     };
     let seen = format!("system time zone {current}, profile wants {target}");
     if current != target {
-        let g4 = if ctx.gate_open {
+        let g4 = if ctx.timezone_writable {
             CheckResult::new("G4", Kind::Hard, Status::Fail, Some("mismatch"))
         } else {
             CheckResult::new(
@@ -354,7 +354,7 @@ pub fn timezone_checks(profile: &AgentProfile, ctx: &TimezoneContext) -> Vec<Che
             )
             .with(
                 "gate",
-                "the takeover gate is closed, so this application did not change the time zone",
+                "the time zone is outside this session's takeover, so this application did not change it",
             )
         };
         return vec![
@@ -569,6 +569,46 @@ fn majority_ip(probes: &[TargetProbe]) -> Option<String> {
         .map(|(ip, _)| ip.to_string())
 }
 
+/// Both addresses are IPv4, or both are IPv6. Anything that does not parse counts as its own
+/// family only when it is textually identical, so a malformed trace never passes as a match.
+fn same_family(a: &str, b: &str) -> bool {
+    use std::net::IpAddr;
+    match (a.parse::<IpAddr>(), b.parse::<IpAddr>()) {
+        (Ok(x), Ok(y)) => x.is_ipv4() == y.is_ipv4(),
+        _ => true,
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum NetworkMatch {
+    Same(u32),
+    Different(u32, u32),
+    NoEvidence,
+}
+
+/// Whether two addresses belong to the same network, by the lookup sources that answered with an
+/// ASN for both. One source that sees two different networks is enough to call it different.
+fn same_network(
+    a: &[(String, Result<Geo, String>)],
+    b: &[(String, Result<Geo, String>)],
+) -> NetworkMatch {
+    let mut seen = None;
+    for (id, ga) in a {
+        let asn_a = ga.as_ref().ok().and_then(|g| g.asn);
+        let asn_b = b
+            .iter()
+            .find(|(other, _)| other == id)
+            .and_then(|(_, g)| g.as_ref().ok().and_then(|g| g.asn));
+        if let (Some(x), Some(y)) = (asn_a, asn_b) {
+            if x != y {
+                return NetworkMatch::Different(x, y);
+            }
+            seen = Some(x);
+        }
+    }
+    seen.map_or(NetworkMatch::NoEvidence, NetworkMatch::Same)
+}
+
 fn geo_lookup(
     http: &dyn HttpClient,
     providers: &ProviderSet,
@@ -729,6 +769,9 @@ pub fn run(input: &CheckInput, http: &dyn HttpClient) -> CheckReport {
     results.push(g1);
 
     // ---- G2, one per target ----
+    // The majority exit's network is looked up at most once, and only when a target saw an address
+    // of the other family.
+    let mut majority_geo: Option<Vec<(String, Result<Geo, String>)>> = None;
     for p in &probes {
         let id = format!("G2:{}", p.target.domain);
         let r = match &p.result {
@@ -744,9 +787,48 @@ pub fn run(input: &CheckInput, http: &dyn HttpClient) -> CheckReport {
                 (Some(a), Some(b)) if a == b => {
                     CheckResult::new(id, Kind::Hard, Status::Pass, None)
                 }
-                (Some(a), Some(b)) => {
+                (Some(a), Some(b)) if same_family(a, b) => {
                     CheckResult::new(id, Kind::Hard, Status::Fail, Some("split_routing"))
                         .with("compare", format!("this target sees {a}, the others {b}"))
+                }
+                (Some(a), Some(b)) => {
+                    let compare = format!(
+                        "this target sees {a}, the others {b}: one is IPv4, the other IPv6, so the addresses alone cannot tell whether it is the same exit"
+                    );
+                    if local_only {
+                        CheckResult::new(id, Kind::Hard, Status::Unknown, Some("mixed_ip_family"))
+                            .with("compare", compare)
+                    } else {
+                        let theirs = majority_geo
+                            .get_or_insert_with(|| geo_lookup(http, input.providers, b, port));
+                        let mine = geo_lookup(http, input.providers, a, port);
+                        match same_network(&mine, theirs) {
+                            NetworkMatch::Same(asn) => {
+                                CheckResult::new(id, Kind::Hard, Status::Pass, None)
+                                    .with("compare", compare)
+                                    .with(
+                                        "network",
+                                        format!("both addresses are in AS{asn}: a dual-stack exit"),
+                                    )
+                            }
+                            NetworkMatch::Different(x, y) => CheckResult::new(
+                                id,
+                                Kind::Hard,
+                                Status::Fail,
+                                Some("split_routing"),
+                            )
+                            .with("compare", compare)
+                            .with("network", format!("{a} is in AS{x}, {b} is in AS{y}")),
+                            NetworkMatch::NoEvidence => CheckResult::new(
+                                id,
+                                Kind::Hard,
+                                Status::Unknown,
+                                Some("mixed_ip_family"),
+                            )
+                            .with("compare", compare)
+                            .with("network", "no lookup source answered for both addresses"),
+                        }
+                    }
                 }
                 _ => CheckResult::new(id, Kind::Hard, Status::Fail, Some("trace_unreadable")),
             },
@@ -1145,6 +1227,64 @@ mod tests {
         assert_eq!(n, 2);
     }
 
+    const EXIT6: &str = "2001:db8::3";
+
+    /// claude.ai answers over IPv4 while the other targets answer over IPv6, as reported by a
+    /// tester whose exit is dual-stack.
+    fn dual_stack(asn6: u32) -> FakeHttp {
+        healthy()
+            .on("https://www.anthropic.com/cdn-cgi/trace", P, trace(EXIT6, "US"))
+            .on("https://chatgpt.com/cdn-cgi/trace", P, trace(EXIT6, "US"))
+            .on(&format!("https://ipwho.is/{EXIT6}"), P, json(&format!(r#"{{"success":true,"country_code":"US","connection":{{"asn":{asn6},"org":"Example ISP"}}}}"#)))
+            .on(&format!("https://api.ip.sb/geoip/{EXIT6}"), P, json(&format!(r#"{{"ip":"x","asn":{asn6},"asn_organization":"Example ISP","country_code":"US"}}"#)))
+    }
+
+    #[test]
+    fn a_dual_stack_exit_in_one_network_passes_g2() {
+        let r = run_with(&profile(), &dual_stack(64500), Ok(()));
+        let g2 = get(&r, "G2:claude.ai");
+        assert_eq!(g2.status, Status::Pass, "{g2:#?}");
+        assert!(g2.evidence.iter().any(|e| e.detail.contains("AS64500")));
+        assert!(r.hard_checks_pass(), "{r:#?}");
+    }
+
+    #[test]
+    fn a_dual_stack_exit_in_two_networks_fails_g2() {
+        let r = run_with(&profile(), &dual_stack(64501), Ok(()));
+        assert_eq!(
+            get(&r, "G2:claude.ai").reason.as_deref(),
+            Some("split_routing")
+        );
+    }
+
+    #[test]
+    fn mixed_families_without_a_lookup_are_unknown() {
+        let http = dual_stack(64500)
+            .on(
+                &format!("https://ipwho.is/{EXIT}"),
+                P,
+                Err(HttpError::Timeout),
+            )
+            .on(
+                &format!("https://api.ip.sb/geoip/{EXIT}"),
+                P,
+                Err(HttpError::Timeout),
+            );
+        let r = run_with(&profile(), &http, Ok(()));
+        let g2 = get(&r, "G2:claude.ai");
+        assert_eq!(
+            (g2.status, g2.reason.as_deref()),
+            (Status::Unknown, Some("mixed_ip_family"))
+        );
+        let mut p = profile();
+        p.detection.mode = DetectionMode::LocalOnly;
+        let r = run_with(&p, &dual_stack(64500), Ok(()));
+        assert_eq!(
+            get(&r, "G2:claude.ai").reason.as_deref(),
+            Some("mixed_ip_family")
+        );
+    }
+
     #[test]
     fn split_routing_and_server_errors_fail_g2() {
         let http = healthy()
@@ -1294,13 +1434,13 @@ mod tests {
 
     fn tz(
         current: Result<&str, &str>,
-        gate_open: bool,
+        timezone_writable: bool,
         ours: bool,
         writers: &[&str],
     ) -> (CheckResult, CheckResult) {
         let ctx = TimezoneContext {
             current: current.map(str::to_string).map_err(str::to_string),
-            gate_open,
+            timezone_writable,
             changed_by_us: ours,
             foreign_writers: writers.iter().map(|w| w.to_string()).collect(),
             privilege: Ok(true),
@@ -1475,7 +1615,7 @@ mod tests {
     fn browser_time_zone_feeds_g4() {
         let ctx = |tz: &str| TimezoneContext {
             current: Ok("Eastern Standard Time".into()),
-            gate_open: true,
+            timezone_writable: true,
             changed_by_us: true,
             foreign_writers: vec![],
             privilege: Ok(true),

@@ -291,6 +291,21 @@ fn fault(e: impl std::fmt::Display, code: &str) -> Fault {
     Fault::new(code, e.to_string())
 }
 
+/// Whether the fallback upstream accepts a connection right now.
+///
+/// A refused connection and a host that does not resolve are different answers: the first is a
+/// link that is not up, the second is a profile that names something unreachable at all. Both
+/// stop Agent mode, with different codes.
+fn fallback_reachable(host: &str, port: u16) -> Result<bool, String> {
+    use std::net::ToSocketAddrs;
+    let addr = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("{host}:{port}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("{host}:{port} resolved to no address"))?;
+    Ok(std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(1500)).is_ok())
+}
+
 impl Platform for LivePlatform {
     fn now_ms(&self) -> u64 {
         SystemTime::now()
@@ -311,6 +326,35 @@ impl Platform for LivePlatform {
         if !direct_test {
             config::relay_config(profile, &self.core.ports, &WindowsCredentials)
                 .map_err(|e| fault(e, "CFG_INVALID"))?;
+            // The core's own configuration is built here so a template or credential problem is
+            // reported while nothing has been changed yet.
+            config::from_profile(
+                profile,
+                &self.core.ports,
+                "<preflight>",
+                &WindowsCredentials,
+            )
+            .map_err(|e| fault(e, "CFG_INVALID"))?;
+            if let Some(fb) = &profile.routing.fallback {
+                match fallback_reachable(&fb.host, fb.port) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(Fault::new(
+                            "FALLBACK_DOWN",
+                            format!(
+                                "nothing is answering on the fallback upstream {}:{}; non-target traffic would have no upstream, so Agent mode is not started",
+                                fb.host, fb.port
+                            ),
+                        ))
+                    }
+                    Err(e) => {
+                        return Err(Fault::new(
+                            "FALLBACK_UNKNOWN",
+                            format!("the fallback upstream could not be probed: {e}"),
+                        ))
+                    }
+                }
+            }
             if !self.core.relay_bin.is_file() {
                 return Err(Fault::new(
                     "RELAY_BINARY_MISSING",
@@ -332,7 +376,7 @@ impl Platform for LivePlatform {
             let relay = config::relay_config(profile, &self.core.ports, &WindowsCredentials)
                 .map_err(|e| fault(e, "CFG_INVALID"))?;
             self.core.up_with_relay(&WindowsHost, &relay, |p, s| {
-                config::from_profile(profile, p, s).map_err(|e| e.to_string())
+                config::from_profile(profile, p, s, &WindowsCredentials).map_err(|e| e.to_string())
             })
         };
         result

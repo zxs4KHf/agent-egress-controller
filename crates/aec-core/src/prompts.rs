@@ -571,12 +571,14 @@ mod tests {
         let gate = TakeoverGate {
             state: GateState::Closed,
             reasons: vec!["foreign writer: Local\\AIEgressGuard is held".into()],
+            ..Default::default()
         };
         assert!(for_gate(&gate, &c).unwrap().contains("AIEgressGuard"));
         assert!(for_gate(
             &TakeoverGate {
                 state: GateState::Open,
-                reasons: vec![]
+                reasons: vec![],
+                ..Default::default()
             },
             &c
         )
@@ -609,6 +611,7 @@ mod tests {
         let gate = TakeoverGate {
             state: GateState::Closed,
             reasons: vec!["r".into()],
+            ..Default::default()
         };
         let text = all(Some(&report), &[], &[], Some(&gate), &c);
         assert_eq!(text.matches("\n---\n").count(), 1);

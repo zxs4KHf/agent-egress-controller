@@ -90,11 +90,36 @@ pub struct ProxyScope {
     pub bypass: Vec<String>,
 }
 
+/// Where everything an Agent entry sends that is not a target domain goes.
+///
+/// Deliberately a named upstream rather than `DIRECT`. A fallback that resolves to a direct
+/// connection stops being a fallback the moment the route to a domain is blocked: the request is
+/// then made from this machine with this machine's address, which is a different failure that
+/// looks like a working link.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FallbackUpstream {
+    pub host: String,
+    pub port: u16,
+    pub proto: UpstreamProto,
+    #[serde(default)]
+    pub credential_ref: Option<String>,
+}
+
+/// `default-v1`: everything goes to the target group.
+pub const TEMPLATE_DEFAULT: &str = "default-v1";
+/// `split-v1`: the target domains go to the target group, everything else to the fallback.
+pub const TEMPLATE_SPLIT: &str = "split-v1";
+pub const RULES_TEMPLATES: [&str; 2] = [TEMPLATE_DEFAULT, TEMPLATE_SPLIT];
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Routing {
     pub target_group: String,
     pub rules_template: String,
+    /// Required by [`TEMPLATE_SPLIT`]; ignored by [`TEMPLATE_DEFAULT`].
+    #[serde(default)]
+    pub fallback: Option<FallbackUpstream>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -249,7 +274,11 @@ impl Default for ProfileSet {
                 },
                 routing: Routing {
                     target_group: "agent-egress".into(),
-                    rules_template: "default-v1".into(),
+                    // Everything an Agent entry opens goes through the target group. That needs no
+                    // second upstream, so the only settings gap left is the egress candidate itself
+                    // and nothing here has to be guessed from the machine it was written on.
+                    rules_template: TEMPLATE_DEFAULT.into(),
+                    fallback: None,
                 },
                 locale: Locale {
                     timezone: TimezoneTarget {
@@ -443,6 +472,37 @@ fn validate_agent(p: &AgentProfile, at: &str, e: &mut Errors) {
     if p.routing.target_group.trim().is_empty() {
         e.push(format!("{at}.routing.targetGroup"), "must not be empty");
     }
+    if !RULES_TEMPLATES.contains(&p.routing.rules_template.as_str()) {
+        e.push(
+            format!("{at}.routing.rulesTemplate"),
+            format!("must be one of {}", RULES_TEMPLATES.join(", ")),
+        );
+    }
+    match &p.routing.fallback {
+        Some(f) => {
+            let fp = format!("{at}.routing.fallback");
+            if f.host.trim().is_empty() {
+                e.push(format!("{fp}.host"), "must not be empty");
+            }
+            if f.port == 0 {
+                e.push(format!("{fp}.port"), "must be 1-65535");
+            }
+            if matches!(f.credential_ref.as_deref(), Some(r) if r.trim().is_empty()) {
+                e.push(
+                    format!("{fp}.credentialRef"),
+                    "must be omitted or non-empty",
+                );
+            }
+        }
+        None => {
+            if p.routing.rules_template == TEMPLATE_SPLIT {
+                e.push(
+                    format!("{at}.routing.fallback"),
+                    format!("is required by '{TEMPLATE_SPLIT}': without it, non-target traffic has no upstream"),
+                );
+            }
+        }
+    }
 
     let l = &p.locale;
     if l.timezone.windows_id.trim().is_empty() {
@@ -560,6 +620,15 @@ mod tests {
         errors.iter().map(|e| e.path.as_str()).collect()
     }
 
+    fn fallback() -> FallbackUpstream {
+        FallbackUpstream {
+            host: "203.0.113.10".into(),
+            port: 1080,
+            proto: UpstreamProto::Socks5,
+            credential_ref: None,
+        }
+    }
+
     #[test]
     fn default_reports_only_the_missing_candidate() {
         assert_eq!(
@@ -567,6 +636,17 @@ mod tests {
             vec!["agent[0].egress.candidates"]
         );
         assert!(validate(&valid()).is_empty());
+    }
+
+    /// The shipped default must not describe the maintainer's machine. A port that happens to be
+    /// listening on one developer's box is a settings gap nobody else can diagnose, so the default
+    /// pre-fills nothing: no egress candidate, no second upstream.
+    #[test]
+    fn default_profile_carries_nothing_machine_specific() {
+        let s = ProfileSet::default();
+        assert_eq!(s.agent[0].routing.rules_template, TEMPLATE_DEFAULT);
+        assert!(s.agent[0].routing.fallback.is_none());
+        assert!(s.agent[0].egress.candidates.is_empty());
     }
 
     #[test]
@@ -646,6 +726,31 @@ mod tests {
                 Box::new(|s| s.agent[0].locale.accept_language = "en-US,,en".into()),
             ),
             (
+                "agent[0].routing.rulesTemplate",
+                Box::new(|s| s.agent[0].routing.rules_template = "v9".into()),
+            ),
+            (
+                "agent[0].routing.fallback",
+                Box::new(|s| {
+                    s.agent[0].routing.rules_template = TEMPLATE_SPLIT.into();
+                    s.agent[0].routing.fallback = None;
+                }),
+            ),
+            (
+                "agent[0].routing.fallback.host",
+                Box::new(|s| {
+                    s.agent[0].routing.fallback = Some(fallback());
+                    s.agent[0].routing.fallback.as_mut().unwrap().host = " ".into();
+                }),
+            ),
+            (
+                "agent[0].routing.fallback.port",
+                Box::new(|s| {
+                    s.agent[0].routing.fallback = Some(fallback());
+                    s.agent[0].routing.fallback.as_mut().unwrap().port = 0;
+                }),
+            ),
+            (
                 "agent[0].targets[0].domain",
                 Box::new(|s| s.agent[0].targets[0].domain = "https://claude.ai/".into()),
             ),
@@ -672,6 +777,14 @@ mod tests {
                 "expected {expected}, got {errs:?}"
             );
         }
+    }
+
+    #[test]
+    fn only_the_split_template_needs_a_fallback() {
+        let mut s = valid();
+        s.agent[0].routing.rules_template = TEMPLATE_DEFAULT.into();
+        s.agent[0].routing.fallback = None;
+        assert!(validate(&s).is_empty());
     }
 
     #[test]

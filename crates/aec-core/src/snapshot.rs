@@ -2,9 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::controller::GlobalItem;
 use crate::model::{ProxySettings, RegistryProxy, TimezoneState};
 use crate::status::{EnvironmentStatus, Reading};
-use crate::writers::WriterScan;
+use crate::writers::{WriterKind, WriterScan};
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -15,36 +16,121 @@ pub enum GateState {
     Closed,
 }
 
-/// Whether global state may be written for real (SPEC 4.7). Every unmet condition is listed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TakeoverGate {
+impl Default for GateState {
+    /// A gate that was never evaluated is closed.
+    fn default() -> Self {
+        GateState::Closed
+    }
+}
+
+const TAKEOVER_OFF: &str = "takeover of global state is not enabled in settings";
+const NOT_PERSISTED: &str = "entry snapshot is not persisted yet";
+
+/// One global item's own gate.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ItemGate {
     pub state: GateState,
     pub reasons: Vec<String>,
 }
 
-impl TakeoverGate {
-    /// `enabled`: the user switched "take over global state" on. `snapshot_persisted`: the entry
-    /// snapshot is on disk. The writer scan must be complete and empty.
-    pub fn evaluate(enabled: bool, scan: &WriterScan, snapshot_persisted: bool) -> Self {
-        let mut reasons = Vec::new();
-        if !enabled {
-            reasons.push("takeover of global state is not enabled in settings".to_string());
-        }
-        for w in &scan.writers {
-            reasons.push(format!("foreign writer: {}", w.evidence));
-        }
-        for e in &scan.errors {
-            reasons.push(format!("foreign writer scan incomplete: {e}"));
-        }
-        if !snapshot_persisted {
-            reasons.push("entry snapshot is not persisted yet".to_string());
-        }
+impl ItemGate {
+    fn from_reasons(reasons: Vec<String>) -> Self {
         let state = if reasons.is_empty() {
             GateState::Open
         } else {
             GateState::Closed
         };
         Self { state, reasons }
+    }
+}
+
+/// Which global items a foreign writer can be expected to rewrite.
+///
+/// The legacy chain's mutexes and its startup items drive both the system proxy and the time zone,
+/// so they hold back both. A process that merely holds the port the system proxy points at is
+/// evidence about the proxy and says nothing about who sets the time zone — treating it as a
+/// blocker for both is what kept the time zone from ever being written.
+fn writer_items(kind: WriterKind) -> &'static [GlobalItem] {
+    match kind {
+        WriterKind::ProxyListener => &[GlobalItem::SystemProxy],
+        WriterKind::LegacyGuardMutex | WriterKind::LegacyTrayMutex | WriterKind::StartupItem => {
+            &[GlobalItem::SystemProxy, GlobalItem::Timezone]
+        }
+    }
+}
+
+/// Whether global state may be written for real (SPEC 4.7), decided per global item. Every unmet
+/// condition of every item is listed in `reasons`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TakeoverGate {
+    /// Open only when every item's gate is open; `allows` is what the controller uses.
+    pub state: GateState,
+    pub reasons: Vec<String>,
+    #[serde(default)]
+    pub system_proxy: ItemGate,
+    #[serde(default)]
+    pub timezone: ItemGate,
+}
+
+impl TakeoverGate {
+    /// `enabled`: the user switched "take over global state" on. `snapshot_persisted`: the entry
+    /// snapshot is on disk. The writer scan must be complete and empty.
+    pub fn evaluate(enabled: bool, scan: &WriterScan, snapshot_persisted: bool) -> Self {
+        let (mut proxy, mut tz): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+        {
+            let mut push = |item: GlobalItem, reason: String| match item {
+                GlobalItem::SystemProxy => proxy.push(reason),
+                GlobalItem::Timezone => tz.push(reason),
+            };
+            if !enabled {
+                for item in [GlobalItem::SystemProxy, GlobalItem::Timezone] {
+                    push(item, TAKEOVER_OFF.to_string());
+                }
+            }
+            for w in &scan.writers {
+                for item in writer_items(w.kind) {
+                    push(*item, format!("foreign writer: {}", w.evidence));
+                }
+            }
+            // A probe that did not run says nothing about either item, so it holds back both.
+            for e in &scan.errors {
+                let reason = format!("foreign writer scan incomplete: {e}");
+                push(GlobalItem::SystemProxy, reason.clone());
+                push(GlobalItem::Timezone, reason);
+            }
+            if !snapshot_persisted {
+                for item in [GlobalItem::SystemProxy, GlobalItem::Timezone] {
+                    push(item, NOT_PERSISTED.to_string());
+                }
+            }
+        }
+        let system_proxy = ItemGate::from_reasons(proxy);
+        let timezone = ItemGate::from_reasons(tz);
+        let mut reasons = system_proxy.reasons.clone();
+        for r in &timezone.reasons {
+            if !reasons.contains(r) {
+                reasons.push(r.clone());
+            }
+        }
+        let state = if system_proxy.state == GateState::Open && timezone.state == GateState::Open {
+            GateState::Open
+        } else {
+            GateState::Closed
+        };
+        Self {
+            state,
+            reasons,
+            system_proxy,
+            timezone,
+        }
+    }
+
+    /// Whether this global item may be written for real.
+    pub fn allows(&self, item: GlobalItem) -> bool {
+        match item {
+            GlobalItem::SystemProxy => self.system_proxy.state == GateState::Open,
+            GlobalItem::Timezone => self.timezone.state == GateState::Open,
+        }
     }
 }
 
@@ -168,6 +254,52 @@ mod tests {
         let g = TakeoverGate::evaluate(false, &busy, false);
         assert_eq!(g.state, GateState::Closed);
         assert_eq!(g.reasons.len(), 4, "{g:?}");
+    }
+
+    fn scan_of(kind: WriterKind) -> WriterScan {
+        WriterScan {
+            writers: vec![ForeignWriter {
+                kind,
+                evidence: "whoever".into(),
+            }],
+            errors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_proxy_listener_holds_back_only_the_system_proxy() {
+        let g = TakeoverGate::evaluate(true, &scan_of(WriterKind::ProxyListener), true);
+        assert_eq!(g.state, GateState::Closed, "the aggregate stays closed");
+        assert!(!g.allows(GlobalItem::SystemProxy));
+        assert!(g.allows(GlobalItem::Timezone), "{g:?}");
+        assert_eq!(g.reasons.len(), 1, "{g:?}");
+        assert_eq!(g.timezone.reasons.len(), 0);
+        assert_eq!(g.system_proxy.reasons.len(), 1);
+    }
+
+    #[test]
+    fn the_legacy_chain_holds_back_both_items() {
+        for kind in [
+            WriterKind::LegacyGuardMutex,
+            WriterKind::LegacyTrayMutex,
+            WriterKind::StartupItem,
+        ] {
+            let g = TakeoverGate::evaluate(true, &scan_of(kind), true);
+            assert!(!g.allows(GlobalItem::SystemProxy), "{kind:?}");
+            assert!(!g.allows(GlobalItem::Timezone), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn an_incomplete_scan_holds_back_both_items() {
+        let scan = WriterScan {
+            writers: Vec::new(),
+            errors: vec!["startup items: denied".into()],
+        };
+        let g = TakeoverGate::evaluate(true, &scan, true);
+        assert!(!g.allows(GlobalItem::SystemProxy));
+        assert!(!g.allows(GlobalItem::Timezone));
+        assert_eq!(g.reasons.len(), 1, "the same reason is listed once");
     }
 
     #[test]

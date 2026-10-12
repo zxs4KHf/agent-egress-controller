@@ -23,7 +23,7 @@ use crate::log::{Level, Logger};
 use crate::model::ProxySettings;
 use crate::profile::Entry;
 use crate::profile::{validate_agent_profile, AgentProfile, ProxyScopeMode};
-use crate::snapshot::{EnvironmentSnapshot, GateState, TakeoverGate};
+use crate::snapshot::{EnvironmentSnapshot, TakeoverGate};
 use crate::status::EnvironmentStatus;
 use crate::store::{write_atomic, SnapshotStore, StoreError};
 
@@ -116,9 +116,10 @@ pub struct ControllerState {
     pub last_report: Option<CheckReport>,
     pub unacknowledged_restore_failures: Vec<RestoreItem>,
     pub correlation_id: Option<String>,
-    /// Takeover gate as evaluated when entering; G4 depends on it.
+    /// The time zone item of the takeover gate as evaluated when entering; G4 depends on it.
+    /// Whether the system proxy could be written is a separate question and stops nothing else.
     #[serde(default)]
-    pub gate_open: bool,
+    pub timezone_writable: bool,
     /// Foreign writers seen when entering.
     #[serde(default)]
     pub foreign_writers: Vec<String>,
@@ -136,7 +137,7 @@ impl Default for ControllerState {
             last_report: None,
             unacknowledged_restore_failures: Vec::new(),
             correlation_id: None,
-            gate_open: false,
+            timezone_writable: false,
             foreign_writers: Vec::new(),
         }
     }
@@ -524,7 +525,7 @@ impl<P: Platform> Controller<P> {
             &status.foreign_writers,
             true,
         );
-        self.state.gate_open = gate.state == GateState::Open;
+        self.state.timezone_writable = gate.allows(GlobalItem::Timezone);
         self.state.foreign_writers = status
             .foreign_writers
             .writers
@@ -550,10 +551,12 @@ impl<P: Platform> Controller<P> {
             json!({ "port": self.platform.core_port() }),
         );
 
-        // E4 global state: real only behind an open gate, otherwise recorded as dry-run.
+        // E4 global state: each item is real only behind its own gate, otherwise recorded as
+        // dry-run. A foreign writer that only holds the system proxy's port leaves the time zone
+        // writable, and the other way round.
         self.set(Mode::Entering, Some(Phase::Global))?;
-        let real = gate.state == GateState::Open;
         for (before, after) in self.plan(profile, &snap) {
+            let real = gate.allows(after.item());
             if real {
                 if let Err(f) = self.platform.write_global(&after) {
                     return self.abort(profile, f);
@@ -666,7 +669,7 @@ impl<P: Platform> Controller<P> {
                 Ok(other) => Err(format!("unexpected value {other:?}")),
                 Err(f) => Err(f.to_string()),
             },
-            gate_open: self.state.gate_open,
+            timezone_writable: self.state.timezone_writable,
             changed_by_us: self.state.journal.iter().any(|e| {
                 matches!(
                     e,
@@ -995,7 +998,7 @@ impl<P: Platform> Controller<P> {
         );
         if mode_after == Mode::Daily {
             self.state.correlation_id = None;
-            self.state.gate_open = false;
+            self.state.timezone_writable = false;
             self.state.foreign_writers.clear();
         }
         let _ = self.persist();
@@ -1029,6 +1032,7 @@ mod tests {
     use crate::checks::{CheckReport, CheckResult};
     use crate::model::proxy_flags;
     use crate::profile::{DetectionMode, ProfileSet};
+    use crate::snapshot::GateState;
     use crate::status::collect;
     use crate::testing::FakeHost;
     use std::cell::{Cell, RefCell};

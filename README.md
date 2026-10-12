@@ -68,7 +68,7 @@ Agent 出口控制器把这件事收进一个托盘图标：**从托盘打开的
 - 不用 TUN、不改路由和防火墙、不装服务、不需要管理员权限。
 - 本机上如果有别的程序也在改时区（比如另一个代理工具的托盘），程序就不去动时区，并在检测结果里说明原因。
 - 不结束不是它启动的进程；终端窗口由你自己关。
-- 不提供出口，也不内置任何人的出口：你需要自己有一个。
+- 不提供出口，也不内置任何人的出口：你需要自己有一个。仓库里没有任何维护者自己的代理配置、出口地址、域名清单或凭据；[推荐的分流规则](docs/RECOMMENDED-RULES.md) 是一份通用建议，填不填由你决定。
 
 ## 已知限制
 
@@ -84,6 +84,7 @@ cargo run -p aec-tray
 ```
 
 - [CONTRIBUTING.md](CONTRIBUTING.md)：开发流程和不接受的改动。给 AI Agent 的速查在 [AGENTS.md](AGENTS.md)。
+- [docs/RECOMMENDED-RULES.md](docs/RECOMMENDED-RULES.md)：哪些域名该走固定出口、哪些不该，以及为什么。
 - [docs/SPEC.md](docs/SPEC.md)：完整行为规格。[CONTEXT.md](CONTEXT.md)：术语表。[docs/adr/](docs/adr/)：关键取舍。
 - [docs/ROADMAP.md](docs/ROADMAP.md)：路线图。[CHANGELOG.md](CHANGELOG.md)：更新记录。
 - 安全问题请按 [SECURITY.md](SECURITY.md) 私下报告。

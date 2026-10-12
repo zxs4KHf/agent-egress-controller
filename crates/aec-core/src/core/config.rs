@@ -40,6 +40,15 @@ pub enum ConfigError {
         candidate: String,
         reference: String,
     },
+    UnknownTemplate {
+        template: String,
+    },
+    FallbackMissing {
+        template: String,
+    },
+    NameCollision {
+        name: String,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -52,6 +61,17 @@ impl std::fmt::Display for ConfigError {
             } => write!(
                 f,
                 "candidate '{candidate}' needs credential '{reference}', which is not stored"
+            ),
+            ConfigError::UnknownTemplate { template } => {
+                write!(f, "rule template '{template}' is not known to this version")
+            }
+            ConfigError::FallbackMissing { template } => write!(
+                f,
+                "rule template '{template}' needs a fallback upstream; without one, non-target traffic has nowhere to go"
+            ),
+            ConfigError::NameCollision { name } => write!(
+                f,
+                "'{name}' cannot be both the target group and the fallback upstream name"
             ),
         }
     }
@@ -110,8 +130,7 @@ fn header(ports: &CorePorts, secret: &str) -> String {
     y
 }
 
-fn rules(group: &str) -> String {
-    let mut y = String::from("rules:\n");
+fn local_cidr_rules(y: &mut String) {
     for cidr in LOCAL_CIDRS {
         let _ = writeln!(
             y,
@@ -119,10 +138,47 @@ fn rules(group: &str) -> String {
             quote(&format!("IP-CIDR,{cidr},DIRECT,no-resolve"))
         );
     }
-    // Template default-v1: everything an Agent entry sends leaves through one group, so a single
-    // browser session never shows two exit addresses.
-    let _ = writeln!(y, "  - {}", quote(&format!("MATCH,{group}")));
-    y
+}
+
+/// Rules for a profile, chosen by its template.
+///
+/// `default-v1` sends everything an Agent entry opens through the target group, so a single browser
+/// session never shows two exit addresses. `split-v1` sends the target domains there and everything
+/// else to the fallback upstream, which keeps domestic traffic off the fixed exit.
+///
+/// An unknown template is an error, and so is `split-v1` without a fallback: both would otherwise
+/// end up matching everything against a rule the profile did not ask for.
+fn rules(profile: &AgentProfile) -> Result<String, ConfigError> {
+    use crate::profile::{TEMPLATE_DEFAULT, TEMPLATE_SPLIT};
+    let group = &profile.routing.target_group;
+    let mut y = String::from("rules:\n");
+    local_cidr_rules(&mut y);
+    match profile.routing.rules_template.as_str() {
+        TEMPLATE_DEFAULT => {
+            let _ = writeln!(y, "  - {}", quote(&format!("MATCH,{group}")));
+        }
+        TEMPLATE_SPLIT => {
+            if profile.routing.fallback.is_none() {
+                return Err(ConfigError::FallbackMissing {
+                    template: TEMPLATE_SPLIT.to_string(),
+                });
+            }
+            for t in &profile.targets {
+                let _ = writeln!(
+                    y,
+                    "  - {}",
+                    quote(&format!("DOMAIN-SUFFIX,{},{}", t.domain, group))
+                );
+            }
+            let _ = writeln!(y, "  - {}", quote(&format!("MATCH,{FALLBACK_PROXY}")));
+        }
+        other => {
+            return Err(ConfigError::UnknownTemplate {
+                template: other.to_string(),
+            })
+        }
+    }
+    Ok(y)
 }
 
 /// Test configuration: the egress group contains only DIRECT. Ticket 03/04 use it to exercise the
@@ -136,24 +192,46 @@ pub fn direct_test(ports: &CorePorts, secret: &str, group: &str) -> String {
         quote(group),
         quote(DIRECT)
     );
-    y.push_str(&rules(group));
+    y.push_str("rules:\n");
+    local_cidr_rules(&mut y);
+    let _ = writeln!(y, "  - {}", quote(&format!("MATCH,{group}")));
     y
 }
 
-/// Name of the single upstream the core sees for a profile: this application's relay.
+/// Name of the upstream that carries everything that is not a target domain (`split-v1`).
+pub const FALLBACK_PROXY: &str = "fallback";
+
+/// Name of the upstream the core sees for the candidate pool: this application's relay.
 pub const RELAY_PROXY: &str = "relay";
 
-/// Core configuration for a profile. The core has one upstream, the local relay, which owns the
-/// candidate pool (SPEC 4.13); no upstream credential appears in the core's configuration.
+fn proxy_type(proto: crate::profile::UpstreamProto) -> &'static str {
+    use crate::profile::UpstreamProto;
+    match proto {
+        UpstreamProto::Socks5 => "socks5",
+        UpstreamProto::Http => "http",
+    }
+}
+
+/// Core configuration for a profile.
+///
+/// The candidate pool reaches the core only as the local relay (SPEC 4.13). The fallback upstream
+/// is different: the core dials it itself, so a fallback that needs credentials carries them here
+/// — [`redact`] is what keeps them out of anything displayed or logged.
 pub fn from_profile(
     profile: &AgentProfile,
     ports: &CorePorts,
     secret: &str,
+    creds: &dyn CredentialSource,
 ) -> Result<String, ConfigError> {
     if profile.egress.candidates.is_empty() {
         return Err(ConfigError::NoCandidates);
     }
     let group = &profile.routing.target_group;
+    if group == FALLBACK_PROXY {
+        return Err(ConfigError::NameCollision {
+            name: group.clone(),
+        });
+    }
     let mut y = header(ports, secret);
     let _ = writeln!(
         y,
@@ -161,13 +239,38 @@ pub fn from_profile(
         quote(RELAY_PROXY),
         ports.relay
     );
+    if let Some(fb) = &profile.routing.fallback {
+        let _ = writeln!(
+            y,
+            "  - name: {}\n    type: {}\n    server: {}\n    port: {}\n    udp: false",
+            quote(FALLBACK_PROXY),
+            proxy_type(fb.proto),
+            quote(&fb.host),
+            fb.port
+        );
+        if let Some(reference) = &fb.credential_ref {
+            let (user, pass) =
+                creds
+                    .get(reference)
+                    .ok_or_else(|| ConfigError::MissingCredential {
+                        candidate: "routing.fallback".into(),
+                        reference: reference.clone(),
+                    })?;
+            let _ = writeln!(
+                y,
+                "    username: {}\n    password: {}",
+                quote(&user),
+                quote(&pass)
+            );
+        }
+    }
     let _ = writeln!(
         y,
         "proxy-groups:\n  - name: {}\n    type: select\n    proxies:\n      - {}",
         quote(group),
         quote(RELAY_PROXY)
     );
-    y.push_str(&rules(group));
+    y.push_str(&rules(profile)?);
     Ok(y)
 }
 
@@ -240,7 +343,9 @@ pub fn redact(config: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::{Candidate, ProfileSet, UpstreamProto};
+    use crate::profile::{
+        Candidate, FallbackUpstream, ProfileSet, Target, UpstreamProto, TEMPLATE_SPLIT,
+    };
 
     struct Creds;
     impl CredentialSource for Creds {
@@ -268,6 +373,15 @@ mod tests {
             },
         ];
         p
+    }
+
+    fn fallback() -> FallbackUpstream {
+        FallbackUpstream {
+            host: "203.0.113.10".into(),
+            port: 1080,
+            proto: UpstreamProto::Http,
+            credential_ref: None,
+        }
     }
 
     #[test]
@@ -300,7 +414,7 @@ mod tests {
 
     #[test]
     fn core_config_points_only_at_the_relay() {
-        let y = from_profile(&profile(), &CorePorts::default(), "s").unwrap();
+        let y = from_profile(&profile(), &CorePorts::default(), "s", &NoCredentials).unwrap();
         assert!(
             y.contains(
                 "  - name: \"relay\"\n    type: socks5\n    server: \"127.0.0.1\"\n    port: 17325"
@@ -315,7 +429,93 @@ mod tests {
         );
         assert!(
             !y.contains("198.51.100.7") && !y.contains("password") && !y.contains("username"),
-            "no upstream detail in the core config"
+            "no candidate detail in the core config"
+        );
+    }
+
+    #[test]
+    fn split_template_sends_targets_to_the_group_and_the_rest_to_the_fallback() {
+        let mut p = profile();
+        p.routing.rules_template = TEMPLATE_SPLIT.into();
+        p.routing.fallback = Some(fallback());
+        p.targets = ["claude.ai", "chatgpt.com"]
+            .iter()
+            .map(|d| Target {
+                domain: (*d).into(),
+                trace: true,
+            })
+            .collect();
+        let y = from_profile(&p, &CorePorts::default(), "s", &NoCredentials).unwrap();
+        for needle in [
+            "  - name: \"fallback\"\n    type: http\n    server: \"203.0.113.10\"\n    port: 1080\n    udp: false",
+            "- \"DOMAIN-SUFFIX,claude.ai,agent-egress\"",
+            "- \"DOMAIN-SUFFIX,chatgpt.com,agent-egress\"",
+            "- \"MATCH,fallback\"",
+        ] {
+            assert!(y.contains(needle), "missing {needle:?} in\n{y}");
+        }
+        // The catch-all must come after the target rules, and the loopback bypass before both.
+        let order: Vec<usize> = [
+            "IP-CIDR,127.0.0.0/8",
+            "DOMAIN-SUFFIX,claude.ai",
+            "DOMAIN-SUFFIX,chatgpt.com",
+            "MATCH,fallback",
+        ]
+        .iter()
+        .map(|n| y.find(n).unwrap_or_else(|| panic!("missing {n}")))
+        .collect();
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}");
+    }
+
+    #[test]
+    fn templates_and_names_fail_closed() {
+        let mut p = profile();
+        p.routing.rules_template = "split-v2".into();
+        assert_eq!(
+            from_profile(&p, &CorePorts::default(), "s", &NoCredentials).unwrap_err(),
+            ConfigError::UnknownTemplate {
+                template: "split-v2".into()
+            }
+        );
+        let mut p = profile();
+        p.routing.rules_template = TEMPLATE_SPLIT.into();
+        p.routing.fallback = None;
+        assert_eq!(
+            from_profile(&p, &CorePorts::default(), "s", &NoCredentials).unwrap_err(),
+            ConfigError::FallbackMissing {
+                template: TEMPLATE_SPLIT.into()
+            }
+        );
+        let mut p = profile();
+        p.routing.target_group = FALLBACK_PROXY.into();
+        assert_eq!(
+            from_profile(&p, &CorePorts::default(), "s", &NoCredentials).unwrap_err(),
+            ConfigError::NameCollision {
+                name: FALLBACK_PROXY.into()
+            }
+        );
+    }
+
+    #[test]
+    fn fallback_credentials_come_from_the_store_and_are_redacted() {
+        let mut p = profile();
+        p.routing.rules_template = TEMPLATE_SPLIT.into();
+        let mut fb = fallback();
+        fb.credential_ref = Some("c1".into());
+        p.routing.fallback = Some(fb);
+        assert_eq!(
+            from_profile(&p, &CorePorts::default(), "s", &NoCredentials).unwrap_err(),
+            ConfigError::MissingCredential {
+                candidate: "routing.fallback".into(),
+                reference: "c1".into()
+            }
+        );
+        let y = from_profile(&p, &CorePorts::default(), "s", &Creds).unwrap();
+        assert!(y.contains("    username: \"user\\\"x\""), "{y}");
+        let r = redact(&y);
+        assert!(
+            !r.contains("p@ss") && r.contains("    password: \"***\""),
+            "{r}"
         );
     }
 
@@ -357,7 +557,7 @@ mod tests {
             ConfigError::NoCandidates
         );
         assert_eq!(
-            from_profile(&p, &CorePorts::default(), "s").unwrap_err(),
+            from_profile(&p, &CorePorts::default(), "s", &NoCredentials).unwrap_err(),
             ConfigError::NoCandidates
         );
     }
@@ -366,7 +566,13 @@ mod tests {
     fn redaction_hides_secrets() {
         let y = format!(
             "{}    username: \"u\"\n    password: \"p@ss\"\n",
-            from_profile(&profile(), &CorePorts::default(), "topsecret").unwrap()
+            from_profile(
+                &profile(),
+                &CorePorts::default(),
+                "topsecret",
+                &NoCredentials
+            )
+            .unwrap()
         );
         let r = redact(&y);
         assert!(!r.contains("topsecret") && !r.contains("p@ss"));

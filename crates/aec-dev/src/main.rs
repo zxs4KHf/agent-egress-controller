@@ -493,8 +493,13 @@ fn core_cmd(args: &[String], data_dir: &Path) -> ExitCode {
                 print!(
                     "{}",
                     config::redact(
-                        &config::from_profile(&profile, &m.ports, "<generated at start>")
-                            .expect("relay_config succeeded")
+                        &config::from_profile(
+                            &profile,
+                            &m.ports,
+                            "<generated at start>",
+                            &config::NoCredentials,
+                        )
+                        .expect("relay_config succeeded")
                     )
                 );
                 println!(
@@ -510,7 +515,8 @@ fn core_cmd(args: &[String], data_dir: &Path) -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             match m.up_with_relay(&host(), &relay, |p, s| {
-                config::from_profile(&profile, p, s).map_err(|e| e.to_string())
+                config::from_profile(&profile, p, s, &config::NoCredentials)
+                    .map_err(|e| e.to_string())
             }) {
                 Ok(o) => {
                     println!(

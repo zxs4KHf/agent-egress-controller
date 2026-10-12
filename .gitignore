@@ -20,8 +20,10 @@ data/
 logs/
 
 # Maintainer-only material: kept on the maintainer's disk, never published.
-# (the predecessor chain, its migration runbook, local tickets and planning notes)
+# (the predecessor chain, its migration runbook, local tickets, planning notes and the
+#  local memory directory, which records the maintainer's own exit addresses)
 legacy/
 .scratch/
+.workbuddy/
 docs/MIGRATION-RUNBOOK.md
 docs/NEXT-STEPS.md
