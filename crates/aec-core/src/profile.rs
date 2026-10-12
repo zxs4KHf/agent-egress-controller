@@ -42,13 +42,15 @@ pub struct RelaySettings {
 }
 
 impl Default for RelaySettings {
-    /// The values the legacy chain runs with (startup-egress.ps1).
+    /// The legacy chain's timings. Concurrency is higher than its original 3: Claude and ChatGPT
+    /// clients open many connections at once, and with 3 slots they queued until they failed
+    /// (2026-10-12, mostly api.anthropic.com). It limits connections being set up, not open ones.
     fn default() -> Self {
         Self {
             connect_timeout_ms: 1200,
             dial_budget_ms: 4000,
             cooldown_ms: 3000,
-            max_inflight: 3,
+            max_inflight: 12,
             max_rounds: 3,
         }
     }
@@ -74,6 +76,55 @@ pub struct Egress {
     pub relay: RelaySettings,
     #[serde(default)]
     pub expected: ExpectedEgress,
+    /// Optional encrypted first hop to the exit (ADR-0009).
+    #[serde(default)]
+    pub tunnel: Option<Tunnel>,
+}
+
+/// Shadowsocks ciphers offered for a tunnel. AEAD only; the stream ciphers are broken.
+pub const TUNNEL_CIPHERS: [&str; 4] = [
+    "chacha20-ietf-poly1305",
+    "aes-128-gcm",
+    "aes-256-gcm",
+    "xchacha20-ietf-poly1305",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TunnelServer {
+    pub host: String,
+    pub port: u16,
+}
+
+/// A Shadowsocks tunnel the relay reaches the exit through (ADR-0009).
+///
+/// Some exits cannot be dialled reliably in plain text from where the user sits: the first hop is
+/// recognised and reset. The core runs the tunnel (it already speaks Shadowsocks) and offers it on
+/// a loopback port; the relay dials each candidate through that port. The exit's own credentials
+/// therefore stay in the relay, and the core only ever holds the tunnel's password.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Tunnel {
+    pub enabled: bool,
+    /// The preset the servers came from (`tunnel::PRESETS`), or none when typed in by hand.
+    #[serde(default)]
+    pub preset: Option<String>,
+    pub servers: Vec<TunnelServer>,
+    pub cipher: String,
+    /// The tunnel password, in Credential Manager like every other secret.
+    pub credential_ref: String,
+    /// After the tunnelled attempts, also dial the exit directly. Both paths leave from the same
+    /// exit address, so the account sees no second address either way.
+    #[serde(default = "default_true")]
+    pub direct_fallback: bool,
+    /// Per-step wait for a tunnelled attempt. The tunnel adds a round trip to every step of the
+    /// handshake with the exit, so the relay's plain connect timeout is too short for it.
+    #[serde(default = "default_tunnel_step_ms")]
+    pub step_timeout_ms: u32,
+}
+
+fn default_tunnel_step_ms() -> u32 {
+    2500
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,12 +141,34 @@ pub struct ProxyScope {
     pub bypass: Vec<String>,
 }
 
-/// Where everything an Agent entry sends that is not a target domain goes.
-///
-/// Deliberately a named upstream rather than `DIRECT`. A fallback that resolves to a direct
-/// connection stops being a fallback the moment the route to a domain is blocked: the request is
-/// then made from this machine with this machine's address, which is a different failure that
-/// looks like a working link.
+/// An explicitly named mihomo outbound. `relay`, `DIRECT` and `REJECT` are reserved names and do
+/// not need entries here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RoutingOutbound {
+    pub name: String,
+    pub kind: RoutingOutboundKind,
+    pub server: String,
+    pub port: u16,
+    #[serde(default)]
+    pub credential_ref: Option<String>,
+    /// Encrypted transport nodes in imported tables (ADR-0009).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cipher: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialer_proxy: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RoutingOutboundKind {
+    Http,
+    Socks5,
+    #[serde(rename = "ss")]
+    Shadowsocks,
+}
+
+/// Legacy settings-page compatibility type. Imported profiles use `RoutingOutbound` instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FallbackUpstream {
@@ -106,21 +179,242 @@ pub struct FallbackUpstream {
     pub credential_ref: Option<String>,
 }
 
-/// `default-v1`: everything goes to the target group.
-pub const TEMPLATE_DEFAULT: &str = "default-v1";
-/// `split-v1`: the target domains go to the target group, everything else to the fallback.
-pub const TEMPLATE_SPLIT: &str = "split-v1";
-pub const RULES_TEMPLATES: [&str; 2] = [TEMPLATE_DEFAULT, TEMPLATE_SPLIT];
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RoutingGroupKind {
+    Select,
+    Fallback,
+    #[serde(rename = "url-test")]
+    UrlTest,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct Routing {
-    pub target_group: String,
-    pub rules_template: String,
-    /// Required by [`TEMPLATE_SPLIT`]; ignored by [`TEMPLATE_DEFAULT`].
-    #[serde(default)]
-    pub fallback: Option<FallbackUpstream>,
+pub struct RoutingCheck {
+    pub url: String,
+    pub interval_sec: u32,
+    pub tolerance_ms: u32,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RoutingGroup {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: RoutingGroupKind,
+    #[serde(default)]
+    pub check: Option<RoutingCheck>,
+    pub members: Vec<String>,
+    #[serde(default)]
+    pub switchable: bool,
+    #[serde(default)]
+    pub selected: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingRuleKind {
+    Domain,
+    DomainSuffix,
+    DomainKeyword,
+    IpCidr,
+    /// Optional geodata-based domestic bypass in the settings-page preset.
+    Geosite,
+    Geoip,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RoutingRule {
+    pub kind: RoutingRuleKind,
+    pub value: String,
+    pub target: String,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub no_resolve: bool,
+}
+
+/// Routing is data, not a code-selected template. Presets below only create initial values in the
+/// setup page; the running core consumes these four fields directly (ADR-0008).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Routing {
+    #[serde(default)]
+    pub outbounds: Vec<RoutingOutbound>,
+    #[serde(default)]
+    pub groups: Vec<RoutingGroup>,
+    #[serde(default)]
+    pub rules: Vec<RoutingRule>,
+    #[serde(rename = "final")]
+    pub final_target: String,
+}
+
+impl Default for Routing {
+    fn default() -> Self {
+        Self::preset("agent-egress", &[], false, &[], false, None)
+    }
+}
+
+impl Routing {
+    pub fn preset(
+        group_name: &str,
+        targets: &[Target],
+        split: bool,
+        extra: &[String],
+        domestic: bool,
+        local_proxy: Option<RoutingOutbound>,
+    ) -> Self {
+        let group = group_name.to_string();
+        let mut rules: Vec<_> = [
+            "127.0.0.0/8",
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "::1/128",
+            "fc00::/7",
+            "fe80::/10",
+        ]
+        .into_iter()
+        .map(|value| RoutingRule {
+            kind: RoutingRuleKind::IpCidr,
+            value: value.into(),
+            target: "DIRECT".into(),
+            note: None,
+            no_resolve: true,
+        })
+        .collect();
+        {
+            for domain in targets.iter().map(|t| &t.domain).chain(extra.iter()) {
+                if !rules.iter().any(|r: &RoutingRule| r.value == *domain) {
+                    rules.push(RoutingRule {
+                        kind: RoutingRuleKind::DomainSuffix,
+                        value: domain.clone(),
+                        target: group.clone(),
+                        note: None,
+                        no_resolve: false,
+                    });
+                }
+            }
+        }
+        if domestic {
+            rules.extend([
+                RoutingRule {
+                    kind: RoutingRuleKind::Geosite,
+                    value: "cn".into(),
+                    target: "DIRECT".into(),
+                    note: None,
+                    no_resolve: false,
+                },
+                RoutingRule {
+                    kind: RoutingRuleKind::Geoip,
+                    value: "CN".into(),
+                    target: "DIRECT".into(),
+                    note: None,
+                    no_resolve: true,
+                },
+            ]);
+        }
+        let mut groups = vec![RoutingGroup {
+            name: group.clone(),
+            kind: RoutingGroupKind::Select,
+            check: None,
+            members: vec!["relay".into()],
+            switchable: false,
+            selected: None,
+        }];
+        let mut outbounds = Vec::new();
+        let final_target = if split {
+            if let Some(proxy) = local_proxy {
+                groups.push(RoutingGroup {
+                    name: "aec-other".into(),
+                    kind: RoutingGroupKind::Fallback,
+                    check: Some(RoutingCheck {
+                        url: "https://www.gstatic.com/generate_204".into(),
+                        interval_sec: 15,
+                        tolerance_ms: 0,
+                    }),
+                    members: vec![proxy.name.clone(), "DIRECT".into()],
+                    switchable: false,
+                    selected: None,
+                });
+                outbounds.push(proxy);
+                "aec-other".to_string()
+            } else {
+                "DIRECT".to_string()
+            }
+        } else {
+            group
+        };
+        Self {
+            outbounds,
+            groups,
+            rules,
+            final_target,
+        }
+    }
+
+    pub fn primary_group(&self) -> Option<&RoutingGroup> {
+        self.groups.first()
+    }
+
+    pub fn primary_group_name(&self) -> Option<&str> {
+        self.primary_group().map(|g| g.name.as_str())
+    }
+
+    pub fn target_for_domain(&self, host: &str) -> Option<&str> {
+        for rule in &self.rules {
+            let hit = match rule.kind {
+                RoutingRuleKind::Domain => host.eq_ignore_ascii_case(&rule.value),
+                RoutingRuleKind::DomainSuffix => {
+                    host.eq_ignore_ascii_case(&rule.value)
+                        || host
+                            .to_ascii_lowercase()
+                            .ends_with(&format!(".{}", rule.value.to_ascii_lowercase()))
+                }
+                RoutingRuleKind::DomainKeyword => host
+                    .to_ascii_lowercase()
+                    .contains(&rule.value.to_ascii_lowercase()),
+                RoutingRuleKind::Geosite | RoutingRuleKind::Geoip => return None,
+                RoutingRuleKind::IpCidr if !rule.no_resolve => return None,
+                RoutingRuleKind::IpCidr => false,
+            };
+            if hit {
+                return Some(&rule.target);
+            }
+        }
+        Some(&self.final_target)
+    }
+
+    pub fn uses_geodata(&self) -> bool {
+        self.rules
+            .iter()
+            .any(|r| matches!(r.kind, RoutingRuleKind::Geosite | RoutingRuleKind::Geoip))
+    }
+}
+
+/// `default-v1`: a preset that routes every target and the final catch-all to the fixed exit.
+pub const TEMPLATE_DEFAULT: &str = "default-v1";
+/// `split-v1`: a preset that routes checked targets to the fixed exit and the rest direct.
+pub const TEMPLATE_SPLIT: &str = "split-v1";
+pub const RULES_TEMPLATES: [&str; 2] = [TEMPLATE_DEFAULT, TEMPLATE_SPLIT];
+
+/// Domains the settings page suggests for the fixed exit in split mode: the account and API
+/// domains of common AI services. A suggestion the user edits, not a rule the code relies on.
+pub const SUGGESTED_EXTRA_DOMAINS: [&str; 12] = [
+    "anthropic.com",
+    "claude.ai",
+    "claude.com",
+    "claudeusercontent.com",
+    "openai.com",
+    "chatgpt.com",
+    "oaistatic.com",
+    "oaiusercontent.com",
+    "sora.com",
+    "x.ai",
+    "grok.com",
+    "gemini.google.com",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -257,6 +551,13 @@ impl Default for ProfileSet {
     /// First-run profiles. The egress candidates are deliberately empty: they are a settings gap the
     /// user fills in, and validation reports them as such.
     fn default() -> Self {
+        let targets: Vec<_> = ["claude.ai", "www.anthropic.com", "chatgpt.com"]
+            .iter()
+            .map(|d| Target {
+                domain: (*d).into(),
+                trace: true,
+            })
+            .collect();
         Self {
             schema_version: SCHEMA_VERSION,
             agent: vec![AgentProfile {
@@ -267,19 +568,13 @@ impl Default for ProfileSet {
                     candidates: Vec::new(),
                     relay: RelaySettings::default(),
                     expected: ExpectedEgress::default(),
+                    tunnel: None,
                 },
                 proxy_scope: ProxyScope {
                     mode: ProxyScopeMode::ExplicitOnly,
                     bypass: vec!["<-loopback>".into(), "127.0.0.1".into(), "localhost".into()],
                 },
-                routing: Routing {
-                    target_group: "agent-egress".into(),
-                    // Everything an Agent entry opens goes through the target group. That needs no
-                    // second upstream, so the only settings gap left is the egress candidate itself
-                    // and nothing here has to be guessed from the machine it was written on.
-                    rules_template: TEMPLATE_DEFAULT.into(),
-                    fallback: None,
-                },
+                routing: Routing::preset("agent-egress", &targets, false, &[], false, None),
                 locale: Locale {
                     timezone: TimezoneTarget {
                         windows_id: "Eastern Standard Time".into(),
@@ -288,13 +583,7 @@ impl Default for ProfileSet {
                     browser_lang: "en-US".into(),
                     accept_language: "en-US,en".into(),
                 },
-                targets: ["claude.ai", "www.anthropic.com", "chatgpt.com"]
-                    .iter()
-                    .map(|d| Target {
-                        domain: (*d).into(),
-                        trace: true,
-                    })
-                    .collect(),
+                targets,
                 entries: vec![
                     Entry::Browser {
                         id: "edge".into(),
@@ -387,6 +676,209 @@ fn check_unique<'a>(errors: &mut Errors, path: &str, ids: impl Iterator<Item = &
     }
 }
 
+/// Validate the data-driven routing table before the core can see it. All references share one
+/// namespace, including built-in `relay`, `DIRECT`, and `REJECT`.
+pub fn validate_routing(r: &Routing) -> Vec<FieldError> {
+    let mut e = Errors(Vec::new());
+    let mut names = HashSet::from(["relay", "DIRECT", "REJECT"]);
+    for (i, outbound) in r.outbounds.iter().enumerate() {
+        let p = format!("routing.outbounds[{i}]");
+        let name = outbound.name.as_str();
+        if name.trim().is_empty()
+            || name.contains([',', '\n', '\r'])
+            || name.starts_with("aec-tunnel")
+            || !names.insert(name)
+        {
+            e.push(
+                format!("{p}.name"),
+                "name is empty, reserved, or already used",
+            );
+        }
+        if outbound.server.trim().is_empty() || outbound.server.contains(char::is_whitespace) {
+            e.push(format!("{p}.server"), "must be a host name or IP");
+        }
+        if outbound.port == 0 {
+            e.push(format!("{p}.port"), "must be 1-65535");
+        }
+        match outbound.kind {
+            RoutingOutboundKind::Shadowsocks => {
+                if !outbound
+                    .cipher
+                    .as_deref()
+                    .is_some_and(|c| TUNNEL_CIPHERS.contains(&c))
+                {
+                    e.push(format!("{p}.cipher"), "requires a supported AEAD cipher");
+                }
+                if outbound.credential_ref.is_none() {
+                    e.push(
+                        format!("{p}.credentialRef"),
+                        "SS requires a stored password",
+                    );
+                }
+            }
+            _ if outbound.cipher.is_some() => {
+                e.push(format!("{p}.cipher"), "only SS outbounds use a cipher")
+            }
+            _ => {}
+        }
+        if matches!(outbound.credential_ref.as_deref(), Some("")) {
+            e.push(format!("{p}.credentialRef"), "must not be empty");
+        }
+    }
+    for (i, group) in r.groups.iter().enumerate() {
+        let p = format!("routing.groups[{i}]");
+        let name = group.name.as_str();
+        if name.trim().is_empty()
+            || name.contains([',', '\n', '\r'])
+            || name.starts_with("aec-tunnel")
+            || !names.insert(name)
+        {
+            e.push(
+                format!("{p}.name"),
+                "name is empty, reserved, or already used",
+            );
+        }
+        if group.switchable && group.kind != RoutingGroupKind::Select {
+            e.push(
+                format!("{p}.switchable"),
+                "only select groups can be switched",
+            );
+        }
+    }
+    let exists = |n: &str| names.contains(n);
+    for (i, outbound) in r.outbounds.iter().enumerate() {
+        if outbound
+            .dialer_proxy
+            .as_deref()
+            .is_some_and(|n| !exists(n) || n == outbound.name)
+        {
+            e.push(
+                format!("routing.outbounds[{i}].dialerProxy"),
+                "unknown or self-referencing dialer",
+            );
+        }
+    }
+    // The same cycle check covers nested groups and outbound dialer chains.
+    fn cyclic<'a>(
+        r: &'a Routing,
+        name: &'a str,
+        visiting: &mut HashSet<&'a str>,
+        done: &mut HashSet<&'a str>,
+    ) -> bool {
+        if done.contains(name) {
+            return false;
+        }
+        if !visiting.insert(name) {
+            return true;
+        }
+        let children: Vec<&str> = if let Some(g) = r.groups.iter().find(|g| g.name == name) {
+            g.members.iter().map(String::as_str).collect()
+        } else {
+            r.outbounds
+                .iter()
+                .find(|o| o.name == name)
+                .and_then(|o| o.dialer_proxy.as_deref())
+                .into_iter()
+                .collect()
+        };
+        if children.into_iter().any(|n| cyclic(r, n, visiting, done)) {
+            return true;
+        }
+        visiting.remove(name);
+        done.insert(name);
+        false
+    }
+    let mut done = HashSet::new();
+    for name in r
+        .groups
+        .iter()
+        .map(|g| g.name.as_str())
+        .chain(r.outbounds.iter().map(|o| o.name.as_str()))
+    {
+        if cyclic(r, name, &mut HashSet::new(), &mut done) {
+            e.push("routing", "group/dialer references form a cycle");
+            break;
+        }
+    }
+    if !exists(&r.final_target) {
+        e.push(
+            "routing.final",
+            "must refer to an outbound, group, or reserved name",
+        );
+    }
+    for (i, group) in r.groups.iter().enumerate() {
+        let p = format!("routing.groups[{i}]");
+        if group.members.is_empty() {
+            e.push(format!("{p}.members"), "must not be empty");
+        }
+        for (j, member) in group.members.iter().enumerate() {
+            if !exists(member) || member == &group.name {
+                e.push(
+                    format!("{p}.members[{j}]"),
+                    "unknown or self-referencing member",
+                );
+            }
+        }
+        if let Some(selected) = &group.selected {
+            if !group.members.contains(selected) || !group.switchable {
+                e.push(
+                    format!("{p}.selected"),
+                    "must be a member of a switchable group",
+                );
+            }
+        }
+        if let Some(check) = &group.check {
+            if !(check.url.starts_with("http://") || check.url.starts_with("https://"))
+                || check.url.contains(char::is_whitespace)
+            {
+                e.push(format!("{p}.check.url"), "must be an HTTP(S) URL");
+            }
+            if check.interval_sec == 0 {
+                e.push(format!("{p}.check.intervalSec"), "must be positive");
+            }
+        } else if group.kind != RoutingGroupKind::Select {
+            e.push(
+                format!("{p}.check"),
+                "fallback and url-test groups require a check",
+            );
+        }
+    }
+    for (i, rule) in r.rules.iter().enumerate() {
+        let p = format!("routing.rules[{i}]");
+        if !exists(&rule.target) {
+            e.push(format!("{p}.target"), "unknown outbound or group");
+        }
+        if rule.value.trim().is_empty() || rule.value.contains([',', '\n', '\r']) {
+            e.push(
+                format!("{p}.value"),
+                "must be a non-empty single value without commas",
+            );
+        }
+        if matches!(
+            rule.kind,
+            RoutingRuleKind::Domain | RoutingRuleKind::DomainSuffix
+        ) && !is_hostname(&rule.value)
+        {
+            e.push(format!("{p}.value"), "must be a domain name");
+        }
+        if rule.kind == RoutingRuleKind::IpCidr {
+            let valid = rule
+                .value
+                .split_once('/')
+                .and_then(|(ip, bits)| Some((ip.parse::<IpAddr>().ok()?, bits.parse::<u8>().ok()?)))
+                .is_some_and(|(ip, bits)| bits <= if ip.is_ipv4() { 32 } else { 128 });
+            if !valid {
+                e.push(format!("{p}.value"), "must be an IPv4/IPv6 CIDR");
+            }
+        }
+        if rule.no_resolve && !matches!(rule.kind, RoutingRuleKind::IpCidr | RoutingRuleKind::Geoip)
+        {
+            e.push(format!("{p}.noResolve"), "only IP rules support no-resolve");
+        }
+    }
+    e.0
+}
+
 fn validate_agent(p: &AgentProfile, at: &str, e: &mut Errors) {
     if p.schema_version != SCHEMA_VERSION {
         e.push(
@@ -396,6 +888,9 @@ fn validate_agent(p: &AgentProfile, at: &str, e: &mut Errors) {
     }
     if p.name.trim().is_empty() {
         e.push(format!("{at}.name"), "must not be empty");
+    }
+    for error in validate_routing(&p.routing) {
+        e.push(format!("{at}.{}", error.path), error.message);
     }
 
     let c = format!("{at}.egress.candidates");
@@ -439,6 +934,39 @@ fn validate_agent(p: &AgentProfile, at: &str, e: &mut Errors) {
         e.push(format!("{rp}.maxRounds"), "must be at least 1");
     }
 
+    if let Some(t) = &p.egress.tunnel {
+        let tp = format!("{at}.egress.tunnel");
+        if t.enabled && t.servers.is_empty() {
+            e.push(format!("{tp}.servers"), "at least one server is required");
+        }
+        for (i, s) in t.servers.iter().enumerate() {
+            if s.host.trim().is_empty() || s.host.contains(char::is_whitespace) {
+                e.push(
+                    format!("{tp}.servers[{i}].host"),
+                    "must be a host name or IP",
+                );
+            }
+            if s.port == 0 {
+                e.push(format!("{tp}.servers[{i}].port"), "must be 1-65535");
+            }
+        }
+        if !TUNNEL_CIPHERS.contains(&t.cipher.as_str()) {
+            e.push(
+                format!("{tp}.cipher"),
+                format!("must be one of {}", TUNNEL_CIPHERS.join(", ")),
+            );
+        }
+        if t.credential_ref.trim().is_empty() {
+            e.push(format!("{tp}.credentialRef"), "must not be empty");
+        }
+        if t.step_timeout_ms == 0 || t.step_timeout_ms > r.dial_budget_ms {
+            e.push(
+                format!("{tp}.stepTimeoutMs"),
+                "must be positive and not above egress.relay.dialBudgetMs",
+            );
+        }
+    }
+
     let x = &p.egress.expected;
     if let Some(ip) = &x.ip {
         if ip.parse::<IpAddr>().is_err() {
@@ -469,41 +997,6 @@ fn validate_agent(p: &AgentProfile, at: &str, e: &mut Errors) {
             "must contain <-loopback> or 127.0.0.1",
         );
     }
-    if p.routing.target_group.trim().is_empty() {
-        e.push(format!("{at}.routing.targetGroup"), "must not be empty");
-    }
-    if !RULES_TEMPLATES.contains(&p.routing.rules_template.as_str()) {
-        e.push(
-            format!("{at}.routing.rulesTemplate"),
-            format!("must be one of {}", RULES_TEMPLATES.join(", ")),
-        );
-    }
-    match &p.routing.fallback {
-        Some(f) => {
-            let fp = format!("{at}.routing.fallback");
-            if f.host.trim().is_empty() {
-                e.push(format!("{fp}.host"), "must not be empty");
-            }
-            if f.port == 0 {
-                e.push(format!("{fp}.port"), "must be 1-65535");
-            }
-            if matches!(f.credential_ref.as_deref(), Some(r) if r.trim().is_empty()) {
-                e.push(
-                    format!("{fp}.credentialRef"),
-                    "must be omitted or non-empty",
-                );
-            }
-        }
-        None => {
-            if p.routing.rules_template == TEMPLATE_SPLIT {
-                e.push(
-                    format!("{at}.routing.fallback"),
-                    format!("is required by '{TEMPLATE_SPLIT}': without it, non-target traffic has no upstream"),
-                );
-            }
-        }
-    }
-
     let l = &p.locale;
     if l.timezone.windows_id.trim().is_empty() {
         e.push(
@@ -620,12 +1113,15 @@ mod tests {
         errors.iter().map(|e| e.path.as_str()).collect()
     }
 
-    fn fallback() -> FallbackUpstream {
-        FallbackUpstream {
-            host: "203.0.113.10".into(),
+    fn fallback() -> RoutingOutbound {
+        RoutingOutbound {
+            name: "daily-proxy".into(),
+            server: "203.0.113.10".into(),
             port: 1080,
-            proto: UpstreamProto::Socks5,
+            kind: RoutingOutboundKind::Socks5,
             credential_ref: None,
+            cipher: None,
+            dialer_proxy: None,
         }
     }
 
@@ -644,8 +1140,8 @@ mod tests {
     #[test]
     fn default_profile_carries_nothing_machine_specific() {
         let s = ProfileSet::default();
-        assert_eq!(s.agent[0].routing.rules_template, TEMPLATE_DEFAULT);
-        assert!(s.agent[0].routing.fallback.is_none());
+        assert_eq!(s.agent[0].routing.final_target, "agent-egress");
+        assert!(s.agent[0].routing.outbounds.is_empty());
         assert!(s.agent[0].egress.candidates.is_empty());
     }
 
@@ -726,28 +1222,29 @@ mod tests {
                 Box::new(|s| s.agent[0].locale.accept_language = "en-US,,en".into()),
             ),
             (
-                "agent[0].routing.rulesTemplate",
-                Box::new(|s| s.agent[0].routing.rules_template = "v9".into()),
+                "agent[0].routing.final",
+                Box::new(|s| s.agent[0].routing.final_target = "missing".into()),
             ),
             (
-                "agent[0].routing.fallback",
+                "agent[0].routing.rules[0].target",
                 Box::new(|s| {
-                    s.agent[0].routing.rules_template = TEMPLATE_SPLIT.into();
-                    s.agent[0].routing.fallback = None;
+                    s.agent[0].routing.rules[0].target = "missing".into();
                 }),
             ),
             (
-                "agent[0].routing.fallback.host",
+                "agent[0].routing.outbounds[0].server",
                 Box::new(|s| {
-                    s.agent[0].routing.fallback = Some(fallback());
-                    s.agent[0].routing.fallback.as_mut().unwrap().host = " ".into();
+                    let mut outbound = fallback();
+                    outbound.server = " ".into();
+                    s.agent[0].routing.outbounds.push(outbound);
                 }),
             ),
             (
-                "agent[0].routing.fallback.port",
+                "agent[0].routing.outbounds[0].port",
                 Box::new(|s| {
-                    s.agent[0].routing.fallback = Some(fallback());
-                    s.agent[0].routing.fallback.as_mut().unwrap().port = 0;
+                    let mut outbound = fallback();
+                    outbound.port = 0;
+                    s.agent[0].routing.outbounds.push(outbound);
                 }),
             ),
             (
@@ -780,10 +1277,30 @@ mod tests {
     }
 
     #[test]
-    fn only_the_split_template_needs_a_fallback() {
+    fn split_mode_does_not_need_a_proxy_of_its_own() {
         let mut s = valid();
-        s.agent[0].routing.rules_template = TEMPLATE_DEFAULT.into();
-        s.agent[0].routing.fallback = None;
+        for split in [false, true] {
+            s.agent[0].routing =
+                Routing::preset("agent-egress", &s.agent[0].targets, split, &[], true, None);
+            assert!(validate(&s).is_empty(), "split={split}");
+        }
+    }
+
+    #[test]
+    fn suggested_extra_domains_are_valid() {
+        let mut s = valid();
+        let extra: Vec<_> = SUGGESTED_EXTRA_DOMAINS
+            .iter()
+            .map(|d| d.to_string())
+            .collect();
+        s.agent[0].routing = Routing::preset(
+            "agent-egress",
+            &s.agent[0].targets,
+            true,
+            &extra,
+            false,
+            None,
+        );
         assert!(validate(&s).is_empty());
     }
 

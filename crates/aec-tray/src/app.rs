@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-use aec_core::controller::{Controller, EnterOptions, Mode, Settings};
+use aec_core::controller::{Controller, EnterOptions, KeepOutcome, Mode, Settings};
 use aec_core::core::process::CoreManager;
 use aec_core::core::CorePorts;
 use aec_core::credentials::WindowsCredentials;
@@ -87,6 +87,10 @@ impl Layout {
 pub enum Cmd {
     Enter,
     Open(String),
+    Switch {
+        group: String,
+        member: String,
+    },
     Recheck,
     /// Leave Agent mode, recover an interrupted session or retry a failed restore.
     Exit,
@@ -96,6 +100,8 @@ pub enum Cmd {
     Restore(Sender<()>),
     /// Restore if needed, then reply and stop so the UI can quit.
     Shutdown(Sender<()>),
+    /// Periodic observation: notify if another program changes the system proxy.
+    Keep,
 }
 
 /// A notification for the UI to show once.
@@ -114,6 +120,8 @@ pub struct Shared {
     pub configured: bool,
     /// (entry id, menu label)
     pub entries: Vec<(String, String)>,
+    /// (group, member, selected); menu IDs are allocated from a separate range.
+    pub switches: Vec<(String, String, bool)>,
     pub has_report: bool,
     pub note: Option<Note>,
     pub summary: Option<String>,
@@ -195,6 +203,21 @@ impl Worker {
                 .map(|e| (e.id().to_string(), text::entry_label(e)))
                 .collect();
             s.has_report = self.controller.state().last_report.is_some();
+            s.switches = p
+                .routing
+                .groups
+                .iter()
+                .filter(|g| g.switchable)
+                .flat_map(|g| {
+                    g.members.iter().map(|member| {
+                        (
+                            g.name.clone(),
+                            member.clone(),
+                            g.selected.as_ref().or_else(|| g.members.first()) == Some(member),
+                        )
+                    })
+                })
+                .collect();
             s.summary = self
                 .controller
                 .state()
@@ -216,13 +239,19 @@ impl Worker {
 
     pub fn run(mut self, rx: Receiver<Cmd>) {
         for cmd in rx {
+            if matches!(cmd, Cmd::Keep) {
+                self.keep();
+                continue;
+            }
             let label = match &cmd {
                 Cmd::Enter => "正在进入 Agent 模式…",
                 Cmd::Open(_) => "正在打开并检测…",
+                Cmd::Switch { .. } => "正在切换路由并重新检测…",
                 Cmd::Recheck => "正在重新检测…",
                 Cmd::Exit | Cmd::Restore(_) | Cmd::Shutdown(_) => "正在退出并恢复…",
                 Cmd::Ack => "正在处理…",
                 Cmd::CopyPrompts => "正在生成提示词…",
+                Cmd::Keep => unreachable!("handled above"),
             };
             self.publish(Some(label));
             let quit = self.handle(cmd);
@@ -268,7 +297,7 @@ impl Worker {
                 if !profile::validate(&set).is_empty() {
                     self.note(
                         "还没有设置出口",
-                        "先在托盘菜单点「设置出口和时区…」。",
+                        "先在托盘菜单点「设置出口和分流…」。",
                         true,
                     );
                     return false;
@@ -336,8 +365,78 @@ impl Worker {
                 let _ = done.send(());
                 return true;
             }
+            Cmd::Switch { group, member } => self.switch_route(&group, &member),
+            Cmd::Keep => self.keep(),
         }
         false
+    }
+
+    fn keep(&mut self) {
+        match self.controller.keep_system_proxy() {
+            None => {}
+            Some(KeepOutcome::Changed { found }) => self.note(
+                "系统代理被其他程序改写",
+                &format!(
+                    "当前系统代理为 {found}。Agent 就绪状态已撤销；请关闭冲突程序的系统代理开关，再退出并重新进入 Agent 模式。"
+                ),
+                true,
+            ),
+            Some(KeepOutcome::Failed(e)) => self.note("系统代理巡检失败", &e, true),
+        }
+        self.write_report();
+        self.publish(None);
+    }
+
+    fn switch_route(&mut self, group: &str, member: &str) {
+        let result = (|| -> Result<(), String> {
+            let store = ProfileStore::new(&self.layout.data_dir);
+            let mut set = store.load().map_err(|e| e.to_string())?;
+            let g = set.agent[0]
+                .routing
+                .groups
+                .iter_mut()
+                .find(|g| g.name == group && g.switchable)
+                .ok_or("路由组不可切换")?;
+            if !g.members.iter().any(|m| m == member) {
+                return Err("所选出站不属于这个组".into());
+            }
+            let previous = g
+                .selected
+                .clone()
+                .or_else(|| g.members.first().cloned())
+                .ok_or("路由组为空")?;
+            g.selected = Some(member.into());
+            self.controller
+                .invalidate_routing_checks()
+                .map_err(|e| e.to_string())?;
+            let core = &self.controller.platform().core;
+            core.select(&aec_core::windows::WindowsHost, group, member)
+                .map_err(|e| e.to_string())?;
+            if let Err(e) = store.save(&set) {
+                let rollback = core.select(&aec_core::windows::WindowsHost, group, &previous);
+                return Err(format!(
+                    "选择保存失败：{e}；回退{}",
+                    if rollback.is_ok() {
+                        "成功"
+                    } else {
+                        "失败，请退出 Agent 模式"
+                    }
+                ));
+            }
+            self.controller
+                .recheck(&set.agent[0])
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        })();
+        self.write_report();
+        match result {
+            Ok(()) => self.note(
+                "路由已切换",
+                "新连接使用所选出站；已重新检测，请查看检测结果。现有连接保留原路由。",
+                false,
+            ),
+            Err(e) => self.note("路由切换未完成", &e, true),
+        }
     }
 
     fn exit(&mut self) {
@@ -364,11 +463,8 @@ impl Worker {
         let profile = &set.agent[0];
         let gaps = profile::validate(&set);
         let st = aec_core::status::collect(&aec_core::windows::WindowsHost, Some(data_dir));
-        let gate = TakeoverGate::evaluate(
-            Settings::load(data_dir).takeover_enabled,
-            &st.foreign_writers,
-            true,
-        );
+        let gate =
+            TakeoverGate::evaluate(self.controller.enabled(profile), &st.foreign_writers, true);
         let state = self.controller.state();
         let data_dir_text = data_dir.display().to_string();
         let ctx = PromptContext {
@@ -413,11 +509,17 @@ impl SetupBackend for Backend {
             .user_name(setup::CREDENTIAL_REF)
             .ok()
             .flatten();
+        let tunnel_stored = WindowsCredentials
+            .exists(setup::TUNNEL_CREDENTIAL_REF)
+            .unwrap_or(false);
         setup::view(
             &set,
-            user.as_deref(),
-            Settings::load(&self.data_dir).takeover_enabled,
-            self.locked(),
+            &setup::ViewInput {
+                stored_user: user.as_deref(),
+                tunnel_password_stored: tunnel_stored,
+                takeover_enabled: Settings::load(&self.data_dir).takeover_enabled,
+                locked: self.locked(),
+            },
         )
     }
 
@@ -434,16 +536,23 @@ impl SetupBackend for Backend {
         let mut set = load_set(&self.data_dir);
         let creds = WindowsCredentials;
         let user = creds.user_name(setup::CREDENTIAL_REF).map_err(fe)?;
-        let (change, takeover) = setup::apply(&mut set, &form, user.as_deref())?;
-        match change {
-            CredentialChange::Store { user, pass } => creds
-                .store(setup::CREDENTIAL_REF, &user, &pass)
-                .map_err(fe)?,
-            CredentialChange::Delete => {
-                creds.delete(setup::CREDENTIAL_REF).map_err(fe)?;
+        let tunnel_stored = creds.exists(setup::TUNNEL_CREDENTIAL_REF).map_err(fe)?;
+        let applied = setup::apply(&mut set, &form, user.as_deref(), tunnel_stored)?;
+        for (reference, change) in [
+            (setup::CREDENTIAL_REF, applied.exit),
+            (setup::TUNNEL_CREDENTIAL_REF, applied.tunnel),
+        ] {
+            match change {
+                CredentialChange::Store { user, pass } => {
+                    creds.store(reference, &user, &pass).map_err(fe)?
+                }
+                CredentialChange::Delete => {
+                    creds.delete(reference).map_err(fe)?;
+                }
+                CredentialChange::Keep => {}
             }
-            CredentialChange::Keep => {}
         }
+        let takeover = applied.takeover;
         ProfileStore::new(&self.data_dir)
             .save(&set)
             .map_err(|e| fe(e.to_string()))?;

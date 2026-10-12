@@ -12,10 +12,14 @@
 ```bash
 cargo build
 cargo run -p aec-tray        # 开发版托盘，数据放在 runtime/dev-data
-cargo run -p aec-dev -- status
+cargo run -p aec-dev --bin aec-dev -- status
 ```
 
 开发版和便携版使用独立的数据目录和端口（17xxx），不会动你本机其他代理工具。
+
+路由数据与官方隧道的约束见 ADR-0008/0009。合成导入 fixture 在 `crates/aec-core/tests/fixtures/routing.yaml`，不把私人源表入库。发布前补跑 `cargo test -- --include-ignored`，包含真实 mihomo 的配置、控制口选择和本地全链路。私有表可用 `verify_mihomo_import` 示例进行只读结构/出口等价验收，命令与验证边界见 `docs/RELEASE-0.2.0.md`。
+
+便携包用 `powershell -ExecutionPolicy Bypass -File packaging/build-portable.ps1` 构建。只复制明确列出的二进制与文档，校验 pinned mihomo，保留第三方许可证，生成 SHA256；不复制 data、logs、legacy 或私有对话。没有可信来源的 GeoSite/GeoIP 文件不会打包。已有版本产物不得覆盖。
 
 ## 改代码的流程
 
@@ -36,7 +40,7 @@ cargo run -p aec-dev -- status
 
 - 机器指纹伪造、Canvas/WebGL 噪声、0–100 的「纯净度」总分。
 - TUN、虚拟网卡、改路由表或防火墙。
-- 把凭据写进任何文件、日志或提示词；自动把任何内容发到网络上。
+- 把凭据写进持久档案、日志或提示词；自动把排查内容发到网络上。内核/relay 启动所需的临时凭据配置按 SPEC 4.4/4.13 管理并在退出时清理，不得随发布包分发。
 - 强制结束不是本应用启动的进程。
 - 没有用户同意就下载东西。
 

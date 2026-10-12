@@ -51,7 +51,12 @@ pub struct CheckResult {
 }
 
 impl CheckResult {
-    fn new(id: impl Into<String>, kind: Kind, status: Status, reason: Option<&str>) -> Self {
+    pub(crate) fn new(
+        id: impl Into<String>,
+        kind: Kind,
+        status: Status,
+        reason: Option<&str>,
+    ) -> Self {
         Self {
             id: id.into(),
             kind,
@@ -60,7 +65,7 @@ impl CheckResult {
             evidence: Vec::new(),
         }
     }
-    fn with(mut self, source: impl Into<String>, detail: impl Into<String>) -> Self {
+    pub(crate) fn with(mut self, source: impl Into<String>, detail: impl Into<String>) -> Self {
         self.evidence.push(Evidence {
             source: source.into(),
             detail: detail.into(),
@@ -418,7 +423,6 @@ fn system_dns_line(r: &Result<Vec<String>, String>) -> String {
 
 /// G3: every target reached the core by name and left through the profile's group.
 fn dns_path(input: &CheckInput, mark: Option<u64>) -> CheckResult {
-    let group = &input.profile.routing.target_group;
     let r = match (input.observer, mark) {
         (Some(o), Some(m)) => match (o.dns_listening(), o.records_since(m)) {
             (Ok(false), _) => {
@@ -437,13 +441,22 @@ fn dns_path(input: &CheckInput, mark: Option<u64>) -> CheckResult {
             .with("core log", e),
             (Ok(true), Ok(records)) => {
                 let mut evidence = Vec::new();
-                let (mut wrong, mut missing) = (Vec::new(), Vec::new());
+                let (mut wrong, mut missing, mut uncertain) = (Vec::new(), Vec::new(), Vec::new());
                 for t in &input.profile.targets {
+                    let group = input.profile.routing.target_for_domain(&t.domain);
+                    if group.is_none() {
+                        uncertain.push(t.domain.clone());
+                    }
                     let seen: Vec<&ConnRecord> = records
                         .iter()
                         .filter(|c| c.host.eq_ignore_ascii_case(&t.domain))
                         .collect();
-                    match seen.iter().find(|c| &c.group != group) {
+                    match seen.iter().find(|c| {
+                        group.is_some_and(|g| c.group != g)
+                            || c.group == "DIRECT"
+                            || c.group == "REJECT"
+                            || c.via.as_deref() == Some("DIRECT")
+                    }) {
                         _ if seen.is_empty() => missing.push(t.domain.clone()),
                         Some(bad) => wrong.push(format!(
                             "{} left through {} (rule {})",
@@ -471,6 +484,13 @@ fn dns_path(input: &CheckInput, mark: Option<u64>) -> CheckResult {
                     CheckResult::new("G3", Kind::Hard, Status::Fail, Some("wrong_group"))
                 } else if !missing.is_empty() {
                     CheckResult::new("G3", Kind::Hard, Status::Fail, Some("no_domain_record"))
+                } else if !uncertain.is_empty() {
+                    CheckResult::new(
+                        "G3",
+                        Kind::Hard,
+                        Status::Unknown,
+                        Some("routing_evidence_incomplete"),
+                    )
                 } else {
                     CheckResult::new("G3", Kind::Hard, Status::Pass, None)
                 };
@@ -482,6 +502,9 @@ fn dns_path(input: &CheckInput, mark: Option<u64>) -> CheckResult {
                 }
                 for e in evidence {
                     r = r.with("core log", e);
+                }
+                for domain in uncertain {
+                    r = r.with("routing", format!("{domain}: earlier geodata/IP rule cannot be evaluated from domain evidence alone"));
                 }
                 if addresses > 0 {
                     r = r.with(

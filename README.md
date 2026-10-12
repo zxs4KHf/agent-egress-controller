@@ -11,12 +11,12 @@
 
 用 Claude Code、Codex 或浏览器里的 AI 时，你可能希望它们稳定走同一个出口，而电脑上其他软件照常直连。手动配代理容易漏：浏览器走了出口，DNS 没走；IP 换了，时区还是本地；某个站点悄悄分流到了别的出口。
 
-Agent 出口控制器把这件事收进一个托盘图标：**从托盘打开的浏览器和 CLI 走你配置的出口，系统时区跟着出口对齐，每一项都实际检测并附上证据；用完一键退出，改过的设置原样恢复。** 它不改系统代理，不碰其他程序。
+Agent 出口控制器把这件事收进一个托盘图标：从托盘打开的浏览器和 CLI 使用你配置的出口，按需对齐系统时区，逐项检测并给出证据，退出时按快照恢复。默认只影响显式启动的入口；需要让遵循 Windows 系统代理的桌面应用使用同一套规则时，可开启系统代理接管。真实全局写入始终受接管门保护。
 
 <p align="center">
-  <img src="./assets/readme/setup-page.png" width="560" alt="出口与时区设置页：填出口地址 203.0.113.10、SOCKS5、端口 12324 和 12325、用户名 alice，密码显示「已保存，不改就留空」；目标时区选美国西部（洛杉矶），浏览器语言 en-US，并勾选了进入时修改系统时区。">
+  <img src="./assets/readme/setup-page-0.2.0.png" width="680" alt="0.2.0 设置页实测截图：合成出口配置、已保存密码占位提示、可选加密隧道。">
 </p>
-<p align="center"><sub>首次运行自动打开的设置页（只在本机 127.0.0.1 打开）。密码直接存进 Windows 凭据管理器，页面不回显。（示例数据）</sub></p>
+<p align="center"><sub>0.2.0 设置页，截图使用合成地址和账号。页面只在 127.0.0.1 打开，密码不回显；下方另有分流、系统代理和时区设置。</sub></p>
 
 ## 它怎么工作
 
@@ -24,7 +24,9 @@ Agent 出口控制器把这件事收进一个托盘图标：**从托盘打开的
   <img src="./assets/readme/workflow.svg" width="100%" alt="四步：1 设置出口（只做一次，密码进凭据管理器）→ 2 进入：拍环境快照、启动内核和 relay、按设置改时区、跑检测 → 3 使用：托盘打开 Edge、Chrome、Claude Code 或 Codex，浏览器信号也纳入检测 → 4 退出：关掉它开的浏览器、时区改回并读回确认、停止内核，注销关机前也会自动做。">
 </p>
 
-- **只给 Agent 用的出口**：程序在本机起一个代理内核（[mihomo](https://github.com/MetaCubeX/mihomo)）和一个 relay。只有从托盘打开的浏览器（独立配置目录，不动你平时的浏览器数据）和终端里的 Claude Code / Codex 会指向它。
+- **默认只给 Agent 用的出口**：本机运行 [mihomo](https://github.com/MetaCubeX/mihomo) 和 Rust relay，托盘启动的浏览器使用独立配置目录，CLI 使用子进程代理变量。可选系统代理接管让其他遵循系统代理的应用也进入这套规则。
+- **隧道中转**：直接连不上 HTTP/SOCKS5 出口时，可先通过 Shadowsocks 隧道连接出口。设置页提供 [IPRoyal 官方公开中转](https://iproyal.com/integrations/how-to-use-iproyal-proxies-with-shadowrocket/) 预设，也支持自定义。中转入口不是最终出口，仍需用户自己的出口代理账号。
+- **路由表作为数据**：具名出站、多层组、规则顺序和注释直接保存在档案里。可以导入 mihomo/Clash 路由表，在托盘切换 `select` 组并保存选择，无需改 Rust 代码或重新发版。
 - **多端口自动切换**：同一个出口的多个端口组成候选池。连不上就换下一个，有冷却、并发上限和拨号预算，全部失败时如实报错，不伪造响应。
 - **改之前先拍快照**：进入时记录系统时区等设置，退出时逐项改回并读回确认。如果发现别的程序改过了，就保留现状并告诉你，不硬覆盖。
 - **有证据才算通过**：拿不到证据的检测项显示「未知」，不当作通过。托盘只有在硬门槛全部通过时才变绿。
@@ -38,6 +40,7 @@ Agent 出口控制器把这件事收进一个托盘图标：**从托盘打开的
 | G3 DNS | 目标域名是由内核按名字代办解析的，没有经过本机 DNS |
 | G4 时区 | 系统时区和浏览器里 `Intl` 报告的时区都等于目标时区 |
 | G5 语言 | 每个打开的浏览器的语言和 Accept-Language 符合设置 |
+| G6 系统代理（仅开启系统接管时） | 接管门允许真实写入，且 Windows 系统代理仍指向本程序 |
 
 另有只读信号，只提示、不影响就绪：出口 ASN、延迟、WebRTC 是否暴露本机 IP、Canvas/WebGL、Cookie 开关、非目标网站的出口、时区由谁设置。**不打 0–100 的「纯净度」分，也不伪造指纹。**
 
@@ -47,10 +50,10 @@ Agent 出口控制器把这件事收进一个托盘图标：**从托盘打开的
 
 **需要：** Windows 10/11；本机已装 Edge 或 Chrome；一个你自己的出口代理（SOCKS5 或 HTTP，地址、端口，有账号就带上）。
 
-1. 到 [Releases](https://github.com/zxs4KHf/agent-egress-controller/releases) 下载 `AgentEgressController-0.1.0-portable.zip`，解压到任意文件夹。
+1. 到 [Releases](https://github.com/zxs4KHf/agent-egress-controller/releases) 下载 `AgentEgressController-0.2.0-portable.zip`，按 `SHA256SUMS.txt` 校验后解压。
 2. 双击 `aec-tray.exe`。程序没有签名，Windows 可能提示「已保护你的电脑」，点「更多信息 → 仍要运行」。
-3. 自动打开的设置页里填出口和目标时区，保存。想让程序改系统时区，就勾选那一项。
-4. 右下角托盘圆点（可能藏在「^」里）→「进入 Agent 模式」。等圆点变绿，从菜单打开 Edge、Chrome、Claude Code 或 Codex。
+3. 设置页填自己的出口、端口和账号、目标时区。直接连接失败时启用隧道；只代理 AI 域名可选「分流」，其他流量默认直连，也可填自己的日常代理。需要修改时区或系统代理时分别勾选相应开关。
+4. 托盘圆点（可能藏在「^」里）→「进入 Agent 模式」，然后从菜单打开 Edge 或 Chrome，让本地检查页回报时区、语言等证据。未打开浏览器或检查证据不足时保持黄色；全部硬门槛通过后才变绿，再开始使用 AI 服务或 CLI。
 5. 用完点「退出 Agent 模式」。浏览器会被关掉，时区改回，代理停止。
 
 | 圆点颜色 | 含义 |
@@ -62,17 +65,36 @@ Agent 出口控制器把这件事收进一个托盘图标：**从托盘打开的
 
 数据（设置、检测结果、日志、快照）放在解压目录的 `data\` 里；密码在凭据管理器里，名字以 `AgentEgressController:` 开头。
 
+## 导入和交付给其他用户
+
+先退出 Agent 模式，再在便携包目录运行 PowerShell：
+
+```powershell
+.\aec-dev.exe profile import .\my-routing.yaml --dry-run
+.\aec-dev.exe profile verify .\my-routing.yaml
+.\aec-dev.exe profile import .\my-routing.yaml
+.\aec-dev.exe profile check
+```
+
+导入只替换路由表，保留出口、时区、启动入口等设置；不读取源配置的系统代理、监听端口、TUN 或 DNS 配置。凭据迁入当前用户的 Windows 凭据管理器，原 YAML 不被修改。导入前自动保存原档案备份，设置页默认「保留现有路由数据」。选择内置预设会替换整张导入表。
+
+支持 HTTP、SOCKS5、AEAD Shadowsocks 与 `dialer-proxy`，`select` / `fallback` / `url-test` 组，以及 DOMAIN、DOMAIN-SUFFIX、DOMAIN-KEYWORD、IP-CIDR/IP-CIDR6、GEOSITE、GEOIP 和最后一条 MATCH。规则顺序、组成员顺序、健康检查和常规块列表中的规则注释保留。不支持的节点、组字段、规则或 provider 会拒绝整次导入，不会默默删掉。
+
+给用户分发 Releases 中的全新 zip，加上不含私人凭据的路由示例与自己的服务配置说明即可。不要转发已使用的 `data\`、日志、浏览器配置目录或含密码的源 YAML。每位用户在本机保存自己的账号；`credentialRef` 不能跨机器替代密码。完整步骤见 [用户交付指南](docs/USER-GUIDE.md)。本项目是 Windows 本机出口控制器，远程 AI API 网关本身需要另外部署。
+
 ## 它不做什么
 
-- 不改系统代理：其他软件照常联网（以后作为可选项加入，见[路线图](docs/ROADMAP.md)）。
+- 默认不改系统代理。开启接管后，影响遵循 Windows 系统代理的应用；自行忽略系统代理的应用需要单独配置。
 - 不用 TUN、不改路由和防火墙、不装服务、不需要管理员权限。
 - 本机上如果有别的程序也在改时区（比如另一个代理工具的托盘），程序就不去动时区，并在检测结果里说明原因。
 - 不结束不是它启动的进程；终端窗口由你自己关。
-- 不提供出口，也不内置任何人的出口：你需要自己有一个。仓库里没有任何维护者自己的代理配置、出口地址、域名清单或凭据；[推荐的分流规则](docs/RECOMMENDED-RULES.md) 是一份通用建议，填不填由你决定。
+- 不提供用户的出口账号。仓库中 IPRoyal 隧道参数是供应商官方公开预设，文档核对日期为 2026-10-12；节点实际可用性由用户网络和供应商决定。私人出口凭据不随仓库或便携包分发。[推荐规则](docs/RECOMMENDED-RULES.md) 是用户可编辑的建议。
 
 ## 已知限制
 
-`0.1.0` 是预览版：只有便携 zip，没有安装包和开机自启；系统时区的真实修改和真实出口端到端还在收集更多机器上的验证。遇到问题请开 [Issue](https://github.com/zxs4KHf/agent-egress-controller/issues/new/choose)，附上「复制排查提示词」的内容（不想公开 IP 就先打码）。
+`0.2.0` 是预览版：只有 Windows x64 便携 zip，没有安装包、签名或开机自启。GEOSITE/GEOIP 需要用户提供可信的 `GeoSite.dat` 和 `GeoIP.dat` 到 `bin\`；包中不附带未核实来源的数据文件，程序不自动下载。未提供时保持「国内直连」关闭；相关规则预检会明确报缺项。
+
+已验证的范围包括本地完整链路、真实 mihomo 配置与选择恢复，以及维护者旧路由表导入后的真实出口等价性；其他用户网络中的隧道可用性、Windows 10/11 普通账号的全局写入与恢复仍需实机验收。详细证据见 [0.2.0 验收记录](docs/RELEASE-0.2.0.md)。遇到问题请开 [Issue](https://github.com/zxs4KHf/agent-egress-controller/issues/new/choose)，附上已脱敏的排查提示词。
 
 ## 参与开发
 

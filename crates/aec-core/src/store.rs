@@ -11,7 +11,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::profile::ProfileSet;
+use crate::profile::{
+    FallbackUpstream, ProfileSet, Routing, RoutingOutbound, RoutingOutboundKind, Target,
+    UpstreamProto, TEMPLATE_SPLIT,
+};
 use crate::snapshot::{is_snapshot_id, snapshot_id, EnvironmentSnapshot};
 
 /// Read-only history kept next to the current snapshot (user decision 2026-10-10).
@@ -112,7 +115,61 @@ impl ProfileStore {
     }
 
     pub fn load(&self) -> Result<ProfileSet, StoreError> {
-        read_json(&self.path)
+        let mut value: serde_json::Value = read_json(&self.path)?;
+        // v0.1.0 stored runtime template fields. Convert them in memory before strict deserialization;
+        // the next normal save writes only the new data model. Never mutate the file on read.
+        if let Some(agents) = value.get_mut("agent").and_then(|v| v.as_array_mut()) {
+            for agent in agents {
+                let targets: Vec<Target> =
+                    serde_json::from_value(agent.get("targets").cloned().unwrap_or_default())
+                        .map_err(|e| StoreError::Parse {
+                            path: self.path.clone(),
+                            message: e.to_string(),
+                        })?;
+                let Some(old) = agent.get("routing") else {
+                    continue;
+                };
+                if old.get("rulesTemplate").is_none() {
+                    continue;
+                }
+                let old: LegacyRouting =
+                    serde_json::from_value(old.clone()).map_err(|e| StoreError::Parse {
+                        path: self.path.clone(),
+                        message: e.to_string(),
+                    })?;
+                if old.rules_template != "default-v1" && old.rules_template != TEMPLATE_SPLIT {
+                    return Err(StoreError::Parse {
+                        path: self.path.clone(),
+                        message: "unknown legacy routing template".into(),
+                    });
+                }
+                let outbound = old.fallback.map(|f| RoutingOutbound {
+                    cipher: None,
+                    dialer_proxy: None,
+                    name: "daily-proxy".into(),
+                    server: f.host,
+                    port: f.port,
+                    credential_ref: f.credential_ref,
+                    kind: match f.proto {
+                        UpstreamProto::Http => RoutingOutboundKind::Http,
+                        UpstreamProto::Socks5 => RoutingOutboundKind::Socks5,
+                    },
+                });
+                let route = Routing::preset(
+                    &old.target_group,
+                    &targets,
+                    old.rules_template == TEMPLATE_SPLIT,
+                    &old.extra_domains,
+                    old.domestic_direct,
+                    outbound,
+                );
+                agent["routing"] = serde_json::to_value(route).expect("routing serializes");
+            }
+        }
+        serde_json::from_value(value).map_err(|e| StoreError::Parse {
+            path: self.path.clone(),
+            message: e.to_string(),
+        })
     }
 
     /// Saves as given; validation is separate so that a profile with settings gaps can be kept.
@@ -128,6 +185,19 @@ impl ProfileStore {
         self.save(&ProfileSet::default())?;
         Ok(true)
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LegacyRouting {
+    target_group: String,
+    rules_template: String,
+    #[serde(default)]
+    fallback: Option<FallbackUpstream>,
+    #[serde(default)]
+    domestic_direct: bool,
+    #[serde(default)]
+    extra_domains: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -308,7 +378,13 @@ mod tests {
 
     fn snap(store: &SnapshotStore) -> EnvironmentSnapshot {
         let (id, ms) = store.next_id();
-        EnvironmentSnapshot::from_status(id, ms, &collect(&FakeHost::default(), None), None, false)
+        EnvironmentSnapshot::from_status(
+            id,
+            ms,
+            &collect(&FakeHost::default(), None),
+            None,
+            crate::snapshot::Enabled::default(),
+        )
     }
 
     #[test]
@@ -322,6 +398,35 @@ mod tests {
             "must not overwrite an existing profile file"
         );
         assert_eq!(s.load().unwrap(), ProfileSet::default());
+    }
+
+    #[test]
+    fn old_templates_migrate_in_memory_and_only_a_save_replaces_fields() {
+        let t = TempDir::new("migration");
+        let store = ProfileStore::new(&t.0);
+        let mut value = serde_json::to_value(ProfileSet::default()).unwrap();
+        value["agent"][0]["routing"] = serde_json::json!({"targetGroup":"agent-egress", "rulesTemplate":"split-v1",
+            "fallback":{"host":"127.0.0.1", "port":7890, "proto":"socks5", "credentialRef":"daily"}, "domesticDirect":false,"extraDomains":["example.com"]});
+        let original = serde_json::to_vec(&value).unwrap();
+        write_atomic(store.path(), &original).unwrap();
+        let set = store.load().unwrap();
+        assert_eq!(
+            fs::read(store.path()).unwrap(),
+            original,
+            "loading is read-only"
+        );
+        assert_eq!(
+            set.agent[0].routing.groups[1].members,
+            ["daily-proxy", "DIRECT"]
+        );
+        assert_eq!(
+            set.agent[0].routing.outbounds[0].credential_ref.as_deref(),
+            Some("daily")
+        );
+        store.save(&set).unwrap();
+        let saved = fs::read_to_string(store.path()).unwrap();
+        assert!(!saved.contains("rulesTemplate") && !saved.contains("targetGroup"));
+        assert_eq!(store.load().unwrap(), set);
     }
 
     #[test]
