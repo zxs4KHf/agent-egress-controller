@@ -1,10 +1,10 @@
-# 0.3.0 用户交付指南
+# 0.3.1 用户交付指南
 
 本产品用于 Windows 10/11 x64 的本机 AI 出口控制，包含托盘、mihomo、Rust relay 和配置命令行。用户需要自己的 HTTP/SOCKS5 出口；远程 AI API 网关本身需要另外部署。
 
 ## 下载与首次使用
 
-从 [GitHub Releases](https://github.com/zxs4KHf/agent-egress-controller/releases) 下载 0.3.0 zip 和 SHA256SUMS.txt。PowerShell 用 `Get-FileHash .\AgentEgressController-0.3.0-portable.zip -Algorithm SHA256` 对照校验。完整解压到可写目录，保留 portable.flag、bin 目录、三个应用 exe 和说明文件。
+从 [GitHub Releases](https://github.com/zxs4KHf/agent-egress-controller/releases) 下载 0.3.1 zip 和对应 SHA256 文件。PowerShell 用 `Get-FileHash .\AgentEgressController-0.3.1-portable.zip -Algorithm SHA256` 对照校验。完整解压到可写目录，保留 portable.flag、bin 目录、三个应用 exe 和说明文件。
 
 双击 aec-tray.exe，在首次打开的本机设置页填出口、端口、协议和账号。端口可逐项附协议，例如 `12324/socks5`、`12323/http`；同一候选池的地址必须相同，备用端口用于拨号切换，不表示多个出口。
 
@@ -22,7 +22,15 @@
 
 GEOSITE/GEOIP 和「国内直连」需要用户自行提供可信的 GeoSite.dat、GeoIP.dat 到 bin 目录。便携包不附带未核实来源的数据文件，程序不自动下载；没有时保持关闭，相关规则预检会报缺项。
 
-## 导入已有表
+## 保留客户端入口与代理共存
+
+退出 Agent 模式后，在设置页「系统级分流 → 本机代理入口端口」填写已有客户端使用的端口；留空或 0 使用默认 17893，其余值须为 1–65535 且不能占用本程序内部端口。保存后下次进入生效。托盘、命令行、检测使用同一设置；较旧页面缺少字段时保留原值。
+
+升级或接替旧链路前，先记录客户端实际使用的入口，备份 data，正常停止旧监听并禁用旧托盘/守护的登录自启，再让新版使用这个入口。不要先停旧入口却让客户端仍指向无人监听的端口。程序不会删除或更改用户级 HTTP_PROXY、HTTPS_PROXY、ALL_PROXY。
+
+如果同时运行另一个代理客户端，关闭对方的「系统代理」开关，保留其内核，并在本程序配置为日常上游。系统代理只交给本程序，AI 站点优先走 ISP，普通流量按规则走日常上游；开启或关闭日常内核不改变受保护站点的出口。不要重新开启对方的系统代理开关，否则 G6 会失效。本程序不合并外部的全局绕过清单，国内直连由有序规则控制，避免绕过保护。
+
+## 导入已有表（操作）
 
 先退出 Agent 模式。源 YAML 可带用户自己的密码，不能公开上传。便携目录 PowerShell：
 
@@ -47,7 +55,7 @@ GEOSITE/GEOIP 和「国内直连」需要用户自行提供可信的 GeoSite.dat
 
 select 组导入后可从托盘选择成员，仅 switchable: true 会显示选项。切换前撤销旧检测就绪，内核确认后保存 selected 并重检，启动时恢复选择。已有长连接保留原路径，需要应用重连后使用新成员。
 
-桌面应用是否遵循 Windows 系统代理由应用决定。需要时开启接管；接管门要求显式开启、快照可用、该项无外部写入者，阻止时 G6 为未知。全局代理改写只告警并撤销就绪，不自动抢回；处理冲突后退出并重新进入。
+桌面应用是否遵循 Windows 系统代理由应用决定。需要时开启接管；接管门要求显式开启、快照可用、该项无外部写入者，阻止时 G6 为未知。全局代理改写只告警并撤销就绪，不自动抢回；处理冲突后退出并重新进入。与另一个代理客户端共存时关闭它的系统代理开关，只保留它的内核作为普通流量上游。
 
 ### Claude 桌面版接入与核验
 
@@ -103,6 +111,8 @@ Electron 的 [系统代理模式](https://www.electronjs.org/docs/latest/api/str
 运行中切换或保存规则先选择 REJECT 并断开本应用内核的旧连接，再选择第一跳/重载规则，经独立 probe 入口核对精确 IP，成功后放行；失败保持阻断。阻断操作本身失败会通知，不宣称已安全阻断。巡检约每 30 秒执行；供应商在两次检测间改变 IP 仍是风险。只覆盖通过本程序并匹配保护规则的流量，普通 DIRECT、忽略系统代理的进程不属于保护范围。
 
 已有站点的 trace 检测方式保留；新站点默认 HTTPS 可达性检查，没有网站 trace 就不声称该网站证明出口。固定保护另外使用强制走 ISP 的 Cloudflare trace，不沿用系统代理的分流结果。
+
+资源根域不一定提供 HTTPS 服务。`oaiusercontent.com` 的可达性使用 OpenAI 文档中的 `files.oaiusercontent.com`，DNS 路由证据也核对该实际主机；保护规则仍覆盖 `oaiusercontent.com` 及所有子域名，不缩小范围。404/403 表示 HTTPS 服务回答请求，不代表文件上传或账号操作成功；连接失败仍为失败。来源：[OpenAI 网络建议](https://help.openai.com/en/articles/9247338-network-recommendations-for-chatgpt-errors-on-web-and-apps)。
 
 ## 自启、快捷方式与便携目录
 

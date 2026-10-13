@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex};
 
 use aec_core::controller::{Controller, EnterOptions, KeepOutcome, Mode, Settings};
 use aec_core::core::process::CoreManager;
-use aec_core::core::CorePorts;
 use aec_core::credentials::WindowsCredentials;
 use aec_core::live::LivePlatform;
 use aec_core::paths::{strip_verbatim, APP_DIR_NAME, PORTABLE_FLAG};
@@ -73,7 +72,7 @@ impl Layout {
             data_dir: self.data_dir.clone(),
             bin: self.mihomo.clone(),
             relay_bin: self.relay.clone(),
-            ports: CorePorts::default(),
+            ports: Settings::load(&self.data_dir).core_ports(),
         };
         LivePlatform::new(core, &self.data_dir)
     }
@@ -689,6 +688,8 @@ impl Worker {
             ));
         }
         let mut set = load_set(&self.layout.data_dir);
+        // Validate installation settings before any profile or credential mutation.
+        let settings = setup::apply_settings(&form, Settings::load(&self.layout.data_dir))?;
         let creds = WindowsCredentials;
         let user = creds
             .user_name(setup::CREDENTIAL_REF)
@@ -714,11 +715,12 @@ impl Worker {
         ProfileStore::new(&self.layout.data_dir)
             .save(&set)
             .map_err(|e| field_error(e.to_string()))?;
-        Settings {
-            takeover_enabled: applied.takeover,
-        }
-        .save(&self.layout.data_dir)
-        .map_err(|e| field_error(e.to_string()))?;
+        settings
+            .save(&self.layout.data_dir)
+            .map_err(|e| field_error(e.to_string()))?;
+        // Daily mode has no active core: recreate the adapter so the next enter uses new ports.
+        self.controller = Controller::open(self.layout.platform(), &self.layout.data_dir, settings)
+            .map_err(|e| field_error(e.to_string()))?;
         Ok(())
     }
 }
@@ -793,6 +795,7 @@ impl SetupBackend for Backend {
         setup::view(
             &set,
             &setup::ViewInput {
+                core_mixed_port: Settings::load(&self.data_dir).core_mixed_port,
                 stored_user: user.as_deref(),
                 tunnel_password_stored: tunnel_stored,
                 takeover_enabled: Settings::load(&self.data_dir).takeover_enabled,

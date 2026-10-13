@@ -262,13 +262,13 @@ fn mode_cmd(cmd: &str, args: &[String], data_dir: &Path) -> ExitCode {
             .expect("profile sets have an agent profile"),
         Err(_) => profile::ProfileSet::default().agent.remove(0),
     };
-    // No settings store yet (ticket 13): takeover stays off, so every global change is a dry-run.
+    // Respect this installation's ports, but keep CLI global writes dry-run.
+    let mut settings = Settings::load(data_dir);
+    settings.takeover_enabled = false;
     let mut c = match Controller::open(
         LivePlatform::dev(&repo_root(), data_dir),
         data_dir,
-        Settings {
-            takeover_enabled: false,
-        },
+        settings,
     ) {
         Ok(c) => c,
         Err(e) => {

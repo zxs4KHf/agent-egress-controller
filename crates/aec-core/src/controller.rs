@@ -19,6 +19,7 @@ use crate::checks::{
     browser_checks, timezone_checks, CheckReport, CheckResult, Kind, Status, TimezoneContext,
 };
 use crate::core::preflight::OwnedProcess;
+use crate::core::CorePorts;
 use crate::log::{Level, Logger};
 use crate::model::ProxySettings;
 use crate::profile::Entry;
@@ -235,11 +236,24 @@ pub trait Platform {
 pub struct Settings {
     /// "Take over global state" (default off, SPEC 4.7).
     pub takeover_enabled: bool,
+    /// The core's mixed-port, for installations that must occupy a port other programs already
+    /// name. `None` and `0` keep [`CorePorts::default`], so a missing field never moves the port.
+    pub core_mixed_port: Option<u16>,
 }
 
 impl Settings {
     pub fn path(data_dir: &Path) -> PathBuf {
         data_dir.join("settings.json")
+    }
+
+    /// The ports this installation runs its core on. Only the mixed-port is overridable so far;
+    /// the controller, DNS and relay ports stay at [`CorePorts::default`].
+    pub fn core_ports(&self) -> CorePorts {
+        let ports = CorePorts::default();
+        match self.core_mixed_port {
+            Some(mixed) if mixed != 0 => CorePorts { mixed, ..ports },
+            _ => ports,
+        }
     }
 
     /// Missing or unreadable settings mean the defaults (takeover off), never an open gate.
@@ -1410,9 +1424,37 @@ mod tests {
             dir,
             Settings {
                 takeover_enabled: takeover,
+                core_mixed_port: None,
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn settings_port_override_moves_only_the_mixed_port() {
+        let base = CorePorts::default();
+        assert_eq!(Settings::default().core_ports(), base);
+        let zero = Settings {
+            takeover_enabled: false,
+            core_mixed_port: Some(0),
+        };
+        assert_eq!(zero.core_ports(), base, "0 means unset, not a port");
+        let moved = Settings {
+            takeover_enabled: false,
+            core_mixed_port: Some(7893),
+        };
+        let ports = moved.core_ports();
+        assert_eq!(ports.mixed, 7893);
+        assert_eq!(ports.controller, base.controller);
+        assert_eq!(ports.dns, base.dns);
+        assert_eq!(ports.relay, base.relay);
+    }
+
+    #[test]
+    fn settings_written_before_the_port_field_keep_the_default() {
+        let s: Settings = serde_json::from_str(r#"{"takeoverEnabled":true}"#).unwrap();
+        assert!(s.takeover_enabled);
+        assert_eq!(s.core_ports(), CorePorts::default());
     }
 
     #[test]

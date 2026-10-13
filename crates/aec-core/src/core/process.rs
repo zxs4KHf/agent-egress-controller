@@ -419,7 +419,7 @@ impl CoreManager {
             bin: portable_bin
                 .unwrap_or_else(|| repo_root.join("runtime").join("bin").join(pin::EXE_NAME)),
             relay_bin,
-            ports: CorePorts::default(),
+            ports: crate::controller::Settings::load(data_dir).core_ports(),
         }
     }
 

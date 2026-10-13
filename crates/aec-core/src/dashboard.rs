@@ -64,10 +64,13 @@ pub fn view(
         suggested: [
             "claude.ai",
             "anthropic.com",
+            "claude.com",
+            "claudeusercontent.com",
             "chatgpt.com",
             "openai.com",
             "oaistatic.com",
             "oaiusercontent.com",
+            "sora.com",
         ]
         .into_iter()
         .map(str::to_string)

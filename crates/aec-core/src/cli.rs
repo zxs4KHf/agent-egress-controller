@@ -204,7 +204,14 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn env_reaches_the_child_process() {
-        let path = split_path(&std::env::var("PATH").unwrap_or_default());
+        // Do not depend on a maintainer's installed shim or a terminal's stale PATH.
+        let fixture = std::env::temp_dir().join(format!("aec-cli-env-{}", std::process::id()));
+        let shim = fixture.join("shim");
+        let native = fixture.join("native");
+        std::fs::create_dir_all(&shim).unwrap();
+        std::fs::create_dir_all(&native).unwrap();
+        std::fs::write(shim.join(SHIM_MARKER), b"synthetic shim marker").unwrap();
+        let path = vec![shim.clone(), native.clone()];
         let env = entry_env(17893, &path, &|d| is_shim_dir(d), &BTreeMap::new());
         let out = std::process::Command::new("cmd.exe")
             .args(["/c", "set"])
@@ -216,6 +223,8 @@ mod tests {
             )
             .output()
             .unwrap();
+        std::fs::remove_dir_all(&fixture).unwrap();
+        assert!(out.status.success());
         let text = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
         assert!(
             text.contains("https_proxy=http://127.0.0.1:17893"),
@@ -228,7 +237,8 @@ mod tests {
             .unwrap_or_default()
             .to_string();
         assert!(
-            !path_line.contains(r"legacy\shim") && !path_line.contains(r"ai-egress\shim"),
+            !path_line.contains(&shim.display().to_string().to_ascii_lowercase())
+                && path_line.contains(&native.display().to_string().to_ascii_lowercase()),
             "shim must not be on the child's PATH: {path_line}"
         );
     }

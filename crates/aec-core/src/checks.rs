@@ -443,17 +443,18 @@ fn dns_path(input: &CheckInput, mark: Option<u64>) -> CheckResult {
                 let mut evidence = Vec::new();
                 let (mut wrong, mut missing, mut uncertain) = (Vec::new(), Vec::new(), Vec::new());
                 for t in &input.profile.targets {
-                    let group = if crate::fixed::protects(input.profile, &t.domain) {
+                    let host = t.probe_domain();
+                    let group = if crate::fixed::protects(input.profile, host) {
                         Some("relay")
                     } else {
-                        input.profile.routing.target_for_domain(&t.domain)
+                        input.profile.routing.target_for_domain(host)
                     };
                     if group.is_none() {
-                        uncertain.push(t.domain.clone());
+                        uncertain.push(host.to_string());
                     }
                     let seen: Vec<&ConnRecord> = records
                         .iter()
-                        .filter(|c| c.host.eq_ignore_ascii_case(&t.domain))
+                        .filter(|c| c.host.eq_ignore_ascii_case(host))
                         .collect();
                     match seen.iter().find(|c| {
                         group.is_some_and(|g| c.group != g)
@@ -461,10 +462,10 @@ fn dns_path(input: &CheckInput, mark: Option<u64>) -> CheckResult {
                             || c.group == "REJECT"
                             || c.via.as_deref() == Some("DIRECT")
                     }) {
-                        _ if seen.is_empty() => missing.push(t.domain.clone()),
+                        _ if seen.is_empty() => missing.push(host.to_string()),
                         Some(bad) => wrong.push(format!(
                             "{} left through {} (rule {})",
-                            t.domain, bad.group, bad.rule
+                            host, bad.group, bad.rule
                         )),
                         None => {
                             let c = seen[0];
@@ -475,7 +476,7 @@ fn dns_path(input: &CheckInput, mark: Option<u64>) -> CheckResult {
                             };
                             evidence.push(format!(
                                 "{} handed over by name, routed via {}[{}] by rule {}{dial}",
-                                t.domain,
+                                host,
                                 c.group,
                                 c.via.as_deref().unwrap_or("-"),
                                 c.rule
@@ -561,10 +562,10 @@ struct TargetProbe<'a> {
 
 fn probe_target<'a>(http: &dyn HttpClient, target: &'a Target, port: u16) -> TargetProbe<'a> {
     let (url, req) = if target.trace {
-        let url = format!("https://{}/cdn-cgi/trace", target.domain);
+        let url = format!("https://{}/cdn-cgi/trace", target.probe_domain());
         (url.clone(), Request::get(url, Route::Proxy(port)))
     } else {
-        let url = format!("https://{}/", target.domain);
+        let url = format!("https://{}/", target.probe_domain());
         (url.clone(), Request::head(url, Route::Proxy(port)))
     };
     let result = send_retry(http, &req);
@@ -1343,6 +1344,48 @@ mod tests {
             get(&r, "G2:www.anthropic.com").reason.as_deref(),
             Some("http_502")
         );
+    }
+
+    #[test]
+    fn resource_root_probes_the_service_subdomain_without_narrowing_protection() {
+        let mut p = profile();
+        p.egress.fixed_exit = true;
+        p.egress.expected.ip = Some(EXIT.into());
+        p.targets = serde_json::from_str(
+            r#"[{"domain":"claude.ai","trace":true},{"domain":"oaiusercontent.com","trace":false}]"#,
+        ).unwrap();
+        let http = healthy().on(
+            "https://files.oaiusercontent.com/",
+            P,
+            Ok(Response {
+                status: 404,
+                body: String::new(),
+                elapsed: Duration::ZERO,
+            }),
+        );
+        let observer = FakeObserver {
+            records: vec![
+                record("claude.ai", "relay"),
+                record("files.oaiusercontent.com", "relay"),
+            ],
+            listening: true,
+            fail: None,
+        };
+        let report = run_full(&p, &http, Ok(()), Some(&observer));
+        assert_eq!(get(&report, "G2:oaiusercontent.com").status, Status::Pass);
+        assert_eq!(get(&report, "G3").status, Status::Pass);
+        assert!(http
+            .sent
+            .borrow()
+            .iter()
+            .any(|q| q.url == "https://files.oaiusercontent.com/"
+                && q.route == P
+                && q.method == crate::http::Method::Head));
+        assert!(!http.urls().contains(&"https://oaiusercontent.com/".into()));
+        assert!(crate::fixed::protects(&p, "another.oaiusercontent.com"));
+        // A failed service probe still fails the gate: no fabricated pass or direct fallback.
+        let failed = run_full(&p, &healthy(), Ok(()), Some(&observer));
+        assert_eq!(get(&failed, "G2:oaiusercontent.com").status, Status::Fail);
     }
 
     #[test]

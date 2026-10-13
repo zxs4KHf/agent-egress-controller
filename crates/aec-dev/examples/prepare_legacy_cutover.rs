@@ -211,6 +211,9 @@ fn prepare(args: &[String]) -> Result<(), String> {
         "claudeusercontent.com",
         "chatgpt.com",
         "openai.com",
+        "oaistatic.com",
+        "oaiusercontent.com",
+        "sora.com",
     ]
     .into_iter()
     .map(|d| profile::Target {
@@ -299,11 +302,6 @@ fn prepare(args: &[String]) -> Result<(), String> {
         let store = ProfileStore::new(&manager.data_dir);
         plan.commit(set, &store, &creds)
             .map_err(|_| "cannot commit routing credentials or profile")?;
-        aec_core::controller::Settings {
-            takeover_enabled: true,
-        }
-        .save(&manager.data_dir)
-        .map_err(|_| "cannot save takeover preference")?;
         let p = store
             .load()
             .map_err(|_| "cannot load staged profile")?
@@ -336,6 +334,14 @@ fn prepare(args: &[String]) -> Result<(), String> {
             .down(&WindowsHost)
             .map_err(|_| "isolated core cleanup failed; leave stage intact")?;
         verify?;
+        // Verification used isolated default ports. Only after stopping it, persist the old
+        // client entrance for the eventual cutover; never rewrite users' proxy variables.
+        aec_core::controller::Settings {
+            takeover_enabled: true,
+            core_mixed_port: Some(old_port),
+        }
+        .save(&manager.data_dir)
+        .map_err(|_| "cannot save cutover entrance port")?;
         println!("[verified] staged profile: {} preserved ordered rules, {} candidate protocols, official tunnel first hop, exact exit evidence matched; private addresses withheld; global state untouched",p.routing.rules.len(),p.egress.candidates.len());
         Ok(())
     })();

@@ -106,6 +106,7 @@ pub const ROUTING_CUSTOM: &str = "custom";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetupView {
+    pub core_mixed_port: String,
     pub host: String,
     pub proto: UpstreamProto,
     /// Comma-separated; a port whose protocol differs from `proto` carries it, e.g. `12323/http`.
@@ -157,6 +158,9 @@ fn default_socks5() -> UpstreamProto {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExitForm {
+    /// None (older page) preserves the value; empty or "0" resets to the default.
+    #[serde(default)]
+    pub core_mixed_port: Option<String>,
     pub host: String,
     pub proto: UpstreamProto,
     pub ports: String,
@@ -252,6 +256,7 @@ fn proto_name(p: UpstreamProto) -> &'static str {
 /// What the settings page shows for this machine. `stored_user`: the exit's user name in
 /// Credential Manager; `tunnel_password_stored`: whether a tunnel password is stored.
 pub struct ViewInput<'a> {
+    pub core_mixed_port: Option<u16>,
     pub stored_user: Option<&'a str>,
     pub tunnel_password_stored: bool,
     pub takeover_enabled: bool,
@@ -292,6 +297,11 @@ pub fn view(set: &ProfileSet, input: &ViewInput) -> SetupView {
     let is_preset = serde_json::to_value(&generated).ok() == serde_json::to_value(r).ok();
     let lines = |v: Vec<String>| v.join("\n");
     SetupView {
+        core_mixed_port: input
+            .core_mixed_port
+            .filter(|p| *p != 0)
+            .map(|p| p.to_string())
+            .unwrap_or_default(),
         host: c.first().map(|c| c.host.clone()).unwrap_or_default(),
         proto,
         ports: c
@@ -700,6 +710,49 @@ pub fn apply(
     })
 }
 
+/// Validate installation settings separately, before saving credentials or the profile.
+pub fn apply_settings(
+    form: &ExitForm,
+    previous: crate::controller::Settings,
+) -> Result<crate::controller::Settings, Vec<FieldError>> {
+    let port = match form.core_mixed_port.as_deref().map(str::trim) {
+        None => previous.core_mixed_port,
+        Some("" | "0") => None,
+        Some(value) => {
+            let port = value
+                .parse::<u16>()
+                .ok()
+                .filter(|p| *p != 0)
+                .ok_or_else(|| {
+                    vec![err(
+                        "coreMixedPort",
+                        "端口必须是 1–65535；留空或 0 使用默认值",
+                    )]
+                })?;
+            let defaults = crate::core::CorePorts::default();
+            if [
+                defaults.controller,
+                defaults.dns,
+                defaults.relay,
+                defaults.tunnel,
+                defaults.tunnel + 1,
+            ]
+            .contains(&port)
+            {
+                return Err(vec![err(
+                    "coreMixedPort",
+                    "入口端口不能与控制、DNS、relay、隧道或检测端口相同",
+                )]);
+            }
+            Some(port)
+        }
+    };
+    Ok(crate::controller::Settings {
+        takeover_enabled: form.takeover_enabled,
+        core_mixed_port: port,
+    })
+}
+
 /// What the page server needs from its owner.
 pub trait SetupBackend: Send + Sync {
     fn view(&self) -> SetupView;
@@ -1035,6 +1088,8 @@ button:disabled{opacity:.5;cursor:default}
 </section>
 
 <section><h2>系统级分流</h2>
+<label for="coreMixedPort">本机代理入口端口</label><input id="coreMixedPort" type="number" min="0" max="65535" placeholder="默认 17893"><div class="fe" data-for="coreMixedPort"></div>
+<div class="hint">留空或 0 使用默认端口。接替已有代理时，填写客户端当前使用的入口端口；不会改写用户级代理环境变量。保存后下次进入生效。若本机程序依赖这个端口，先核对，避免断网。</div>
 <label class="check"><input id="systemProxy" type="checkbox"><span>进入 Agent 模式时接管 Windows 系统代理，退出时恢复原样
 <div class="hint">电脑上跟随 Windows 系统代理的程序也使用上面的规则；是否遵循系统代理由各程序决定。发现其他程序改写时会撤销就绪并告警，请关闭冲突程序的系统代理开关后重新进入。默认关闭，真实写入需要接管门放行。</div></span></label>
 </section>
@@ -1069,7 +1124,7 @@ for(const [k,l] of LANG)opt("language",k,l+"  "+k);
 for(const p of PRESETS)opt("tunnelPreset",p.key,p.label);
 opt("tunnelPreset","custom","自定义 Shadowsocks 隧道");
 for(const c of CIPHERS)opt("tunnelCipher",c,c);
-for(const k of ["host","ports","username","expectedIp","tunnelServers","localProxy","targets","extraDomains"])$(k).value=V[k]||"";
+for(const k of ["host","ports","username","expectedIp","tunnelServers","localProxy","targets","extraDomains","coreMixedPort"])$(k).value=V[k]||"";
 for(const k of ["maxInflight","connectTimeoutMs","dialBudgetMs"])$(k).value=V[k];
 $("proto").value=V.proto;$("timezone").value=V.timezone;$("language").value=V.language;
 $("tunnelPreset").value=V.tunnelPreset;$("tunnelCipher").value=V.tunnelCipher;$("localProxyProto").value=V.localProxyProto;
@@ -1101,6 +1156,7 @@ $("f").addEventListener("submit",async e=>{e.preventDefault();
  document.querySelectorAll(".fe").forEach(x=>x.textContent="");$("msg").className="";
  const num=id=>parseInt($(id).value,10)||0;
  const form={host:$("host").value,proto:$("proto").value,ports:$("ports").value,username:$("username").value,
+  coreMixedPort:$("coreMixedPort").value,
   password:$("password").value||null,timezone:$("timezone").value,language:$("language").value,
   expectedIp:$("expectedIp").value,takeoverEnabled:$("takeoverEnabled").checked,
   tunnelEnabled:$("tunnelEnabled").checked,tunnelPreset:$("tunnelPreset").value,tunnelServers:$("tunnelServers").value,
@@ -1131,6 +1187,7 @@ mod tests {
 
     fn form() -> ExitForm {
         ExitForm {
+            core_mixed_port: None,
             host: " 203.0.113.10 ".into(),
             proto: UpstreamProto::Socks5,
             ports: "12324, 12323，12324".into(),
@@ -1161,6 +1218,7 @@ mod tests {
 
     fn input<'a>(user: Option<&'a str>) -> ViewInput<'a> {
         ViewInput {
+            core_mixed_port: None,
             stored_user: user,
             tunnel_password_stored: false,
             takeover_enabled: true,
@@ -1168,6 +1226,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn settings_form_keeps_legacy_port_and_validates_explicit_changes() {
+        let previous = crate::controller::Settings {
+            takeover_enabled: false,
+            core_mixed_port: Some(27893),
+        };
+        let mut json = serde_json::to_value(form()).unwrap();
+        for (value, expected) in [
+            (None, Some(27893)),
+            (Some(""), None),
+            (Some("0"), None),
+            (Some(" 27894 "), Some(27894)),
+        ] {
+            json.as_object_mut().unwrap().remove("coreMixedPort");
+            if let Some(value) = value {
+                json["coreMixedPort"] = value.into();
+            }
+            let f: ExitForm = serde_json::from_value(json.clone()).unwrap();
+            let next = apply_settings(&f, previous).unwrap();
+            assert_eq!(next.core_mixed_port, expected);
+            assert!(next.takeover_enabled);
+        }
+        for value in [
+            "-1", "65536", "no-port", "17909", "17553", "17325", "17326", "17327",
+        ] {
+            json["coreMixedPort"] = value.into();
+            let f: ExitForm = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(
+                apply_settings(&f, previous).unwrap_err()[0].path,
+                "coreMixedPort"
+            );
+        }
+        let mut i = input(None);
+        i.core_mixed_port = previous.core_mixed_port;
+        assert_eq!(view(&ProfileSet::default(), &i).core_mixed_port, "27893");
+    }
     #[test]
     fn a_form_becomes_one_candidate_per_port_with_one_credential() {
         let mut set = ProfileSet::default();

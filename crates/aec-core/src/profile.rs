@@ -444,6 +444,19 @@ pub struct Target {
     pub trace: bool,
 }
 
+impl Target {
+    /// The public service host used for HTTPS reachability. The protected suffix stays `domain`.
+    /// OpenAI documents files.oaiusercontent.com; its parent is a resource namespace, not a
+    /// reachable HTTPS homepage. Trace probes and all other user domains retain their host.
+    pub fn probe_domain(&self) -> &str {
+        if !self.trace && self.domain.eq_ignore_ascii_case("oaiusercontent.com") {
+            "files.oaiusercontent.com"
+        } else {
+            &self.domain
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
