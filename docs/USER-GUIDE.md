@@ -1,10 +1,10 @@
-# 0.2.0 用户交付指南
+# 0.3.1 用户交付指南
 
 本产品用于 Windows 10/11 x64 的本机 AI 出口控制，包含托盘、mihomo、Rust relay 和配置命令行。用户需要自己的 HTTP/SOCKS5 出口；远程 AI API 网关本身需要另外部署。
 
 ## 下载与首次使用
 
-从 [GitHub Releases](https://github.com/zxs4KHf/agent-egress-controller/releases) 下载 0.2.0 zip 和 SHA256SUMS.txt。PowerShell 用 `Get-FileHash .\AgentEgressController-0.2.0-portable.zip -Algorithm SHA256` 对照校验。完整解压到可写目录，保留 portable.flag、bin 目录、三个应用 exe 和说明文件。
+从 [GitHub Releases](https://github.com/zxs4KHf/agent-egress-controller/releases) 下载 0.3.1 zip 和对应 SHA256 文件。PowerShell 用 `Get-FileHash .\AgentEgressController-0.3.1-portable.zip -Algorithm SHA256` 对照校验。完整解压到可写目录，保留 portable.flag、bin 目录、三个应用 exe 和说明文件。
 
 双击 aec-tray.exe，在首次打开的本机设置页填出口、端口、协议和账号。端口可逐项附协议，例如 `12324/socks5`、`12323/http`；同一候选池的地址必须相同，备用端口用于拨号切换，不表示多个出口。
 
@@ -22,7 +22,15 @@
 
 GEOSITE/GEOIP 和「国内直连」需要用户自行提供可信的 GeoSite.dat、GeoIP.dat 到 bin 目录。便携包不附带未核实来源的数据文件，程序不自动下载；没有时保持关闭，相关规则预检会报缺项。
 
-## 导入已有表
+## 保留客户端入口与代理共存
+
+退出 Agent 模式后，在设置页「系统级分流 → 本机代理入口端口」填写已有客户端使用的端口；留空或 0 使用默认 17893，其余值须为 1–65535 且不能占用本程序内部端口。保存后下次进入生效。托盘、命令行、检测使用同一设置；较旧页面缺少字段时保留原值。
+
+升级或接替旧链路前，先记录客户端实际使用的入口，备份 data，正常停止旧监听并禁用旧托盘/守护的登录自启，再让新版使用这个入口。不要先停旧入口却让客户端仍指向无人监听的端口。程序不会删除或更改用户级 HTTP_PROXY、HTTPS_PROXY、ALL_PROXY。
+
+如果同时运行另一个代理客户端，关闭对方的「系统代理」开关，保留其内核，并在本程序配置为日常上游。系统代理只交给本程序，AI 站点优先走 ISP，普通流量按规则走日常上游；开启或关闭日常内核不改变受保护站点的出口。不要重新开启对方的系统代理开关，否则 G6 会失效。本程序不合并外部的全局绕过清单，国内直连由有序规则控制，避免绕过保护。
+
+## 导入已有表（操作）
 
 先退出 Agent 模式。源 YAML 可带用户自己的密码，不能公开上传。便携目录 PowerShell：
 
@@ -47,9 +55,44 @@ GEOSITE/GEOIP 和「国内直连」需要用户自行提供可信的 GeoSite.dat
 
 select 组导入后可从托盘选择成员，仅 switchable: true 会显示选项。切换前撤销旧检测就绪，内核确认后保存 selected 并重检，启动时恢复选择。已有长连接保留原路径，需要应用重连后使用新成员。
 
-桌面应用是否遵循 Windows 系统代理由应用决定。需要时开启接管；接管门要求显式开启、快照可用、该项无外部写入者，阻止时 G6 为未知。全局代理改写只告警并撤销就绪，不自动抢回；处理冲突后退出并重新进入。
+桌面应用是否遵循 Windows 系统代理由应用决定。需要时开启接管；接管门要求显式开启、快照可用、该项无外部写入者，阻止时 G6 为未知。全局代理改写只告警并撤销就绪，不自动抢回；处理冲突后退出并重新进入。与另一个代理客户端共存时关闭它的系统代理开关，只保留它的内核作为普通流量上游。
+
+### Claude 桌面版接入与核验
+
+无需托盘启动入口，也不改变 Claude 的安装文件、配置、语言或进程归属。0.3.0 包含系统代理接管、R11 和 `desktop check`。
+
+1. 设置页填写自己的 ISP 出口。需要中转时启用隧道；中转服务器不是最终出口。
+2. 选择「分流」，保留附加域名 `anthropic.com`、`claude.ai`、`claude.com`、`claudeusercontent.com`。`DOMAIN-SUFFIX,anthropic.com` 覆盖 `api.anthropic.com`；仅有 `www.anthropic.com` 不覆盖它。AI 域名规则应先于 GEOSITE/GEOIP 和 MATCH。导入表不会自动补规则或被覆盖，需要自己检查 Claude 域名命中的组、成员和固定 ISP 节点。
+3. 开启「系统代理接管」，进入 Agent 模式，确认 G6 通过。其他代理工具不能同时争抢系统代理；接管门被阻止时按证据处理冲突，本程序不会自动抢回。
+4. 正常打开和使用 Claude 桌面版。在有请求或长连接期间点「重新检测」，看 R11 的进程 PID、目标域名、预期出站和实际链。ISP 地址/网络身份用 G1/G2 核对，配置了精确预期 IP 才做严格比对。程序不会替用户发测试消息。
+
+也可在便携目录运行以下只读命令；开发环境改用 `cargo run -p aec-dev --bin aec-dev -- desktop check --json --data-dir <目录>`。必须选择实际托盘使用的 `data`，不是另一个测试目录。
+
+```powershell
+.\aec-dev.exe desktop check --json --data-dir .\data
+```
+
+命令退出码：R11 通过为 0，警告/未知或读取失败为 1，参数错误为 2。它不会写状态、日志、系统设置，不启动、关闭或重启 Claude。托盘完整检测也显示 R11；R11 是只读抽样，不参与绿灯硬门槛。
+
+| R11 结果/原因 | 意义与处理 |
+| --- | --- |
+| 通过 | 至少观测到一个 Claude 服务域名连接，当前稳定样本的域名规则和实际出站链一致；仅该样本有证据，不代表所有请求或 ISP 身份已经证明 |
+| `no_desktop_traffic` 未知 | 未抓到可归属的服务连接；可能空闲、连接已关闭、走别的代理或忽略系统代理，不能据此判定通过或断网 |
+| `owned_core_unavailable` 未知 | 当前目录没有可验证的本应用内核/端口，或连接表不可读取；检查数据目录和 Agent 模式 |
+| `desktop_probe_failed` 未知 | Windows TCP 读取失败；不把失败当作通过 |
+| `desktop_route_unproven` 未知 | 请求只带 IP、域名不可判定，或前置 Geo/IP 规则需要额外匹配证据 |
+| `claude_target_not_proxied` 警告 | 观测到 Claude 服务域名走 DIRECT/REJECT；检查规则顺序和组成员，程序保留自定义表，不自动改路由 |
+| `routing_mismatch` 警告 | 当前出站链不符合档案，或长连接还在使用切换前的 select 成员；核对组选择并让应用重新建立连接 |
+
+核验只读 Windows 的 IPv4 TCP 表和本应用内核的 `GET /connections`。按客户端源 IP/端口匹配，并要求两次 TCP 读取的 PID、可执行文件路径和进程创建时间一致，控制口及 mixed-port 仍由本应用记录的内核持有。支持 `%LOCALAPPDATA%\AnthropicClaude\app-<数字版本>\claude.exe` 的 Windows 安装形态；Claude Code、启动器、其他安装形态及无法读取身份的进程均不冒充桌面版证据。不读取对话正文、请求头、Claude 配置或令牌，不使用过期日志推断 PID。
+
+Electron 的 [系统代理模式](https://www.electronjs.org/docs/latest/api/structures/proxy-config)使用操作系统配置，但应用可自行覆盖；[代理切换说明](https://www.electronjs.org/docs/latest/api/session#sessetproxyconfig)也指出旧连接池可能继续使用旧代理。没有 R11 证据时先核对 G6 和应用代理设置，必要时由用户自行退出并重新打开 Claude。Node、MCP 子进程、Cowork VM 等路径需分别验收，不用全局环境变量、TUN 或修改 Claude 文件来强制接管。
+
+退出 Agent 模式会恢复已接管的系统代理并停止本应用内核，Claude 仍由用户管理。原有长连接不保证随代理设置恢复立即切换；继续使用时让应用重连。
 
 ## 退出、更新与交付
+
+如果 Claude 能登录，但 Code 请求反复 `Request failed`/`Retry`，应核对请求路由与同一时间的 relay 日志；登录成功不代表长请求能持续传输。0.3.0 修复 relay 将拨号/握手超时带入传输阶段的问题，连接成功后不会因这些短超时主动切断等待或流式响应间隔，失败拨号仍受预算限制。更新 relay 后需要正常退出并重新进入 Agent 模式来加载新程序，已有进程不会自动采用新代码；这项修复不等于证明供应商隧道或每个真实 Claude 请求都正常。
 
 退出会请求关闭本应用启动且身份一致的浏览器，按快照恢复已实际接管的项，停止本应用内核与 relay。CLI 由用户关闭。恢复冲突保留外部状态，失败变红，提供重试或明确接受现状；崩溃后先恢复未完成会话，再删数据。
 
@@ -57,4 +100,24 @@ select 组导入后可从托盘选择成员，仅 switchable: true 会显示选�
 
 给其他用户交付全新 zip、SHA256SUMS、无私人凭据的路由示例和自己的服务说明。不要交付维护者 data、浏览器 profile、日志、快照、真实出口或带密码 YAML。内核/relay 启动时会使用临时凭据配置，正常退出会清理；崩溃后需先恢复，不能把运行中的 core 目录当作无敏感信息的示例。仓库 `crates/aec-core/tests/fixtures/routing.yaml` 是纯合成示例，不能直接联网。
 
-卸载前退出并完成恢复，再删目录；凭据条目以 AgentEgressController: 开头，可手动清理。排查提示词只复制、不自动发送，分享前自行决定是否遮盖 IP。
+卸载前关闭登录自启、退出并完成恢复，移除桌面和开始菜单的四个 Agent Egress 快捷方式，再删目录；凭据条目以 AgentEgressController: 开头，可手动清理。排查提示词只复制、不自动发送，分享前自行决定是否遮盖 IP。
+
+## 看板与固定 ISP 保护
+
+托盘「打开看板」管理受保护站点和有序规则。类型、出站、不解析 DNS 都有选项，常用站点和 Geo 分类提供建议；网站、IP 段和自定义类别仍由用户填写。类别是否存在取决于 GeoSite/GeoIP 文件，保存或内核预检失败会报错。可新增、移除、上下移动规则，最后兜底单独选择。已有注释保留，普通规则不能覆盖受保护域名及子域名。
+
+首次启用固定出口保护：先退出 Agent 模式，在设置填写精确预期 IP，再到看板保存连接路径，然后进入。可选择直接连接 ISP、官方隧道自动选择或具体节点。固定模式下不自动从隧道退到直连；各路径连接同一候选出口，不提供另一个 ISP 作为备用。
+
+运行中切换或保存规则先选择 REJECT 并断开本应用内核的旧连接，再选择第一跳/重载规则，经独立 probe 入口核对精确 IP，成功后放行；失败保持阻断。阻断操作本身失败会通知，不宣称已安全阻断。巡检约每 30 秒执行；供应商在两次检测间改变 IP 仍是风险。只覆盖通过本程序并匹配保护规则的流量，普通 DIRECT、忽略系统代理的进程不属于保护范围。
+
+已有站点的 trace 检测方式保留；新站点默认 HTTPS 可达性检查，没有网站 trace 就不声称该网站证明出口。固定保护另外使用强制走 ISP 的 Cloudflare trace，不沿用系统代理的分流结果。
+
+资源根域不一定提供 HTTPS 服务。`oaiusercontent.com` 的可达性使用 OpenAI 文档中的 `files.oaiusercontent.com`，DNS 路由证据也核对该实际主机；保护规则仍覆盖 `oaiusercontent.com` 及所有子域名，不缩小范围。404/403 表示 HTTPS 服务回答请求，不代表文件上传或账号操作成功；连接失败仍为失败。来源：[OpenAI 网络建议](https://help.openai.com/en/articles/9247338-network-recommendations-for-chatgpt-errors-on-web-and-apps)。
+
+## 自启、快捷方式与便携目录
+
+托盘和看板均有「登录时自动启动」开关。只写 HKCU Run 的 `AgentEgressController` 值，命令为本安装 `aec-tray.exe --enter`；不安装服务或任务。登录后自动尝试进入，但上次未恢复和接管门仍会阻止进入或真实写入。自启默认关闭。
+
+从托盘或看板点「创建桌面和开始菜单快捷方式」，在当前用户桌面和开始菜单 Programs 下各建两个入口：`Agent Egress Controller` 打开托盘，`Agent Egress Dashboard` 打开看板。已有托盘时看板请求交给该实例。开始菜单可搜索 Agent Egress。
+
+命令行可用 `aec-tray.exe --enable-autostart`、`--disable-autostart`、`--create-shortcuts`、`--dashboard`。注册或同名快捷方式属于其他安装时拒绝覆盖；在旧安装先关闭自启，核对并移除旧入口，再在新目录重新创建。移动便携目录前也按这个顺序处理。不开文件关联、URL 协议、系统服务或全局环境变量，避免让不必要的系统注册残留。

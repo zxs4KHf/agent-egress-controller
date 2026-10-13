@@ -8,6 +8,8 @@
 
 #[cfg(windows)]
 mod app;
+#[cfg(windows)]
+mod startup;
 mod text;
 #[cfg(windows)]
 mod win;
@@ -19,6 +21,21 @@ fn main() {
 
 #[cfg(windows)]
 fn main() {
+    for arg in std::env::args().skip(1) {
+        let operation = match arg.as_str() {
+            "--enable-autostart" => Some(startup::set(true)),
+            "--disable-autostart" => Some(startup::set(false)),
+            "--create-shortcuts" => Some(startup::shortcuts()),
+            _ => None,
+        };
+        if let Some(result) = operation {
+            if let Err(e) = result {
+                win::message_box(std::ptr::null_mut(), &e, "Agent 出口控制器");
+                std::process::exit(1);
+            }
+            return;
+        }
+    }
     tray::run();
 }
 
@@ -60,6 +77,9 @@ mod tray {
     const ID_SETTINGS: usize = 7;
     const ID_DATA: usize = 8;
     const ID_QUIT: usize = 9;
+    const ID_DASHBOARD: usize = 10;
+    const ID_STARTUP: usize = 11;
+    const ID_SHORTCUTS: usize = 12;
     const ID_ENTRY_BASE: usize = 100;
     const ID_SWITCH_BASE: usize = 10000;
     const TIMER_REFRESH: usize = 1;
@@ -206,28 +226,29 @@ mod tray {
             unsafe { Shell_NotifyIconW(NIM_MODIFY, &n) };
         }
 
-        fn open_settings(&mut self) -> Effect {
+        fn open_page(&mut self, dashboard: bool) -> Effect {
             if self.setup.is_none() {
                 let token = match aec_core::crypto::random_hex(16) {
                     Ok(t) => t,
                     Err(e) => return Effect::Warn(format!("设置页打不开：{e}")),
                 };
-                let hwnd = self.hwnd as usize;
                 let backend = Backend {
+                    tx: self.tx.clone(),
                     data_dir: self.layout.data_dir.clone(),
                     shared: self.shared.clone(),
-                    notify: Box::new(move || unsafe {
-                        PostMessageW(hwnd as HWND, WM_REFRESH, 0, 0);
-                    }),
                 };
                 match SetupServer::start(0, token, Arc::new(backend)) {
                     Ok(s) => self.setup = Some(s),
                     Err(e) => return Effect::Warn(format!("本机设置页没能启动：{e}")),
                 }
             }
-            self.setup
-                .as_ref()
-                .map_or(Effect::None, |s| Effect::Open(s.url()))
+            self.setup.as_ref().map_or(Effect::None, |s| {
+                Effect::Open(if dashboard {
+                    s.dashboard_url()
+                } else {
+                    s.url()
+                })
+            })
         }
 
         fn send(&self, cmd: Cmd) {
@@ -297,7 +318,19 @@ mod tray {
                 add(on(s.has_report), ID_REPORT, "查看检测结果");
                 add(on(idle), ID_PROMPTS, "复制排查提示词");
                 add(MF_STRING, ID_SETTINGS, "设置出口和分流…");
+                add(MF_STRING, ID_DASHBOARD, "打开看板（连接路径与规则）");
+                add(
+                    MF_STRING
+                        | if crate::startup::enabled() {
+                            MF_CHECKED
+                        } else {
+                            0
+                        },
+                    ID_STARTUP,
+                    "登录时启动并进入 Agent 模式",
+                );
                 add(MF_STRING, ID_DATA, "打开数据和日志目录");
+                add(on(idle), ID_SHORTCUTS, "创建桌面和开始菜单快捷方式");
                 AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
                 add(
                     on(!self.quitting),
@@ -315,7 +348,7 @@ mod tray {
 
         fn command(&mut self, id: usize, s: &Shared) -> Effect {
             match id {
-                ID_ENTER if !s.configured => return self.open_settings(),
+                ID_ENTER if !s.configured => return self.open_page(false),
                 ID_ENTER => self.send(Cmd::Enter),
                 ID_RECHECK => self.send(Cmd::Recheck),
                 ID_EXIT => self.send(Cmd::Exit),
@@ -324,7 +357,16 @@ mod tray {
                 ID_REPORT => {
                     return Effect::Open(self.layout.report_path().to_string_lossy().into())
                 }
-                ID_SETTINGS => return self.open_settings(),
+                ID_SETTINGS => return self.open_page(false),
+                ID_DASHBOARD => return self.open_page(true),
+                ID_STARTUP => {
+                    let (tx, _rx) = channel();
+                    self.send(Cmd::Startup(!crate::startup::enabled(), tx));
+                }
+                ID_SHORTCUTS => {
+                    let (tx, _rx) = channel();
+                    self.send(Cmd::Shortcuts(tx));
+                }
                 ID_DATA => return Effect::Open(self.layout.data_dir.to_string_lossy().into()),
                 ID_QUIT => self.quit(),
                 n if n >= ID_SWITCH_BASE => {
@@ -360,6 +402,14 @@ mod tray {
 
     unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         match msg {
+            WM_CLOSE => {
+                with_ui(|u| {
+                    if !u.quitting {
+                        u.quit();
+                    }
+                });
+                0
+            }
             WM_TRAY => {
                 let ev = lp as u32;
                 if ev == WM_RBUTTONUP || ev == WM_LBUTTONUP {
@@ -430,11 +480,29 @@ mod tray {
         let name = wide("Local\\AgentEgressControllerTray");
         let mutex = unsafe { CreateMutexW(std::ptr::null(), 1, name.as_ptr()) };
         if mutex.is_null() || unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            let request = std::env::args().find_map(|a| match a.as_str() {
+                "--dashboard" => Some(ID_DASHBOARD),
+                "--enter" => Some(ID_ENTER),
+                "--quit" => Some(ID_QUIT),
+                _ => None,
+            });
+            if let Some(request) = request {
+                let existing = unsafe {
+                    FindWindowW(wide("AgentEgressControllerTray").as_ptr(), std::ptr::null())
+                };
+                if !existing.is_null() {
+                    unsafe { PostMessageW(existing, WM_COMMAND, request, 0) };
+                    return;
+                }
+            }
             win::message_box(
                 std::ptr::null_mut(),
                 "Agent 出口控制器已经在运行，请看任务栏右下角的托盘图标（可能藏在「^」里）。",
                 "Agent 出口控制器",
             );
+            return;
+        }
+        if std::env::args().any(|a| a == "--quit") {
             return;
         }
 
@@ -484,6 +552,7 @@ mod tray {
         }
 
         let shared: SharedRef = Arc::new(Mutex::new(Shared {
+            fixed_blocked: true,
             mode: Mode::Daily,
             busy: Some("正在启动…"),
             configured: false,
@@ -552,13 +621,22 @@ mod tray {
             u.refresh();
             let s = u.state();
             // First run: nothing works without an exit, so start there.
-            if !s.configured && s.mode == Mode::Daily {
-                u.open_settings()
+            if std::env::args().any(|a| a == "--dashboard") {
+                u.open_page(true)
+            } else if !s.configured && s.mode == Mode::Daily {
+                u.open_page(false)
             } else {
                 Effect::None
             }
         });
         run_effect(hwnd, first_run.unwrap_or(Effect::None));
+        if std::env::args().any(|a| a == "--enter") {
+            with_ui(|u| {
+                if u.state().mode == Mode::Daily {
+                    let _ = u.tx.send(Cmd::Enter);
+                }
+            });
+        }
 
         let mut msg: MSG = unsafe { std::mem::zeroed() };
         while unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) } > 0 {

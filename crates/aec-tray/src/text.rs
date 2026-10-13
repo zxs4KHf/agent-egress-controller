@@ -41,6 +41,7 @@ pub fn check_label(id: &str) -> String {
         "R5" => format!("浏览器 {arg} 的 Cookie 开关"),
         "R9" => "非目标网站流量的出口".into(),
         "R10" => "时区由谁设置".into(),
+        "R11" => "Claude 桌面版当前连接遵循分流（只读抽样）".into(),
         _ => id.into(),
     }
 }

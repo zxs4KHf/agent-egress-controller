@@ -1,0 +1,41 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent 出口看板</title><style>
+body{font:15px system-ui,sans-serif;background:#f3f5f7;color:#182331;margin:0}main{max-width:1100px;margin:auto;padding:28px}h1{font-size:26px}section{background:white;border:1px solid #dbe2e9;border-radius:12px;padding:22px;margin:18px 0}h2{font-size:19px;margin-top:0}button,input,select{font:inherit;padding:8px;border:1px solid #bac6d2;border-radius:6px}button{cursor:pointer;background:#eef3f8}button.primary{background:#176853;color:white}button:disabled{opacity:.45;cursor:wait}p{line-height:1.6}.muted{color:#586779}.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:10px 0}#notice{white-space:pre-wrap}#notice.error{color:#aa2828}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:7px;border-bottom:1px solid #eee}td input{width:90%;min-width:110px}td select{max-width:210px}.scroll{overflow:auto}.chip{display:inline-flex;align-items:center;gap:8px;background:#edf5f2;margin:5px;padding:8px;border-radius:7px}small{color:#586779}
+</style><main><h1>Agent 出口看板</h1><p id="status"></p><p id="notice" role="status"></p>
+<section><h2>连接到固定 ISP</h2><p>切换先阻断并断开旧连接，核对配置的出口 IP 后放行。失败时保持阻断，不切换到其他出口。检测只代表检测时刻，供应商更换 IP 会在后续巡检时被阻断。</p><div class="row"><select id="path"></select><button id="switch" class="primary">切换并核对出口</button><button id="recheck">重新核对</button></div><small id="guard"></small></section>
+<section><h2>受保护站点</h2><p>这些域名及其子域名优先走固定 ISP，普通规则不能覆盖。删除站点会取消该站点的保护。新站点检测 HTTPS 可达性；oaiusercontent.com 使用 files.oaiusercontent.com 检测，保护仍覆盖整个域名及子域名。</p><div id="sites"></div><div class="row"><select id="suggested"></select><button id="addSuggested">添加常用站点</button><input id="site" placeholder="自定义域名，例如 example.com"><button id="addSite">添加域名</button></div></section>
+<section><h2>分流规则</h2><p>按从上到下的顺序匹配。匹配类型和出站从现有选项选择；域名、IP 段等匹配内容自行填写。</p><div class="scroll"><table><thead><tr><th>匹配类型</th><th>内容</th><th>出站</th><th>不解析 DNS</th><th>顺序 / 删除</th></tr></thead><tbody id="rules"></tbody></table></div><div class="row"><button id="addRule">新增规则</button><label>未匹配流量 <select id="final"></select></label></div><p class="muted">密钥在「出口设置」中填写，保存在 Windows 凭据管理器，看板不回显密钥。</p><button id="save" class="primary">保存站点与规则</button> <a id="setup">出口与隧道设置</a></section></main>
+<section><h2>启动入口与登录自启</h2><p>登录自启会打开本安装的托盘并尝试进入 Agent 模式。上次未恢复、出口检测失败或接管门未打开时，不会显示已就绪。</p><div class="row"><label><input type="checkbox" id="autostart"> 登录时自动启动</label><button id="saveStartup">保存自启选项</button><button id="shortcuts">创建桌面和开始菜单快捷方式</button></div><small>快捷方式分别打开托盘和看板；开始菜单可搜索 Agent Egress。移动便携目录前先关闭自启，移动后重新创建入口。</small></section>
+<script>
+// Keep all sections inside the same bounded layout, including startup controls.
+document.querySelector('main').append(document.querySelector('main+section'));
+const token='__TOKEN__';let state=__VIEW__,form=structuredClone(state.form),saving=false,dirty=false,startupDirty=false,pathDirty=false;
+const $=id=>document.getElementById(id),types=[['domain','精确域名'],['domain_suffix','域名及子域名'],['domain_keyword','域名关键词'],['ip_cidr','IP / CIDR'],['geosite','GeoSite 分类'],['geoip','GeoIP 国家']];
+function options(el,items,value){el.replaceChildren();for(const [v,label] of items){let o=document.createElement('option');o.value=v;o.textContent=label;el.append(o)}el.value=value}
+function notice(s,error=false){$('notice').textContent=s;$('notice').className=error?'error':''}
+function mark(){dirty=true}
+function render(){
+ $('status').textContent=`模式：${state.mode} · ${state.busy?'正在处理':!state.fixedExit?'未启用固定出口保护':state.mode==='daily'?'固定保护待启动':state.blocked?'固定出口已阻断':'出口已核对'}${state.summary?' · '+state.summary:''}`;
+ options($('path'),state.paths,pathDirty?$('path').value:state.path);$('guard').textContent=state.fixedExit?'固定出口保护已启用；每 30 秒巡检。':'固定出口保护尚未启用；请先在出口设置中配置精确 IP，再启用保护。';
+ $('switch').disabled=saving||state.busy;$('switch').textContent=state.mode==='daily'?'保存路径并启用固定出口保护':'切换并核对出口';$('recheck').disabled=saving||state.busy||!state.fixedExit||state.mode==='daily';
+ $('sites').replaceChildren();form.sites.forEach((s,i)=>{let c=document.createElement('span');c.className='chip';c.append(document.createTextNode(s));let b=document.createElement('button');b.textContent='移除';b.onclick=()=>{form.sites.splice(i,1);mark();render()};c.append(b);$('sites').append(c)});
+ options($('suggested'),state.suggested.map(s=>[s,s]),state.suggested[0]);options($('final'),state.targets.map(s=>[s,s]),form.finalTarget);
+ $('rules').replaceChildren();form.rules.forEach((r,i)=>{let tr=document.createElement('tr');function cell(el){let td=document.createElement('td');td.append(el);tr.append(td)}
+ let k=document.createElement('select');options(k,types,r.kind);k.onchange=()=>{r.kind=k.value;if(r.kind!=='ip_cidr'&&r.kind!=='geoip')r.noResolve=false;mark();render()};cell(k);
+ let v=document.createElement('input');v.value=r.value;v.placeholder=r.kind==='ip_cidr'?'192.0.2.0/24':r.kind==='geosite'?'选择分类或填写自定义分类':r.kind==='geoip'?'选择国家或填写代码':'example.com';if(['geosite','geoip'].includes(r.kind)){let list=document.createElement('datalist');list.id='values-'+i;v.setAttribute('list',list.id);for(const value of r.kind==='geoip'?['CN','US','JP','SG','HK','DE','GB','private']:['cn','geolocation-!cn','category-ai','google','microsoft','apple']){let o=document.createElement('option');o.value=value;list.append(o)}tr.append(list)}v.oninput=()=>{r.value=v.value;mark()};cell(v);
+ let t=document.createElement('select');options(t,state.targets.map(s=>[s,s]),r.target);t.onchange=()=>{r.target=t.value;mark()};cell(t);
+ let n=document.createElement('input');n.type='checkbox';n.checked=r.noResolve;n.disabled=!['ip_cidr','geoip'].includes(r.kind);n.onchange=()=>{r.noResolve=n.checked;mark()};cell(n);
+ let actions=document.createElement('span');for(const [label,delta] of [['↑',-1],['↓',1],['删除',0]]){let b=document.createElement('button');b.textContent=label;b.disabled=delta!==0&&(i+delta<0||i+delta>=form.rules.length);b.onclick=()=>{if(delta)[form.rules[i],form.rules[i+delta]]=[form.rules[i+delta],form.rules[i]];else form.rules.splice(i,1);mark();render()};actions.append(b)}cell(actions);$('rules').append(tr)});
+ $('save').disabled=saving||state.busy;$('setup').href='/setup?t='+token;
+ if(!startupDirty)$('autostart').checked=state.autostart;$('saveStartup').disabled=saving||state.busy;$('shortcuts').disabled=saving||state.busy;
+}
+function addSite(s){s=s.trim().toLowerCase();if(s&&!form.sites.includes(s)){form.sites.push(s);mark();render()}}
+$('addSite').onclick=()=>{addSite($('site').value);$('site').value=''};$('addSuggested').onclick=()=>addSite($('suggested').value);
+$('addRule').onclick=()=>{form.rules.push({kind:'domain_suffix',value:'',target:'relay',noResolve:false,note:null});mark();render()};$('final').onchange=()=>{form.finalTarget=$('final').value;mark()};
+async function action(path,body){saving=true;render();notice(['rules','path'].includes(path)?'正在处理；切换期间受保护连接会中断…':'正在保存启动入口…');try{let r=await fetch('/'+path+'?t='+token,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});let result=await r.json();if(!result.ok)throw Error(result.errors.map(e=>e.path+'：'+e.message).join('\n'));if(path==='rules')dirty=false;if(path==='startup')startupDirty=false;if(path==='path')pathDirty=false;await refresh();notice('操作完成。请查看当前状态。')}catch(e){try{await refresh()}catch{}notice(e.message,true)}finally{saving=false;render()}}
+$('save').onclick=()=>action('rules',form);$('switch').onclick=()=>{const path=$('path').value;action('path',{path})};$('recheck').onclick=()=>action('path',{path:state.path});
+$('saveStartup').onclick=()=>action('startup',{enabled:$('autostart').checked});$('shortcuts').onclick=()=>action('shortcuts',{});
+$('autostart').onchange=()=>{startupDirty=true};$('path').onchange=()=>{pathDirty=true};
+async function refresh(){let r=await fetch('/state?t='+token,{cache:'no-store'});state=await r.json();if(!dirty)form=structuredClone(state.form);render()}
+render();setInterval(()=>{if(!saving&&!dirty)refresh().catch(()=>notice('看板服务不可用，请从托盘重新打开。',true))},5000);
+</script></html>

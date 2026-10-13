@@ -13,6 +13,7 @@ struct Memory {
     user: Option<String>,
     tunnel_stored: bool,
     takeover: bool,
+    settings: aec_core::controller::Settings,
 }
 
 struct Preview(Mutex<Memory>);
@@ -23,6 +24,7 @@ impl SetupBackend for Preview {
         setup::view(
             &g.set,
             &setup::ViewInput {
+                core_mixed_port: g.settings.core_mixed_port,
                 stored_user: g.user.as_deref(),
                 tunnel_password_stored: g.tunnel_stored,
                 takeover_enabled: g.takeover,
@@ -32,6 +34,7 @@ impl SetupBackend for Preview {
     }
     fn save(&self, form: ExitForm) -> Result<(), Vec<FieldError>> {
         let mut g = self.0.lock().unwrap();
+        let settings = setup::apply_settings(&form, g.settings)?;
         let (user, stored) = (g.user.clone(), g.tunnel_stored);
         let a = setup::apply(&mut g.set, &form, user.as_deref(), stored)?;
         if let CredentialChange::Store { ref user, .. } = a.exit {
@@ -41,6 +44,7 @@ impl SetupBackend for Preview {
             g.tunnel_stored = true;
         }
         g.takeover = a.takeover;
+        g.settings = settings;
         println!("saved: exit {:?}, tunnel {:?}", a.exit, a.tunnel);
         Ok(())
     }
@@ -52,6 +56,7 @@ fn main() {
         user: None,
         tunnel_stored: false,
         takeover: false,
+        settings: Default::default(),
     })));
     let srv = SetupServer::start(0, "preview".into(), backend).expect("listen");
     println!("{}", srv.url());

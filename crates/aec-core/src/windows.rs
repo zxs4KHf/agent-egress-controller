@@ -301,6 +301,80 @@ impl WindowsHost {
     }
 }
 
+/// Active IPv4 TCP clients of our 127.0.0.1 mixed listener, with process creation identity.
+/// The core is IPv4 loopback-only. Never inspect command lines or close these foreign clients.
+pub fn desktop_proxy_flows(mixed: u16) -> ProbeResult<Vec<crate::desktop::DesktopFlow>> {
+    use std::net::{Ipv4Addr, SocketAddr};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        MIB_TCP_STATE_ESTAB, TCP_TABLE_OWNER_PID_ALL,
+    };
+
+    let mut size = 16 * 1024u32;
+    for _ in 0..4 {
+        // Aligned storage, bounded rows, and a successful API return are required before reading.
+        let mut buf = vec![0u64; (size as usize).div_ceil(8)];
+        let rc = unsafe {
+            GetExtendedTcpTable(
+                buf.as_mut_ptr().cast(),
+                &mut size,
+                0,
+                AF_INET as u32,
+                TCP_TABLE_OWNER_PID_ALL,
+                0,
+            )
+        };
+        if rc == ERROR_INSUFFICIENT_BUFFER {
+            continue;
+        }
+        if rc != NO_ERROR {
+            return Err(ProbeError::new("GetExtendedTcpTable", Some(rc)));
+        }
+        let table = buf.as_ptr().cast::<MIB_TCPTABLE_OWNER_PID>();
+        let offset = std::mem::offset_of!(MIB_TCPTABLE_OWNER_PID, table);
+        let used = (size as usize).min(buf.len() * 8);
+        if used < offset {
+            return Err(ProbeError::new("invalid TCP table header", None));
+        }
+        let count = unsafe { (*table).dwNumEntries } as usize;
+        let row_size =
+            size_of::<windows_sys::Win32::NetworkManagement::IpHelper::MIB_TCPROW_OWNER_PID>();
+        if count > (used - offset) / row_size {
+            return Err(ProbeError::new("invalid TCP table size", None));
+        }
+        let rows = unsafe { std::slice::from_raw_parts((*table).table.as_ptr(), count) };
+        let mut identities = std::collections::HashMap::new();
+        let mut flows = Vec::new();
+        for r in rows {
+            let remote = SocketAddr::from((
+                Ipv4Addr::from(r.dwRemoteAddr.to_ne_bytes()),
+                u16::from_be(r.dwRemotePort as u16),
+            ));
+            if r.dwState != MIB_TCP_STATE_ESTAB as u32
+                || remote != SocketAddr::from(([127, 0, 0, 1], mixed))
+            {
+                continue;
+            }
+            let identity = identities
+                .entry(r.dwOwningPid)
+                .or_insert_with(|| crate::core::process::process_identity(r.dwOwningPid));
+            if let Some((exe, created)) = identity {
+                flows.push(crate::desktop::DesktopFlow {
+                    pid: r.dwOwningPid,
+                    created: *created,
+                    exe: exe.clone(),
+                    local: SocketAddr::from((
+                        Ipv4Addr::from(r.dwLocalAddr.to_ne_bytes()),
+                        u16::from_be(r.dwLocalPort as u16),
+                    )),
+                    remote,
+                });
+            }
+        }
+        return Ok(flows);
+    }
+    Err(ProbeError::new("TCP table changed during probe", None))
+}
+
 /// Write the system proxy for the default (LAN) connection, with the same four values the reader
 /// returns, then tell running programs that the settings changed. Called only by the controller,
 /// behind an open takeover gate, and when restoring a snapshot it took itself.

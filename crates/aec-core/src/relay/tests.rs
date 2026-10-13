@@ -387,6 +387,185 @@ fn roundtrip(s: &mut TcpStream) -> Vec<u8> {
     buf
 }
 
+// This upstream implements only the handshake; it does not use the relay's pump, so fixes to
+// the production transfer path cannot accidentally fix the fake side of the regression.
+fn scripted_upstream(
+    proto: UpstreamProto,
+    transfer: impl FnOnce(&mut TcpStream) -> io::Result<()> + Send + 'static,
+) -> (Upstream, std::thread::JoinHandle<io::Result<()>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let candidate = up(listener.local_addr().unwrap().port(), proto);
+    let worker = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept()?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        match proto {
+            UpstreamProto::Socks5 => {
+                let mut greeting = [0; 3];
+                stream.read_exact(&mut greeting)?;
+                assert_eq!(greeting, [5, 1, 0]);
+                stream.write_all(&[5, 0])?;
+                let mut request = [0; 5];
+                stream.read_exact(&mut request)?;
+                assert_eq!(&request[..4], &[5, 1, 0, 3]);
+                let mut address = vec![0; usize::from(request[4]) + 2];
+                stream.read_exact(&mut address)?;
+                stream.write_all(&REPLY_OK)?;
+            }
+            UpstreamProto::Http => {
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte)?;
+                    head.push(byte[0]);
+                    assert!(head.len() <= 8192);
+                }
+                assert!(head.starts_with(b"CONNECT example.org:443 HTTP/1.1\r\n"));
+                stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")?;
+            }
+        }
+        transfer(&mut stream)
+    });
+    (candidate, worker)
+}
+
+const TRANSFER_PAUSE: Duration = Duration::from_millis(1200);
+
+#[test]
+fn s10_delayed_first_response_survives_upstream_handshake_timeout() {
+    for proto in [UpstreamProto::Socks5, UpstreamProto::Http] {
+        let (candidate, worker) = scripted_upstream(proto, |stream| {
+            let mut request = [0; 4];
+            stream.read_exact(&mut request)?;
+            assert_eq!(&request, b"ping");
+            std::thread::sleep(TRANSFER_PAUSE);
+            stream.write_all(b"pong")?;
+            let mut end = [0];
+            assert_eq!(
+                stream.read(&mut end)?,
+                0,
+                "client close must end forwarding"
+            );
+            Ok(())
+        });
+        let (_logs, sink) = Logs::new();
+        let mut config = cfg(vec![candidate]);
+        config.connect_timeout_ms = 400;
+        let relay = start(config, sink).unwrap();
+        let (mut client, code) = socks_connect(relay.addr, "example.org", 443);
+        assert_eq!(code, 0);
+        client.write_all(b"ping").unwrap();
+        let mut response = [0; 4];
+        client
+            .read_exact(&mut response)
+            .expect("relay cut off the delayed first response");
+        assert_eq!(&response, b"pong");
+        client.shutdown(Shutdown::Both).unwrap();
+        worker.join().unwrap().unwrap();
+    }
+}
+
+#[test]
+fn s10_streaming_gap_survives_upstream_step_timeout() {
+    for proto in [UpstreamProto::Socks5, UpstreamProto::Http] {
+        let (mut candidate, worker) = scripted_upstream(proto, |stream| {
+            stream.write_all(b"first")?;
+            std::thread::sleep(TRANSFER_PAUSE);
+            stream.write_all(b"later")
+        });
+        candidate.step_timeout_ms = Some(400);
+        let (_logs, sink) = Logs::new();
+        let relay = start(cfg(vec![candidate]), sink).unwrap();
+        let (mut client, code) = socks_connect(relay.addr, "example.org", 443);
+        assert_eq!(code, 0);
+        let mut chunk = [0; 5];
+        client.read_exact(&mut chunk).unwrap();
+        assert_eq!(&chunk, b"first");
+        client
+            .read_exact(&mut chunk)
+            .expect("relay cut off the stream during a response gap");
+        assert_eq!(&chunk, b"later");
+        let mut end = [0];
+        assert_eq!(
+            client.read(&mut end).unwrap(),
+            0,
+            "upstream close must end forwarding"
+        );
+        worker.join().unwrap().unwrap();
+    }
+}
+
+#[test]
+fn s10_client_idle_survives_inbound_handshake_timeout() {
+    let (candidate, worker) = scripted_upstream(UpstreamProto::Socks5, |stream| {
+        let mut request = [0; 4];
+        stream.read_exact(&mut request)?;
+        assert_eq!(&request, b"ping");
+        stream.write_all(b"pong")
+    });
+    let (_logs, sink) = Logs::new();
+    let mut config = cfg(vec![candidate]);
+    config.handshake_timeout_ms = 400;
+    config.connect_timeout_ms = 2500;
+    let relay = start(config, sink).unwrap();
+    let (mut client, code) = socks_connect(relay.addr, "example.org", 443);
+    assert_eq!(code, 0);
+    std::thread::sleep(TRANSFER_PAUSE);
+    client.write_all(b"ping").unwrap();
+    let mut response = [0; 4];
+    client
+        .read_exact(&mut response)
+        .expect("relay cut off the idle client after its handshake");
+    assert_eq!(&response, b"pong");
+    worker.join().unwrap().unwrap();
+}
+
+#[test]
+fn s10_direct_dial_caller_can_wait_for_response_after_handshake() {
+    for proto in [UpstreamProto::Socks5, UpstreamProto::Http] {
+        let (candidate, worker) = scripted_upstream(proto, |stream| {
+            std::thread::sleep(TRANSFER_PAUSE);
+            stream.write_all(b"pong")
+        });
+        let mut stream = dial_upstream(
+            &candidate,
+            "example.org",
+            443,
+            Duration::from_millis(400),
+            Instant::now() + Duration::from_millis(2500),
+        )
+        .unwrap();
+        let mut response = [0; 4];
+        stream
+            .read_exact(&mut response)
+            .expect("dial_upstream leaked its handshake timeout to the caller");
+        assert_eq!(&response, b"pong");
+        worker.join().unwrap().unwrap();
+    }
+}
+
+#[test]
+fn s10_tunnelled_transfer_survives_handshake_timeout() {
+    let (mut candidate, worker) = scripted_upstream(UpstreamProto::Http, |stream| {
+        stream.write_all(b"first")?;
+        std::thread::sleep(TRANSFER_PAUSE);
+        stream.write_all(b"later")
+    });
+    let (tx, _rx) = mpsc::channel();
+    candidate.via = Some(format!("127.0.0.1:{}", socks5_upstream(false, tx)));
+    candidate.step_timeout_ms = Some(400);
+    let (_logs, sink) = Logs::new();
+    let relay = start(cfg(vec![candidate]), sink).unwrap();
+    let (mut client, code) = socks_connect(relay.addr, "example.org", 443);
+    assert_eq!(code, 0);
+    let mut response = [0; 10];
+    client
+        .read_exact(&mut response)
+        .expect("relay cut off a response through the tunnel entrance");
+    assert_eq!(&response, b"firstlater");
+    worker.join().unwrap().unwrap();
+}
+
 #[test]
 fn s4_s10_fails_over_to_a_working_candidate_and_relays_bytes() {
     let echo = echo_server();

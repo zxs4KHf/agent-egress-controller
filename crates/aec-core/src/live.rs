@@ -1,8 +1,7 @@
 //! The real machine behind the [`Platform`] trait (Windows).
 //!
-//! Real global writes: the time zone only, and only when the controller calls `write_global`,
-//! which it does behind an open takeover gate. The system proxy is never written in this version
-//! (explicit-only scope); its writer arrives with ticket 16.
+//! Real global writes: time zone and optional system proxy, only when the controller calls
+//! `write_global` behind the per-item takeover gate.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -39,6 +38,7 @@ struct EntryRuntime {
 }
 
 pub struct LivePlatform {
+    fixed_verified: std::sync::atomic::AtomicBool,
     pub data_dir: PathBuf,
     pub core: CoreManager,
     entries: Mutex<HashMap<String, EntryRuntime>>,
@@ -87,6 +87,53 @@ fn wait_exit(pid: u32, created: u64, timeout: Duration) -> bool {
 }
 
 impl LivePlatform {
+    pub fn fixed_verified(&self) -> bool {
+        self.fixed_verified
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub fn block_fixed(&self) -> Result<(), Fault> {
+        self.fixed_verified
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        // Both steps are attempted: failure to select must not preserve existing connections.
+        let gate = self.core.select(&WindowsHost, "relay", "REJECT");
+        let close = self.core.close_connections(&WindowsHost);
+        gate.and(close).map_err(|e| fault(e, "FIXED_BLOCK_FAILED"))
+    }
+
+    pub fn verify_fixed(&self, profile: &AgentProfile) -> Result<(), Fault> {
+        let port = crate::fixed::probe_port(&self.core.ports)
+            .ok_or_else(|| Fault::new("CFG_INVALID", "probe port collision"))?;
+        crate::fixed::verify(
+            &crate::http::WinHttpClient,
+            port,
+            profile.egress.expected.ip.as_deref(),
+        )
+        .map_err(|e| Fault::new("FIXED_EXIT_UNVERIFIED", e))
+    }
+
+    /// Called only with the gate blocked. Unknown evidence leaves it blocked.
+    pub fn open_fixed(&self, profile: &AgentProfile) -> Result<(), Fault> {
+        let member = crate::fixed::path_member(
+            profile,
+            profile
+                .egress
+                .connection_path
+                .as_deref()
+                .unwrap_or("direct"),
+        )
+        .ok_or_else(|| Fault::new("CFG_INVALID", "connection path unavailable"))?;
+        self.core
+            .select(&WindowsHost, crate::fixed::FIRST_HOP, &member)
+            .map_err(|e| fault(e, "FIXED_PATH_FAILED"))?;
+        self.verify_fixed(profile)?;
+        self.core
+            .select(&WindowsHost, "relay", crate::fixed::TRANSPORT)
+            .map_err(|e| fault(e, "FIXED_OPEN_FAILED"))?;
+        self.fixed_verified
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
     pub fn dev(repo_root: &Path, data_dir: &Path) -> Self {
         Self::new(CoreManager::dev(repo_root, data_dir), data_dir)
     }
@@ -94,6 +141,7 @@ impl LivePlatform {
     /// Any layout: the core manager says where the binaries are.
     pub fn new(core: CoreManager, data_dir: &Path) -> Self {
         Self {
+            fixed_verified: std::sync::atomic::AtomicBool::new(false),
             data_dir: data_dir.to_path_buf(),
             core,
             entries: Mutex::new(HashMap::new()),
@@ -341,6 +389,14 @@ impl Platform for LivePlatform {
     }
 
     fn core_up(&self, profile: &AgentProfile, direct_test: bool) -> Result<(), Fault> {
+        // A previous live session can carry different relay candidates and gate topology. Do not
+        // adopt it for a new controller session: recovery must finish before entering again.
+        if self.core.status(&WindowsHost).alive || self.core.status(&WindowsHost).relay_alive {
+            return Err(Fault::new(
+                "CORE_SESSION_ACTIVE",
+                "已有内核或 relay 会话；请先恢复并退出该会话，再进入 Agent 模式",
+            ));
+        }
         let group = profile
             .routing
             .primary_group_name()
@@ -361,6 +417,11 @@ impl Platform for LivePlatform {
             if let Err(e) = self.core.apply_selections(&WindowsHost, &profile.routing) {
                 let _ = self.core.down(&WindowsHost);
                 return Err(Fault::new(e.code, e.message));
+            }
+            if profile.egress.fixed_exit {
+                self.block_fixed()?;
+                // Failed evidence keeps the core blocked and alive, permitting another path.
+                let _ = self.open_fixed(profile);
             }
         }
         Ok(())
@@ -391,7 +452,29 @@ impl Platform for LivePlatform {
             system_dns: crate::windows::system_dns_servers().map_err(|e| e.to_string()),
             generated_at: rfc3339_utc(self.now_ms() / 1000),
         };
-        checks::run(&input, &crate::http::WinHttpClient)
+        let mut report = checks::run(&input, &crate::http::WinHttpClient);
+        if profile.egress.fixed_exit {
+            report.results.push(crate::checks::CheckResult::new(
+                "FIXED",
+                crate::checks::Kind::Hard,
+                if self.fixed_verified() {
+                    crate::checks::Status::Pass
+                } else {
+                    crate::checks::Status::Unknown
+                },
+                if self.fixed_verified() {
+                    None
+                } else {
+                    Some("fixed_exit_blocked")
+                },
+            ));
+        }
+        report.results.push(crate::desktop::observe(
+            profile,
+            self.core.ports.mixed,
+            &crate::desktop::WindowsDesktopProbe(&self.core),
+        ));
+        report
     }
 
     fn launch_entry(&self, profile: &AgentProfile, entry_id: &str) -> Result<OwnedProcess, Fault> {

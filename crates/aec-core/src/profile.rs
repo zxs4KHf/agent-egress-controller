@@ -79,6 +79,11 @@ pub struct Egress {
     /// Optional encrypted first hop to the exit (ADR-0009).
     #[serde(default)]
     pub tunnel: Option<Tunnel>,
+    /// Fail closed until the relay's public IP matches `expected.ip` (ADR-0010).
+    #[serde(default)]
+    pub fixed_exit: bool,
+    #[serde(default)]
+    pub connection_path: Option<String>,
 }
 
 /// Shadowsocks ciphers offered for a tunnel. AEAD only; the stream ciphers are broken.
@@ -439,6 +444,19 @@ pub struct Target {
     pub trace: bool,
 }
 
+impl Target {
+    /// The public service host used for HTTPS reachability. The protected suffix stays `domain`.
+    /// OpenAI documents files.oaiusercontent.com; its parent is a resource namespace, not a
+    /// reachable HTTPS homepage. Trace probes and all other user domains retain their host.
+    pub fn probe_domain(&self) -> &str {
+        if !self.trace && self.domain.eq_ignore_ascii_case("oaiusercontent.com") {
+            "files.oaiusercontent.com"
+        } else {
+            &self.domain
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -569,6 +587,8 @@ impl Default for ProfileSet {
                     relay: RelaySettings::default(),
                     expected: ExpectedEgress::default(),
                     tunnel: None,
+                    fixed_exit: false,
+                    connection_path: None,
                 },
                 proxy_scope: ProxyScope {
                     mode: ProxyScopeMode::ExplicitOnly,
@@ -686,7 +706,7 @@ pub fn validate_routing(r: &Routing) -> Vec<FieldError> {
         let name = outbound.name.as_str();
         if name.trim().is_empty()
             || name.contains([',', '\n', '\r'])
-            || name.starts_with("aec-tunnel")
+            || name.starts_with("aec-")
             || !names.insert(name)
         {
             e.push(
@@ -730,7 +750,7 @@ pub fn validate_routing(r: &Routing) -> Vec<FieldError> {
         let name = group.name.as_str();
         if name.trim().is_empty()
             || name.contains([',', '\n', '\r'])
-            || name.starts_with("aec-tunnel")
+            || name.starts_with("aec-") && name != "aec-other"
             || !names.insert(name)
         {
             e.push(
@@ -968,6 +988,22 @@ fn validate_agent(p: &AgentProfile, at: &str, e: &mut Errors) {
     }
 
     let x = &p.egress.expected;
+    if p.egress.fixed_exit {
+        if x.ip.is_none() {
+            e.push(
+                format!("{at}.egress.expected.ip"),
+                "fixed exit requires one exact IP",
+            );
+        }
+        if crate::fixed::path_member(p, p.egress.connection_path.as_deref().unwrap_or("direct"))
+            .is_none()
+        {
+            e.push(
+                format!("{at}.egress.connectionPath"),
+                "unknown or unavailable connection path",
+            );
+        }
+    }
     if let Some(ip) = &x.ip {
         if ip.parse::<IpAddr>().is_err() {
             e.push(

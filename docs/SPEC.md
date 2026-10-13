@@ -97,7 +97,7 @@ Controller（Rust，唯一对外的业务入口）
 
 数据目录下的结构：`profiles\`、`snapshots\`、`state.json`、`providers.json`、`core\`（运行配置，退出时删除）、`browser-profiles\edge|chrome\`、`logs\`。
 
-默认端口都只绑定 `127.0.0.1`，都可在设置里改：
+默认端口都只绑定 `127.0.0.1`，mixed-port 可在设置里改，其余内部端口目前固定：
 
 | 用途 | 默认端口 |
 | --- | --- |
@@ -108,6 +108,13 @@ Controller（Rust，唯一对外的业务入口）
 | 本地检查页服务 | 17980 |
 
 2026-10-10 核查时，这些端口都没有被占用；legacy 链路使用 7893/9099/10553/12325。
+
+mixed-port 可覆盖：设置页「本机代理入口端口」保存到 `settings.json` 的 `coreMixedPort`，字段缺失或为 0 时用默认值。表单留空或 0 重置默认，旧表单缺字段保留原值；其他值须为 1–65535，不得与控制、DNS、relay、隧道、固定出口检测端口重复。只在日常模式保存，下次进入生效，托盘和开发命令共用已保存端口。
+接管已有链路时复用客户端入口，迁移准备在隔离检测结束后记录旧入口端口，不改用户级代理环境变量。内部端口目前仍只读默认值。
+
+系统代理由单一写入者管理；其他代理客户端关闭系统代理开关，内核可继续作为普通流量上游。本程序不合并外部全局绕过列表，不反复抢回。发现外部改写时告警；用户处理冲突后重新进入并拍快照。
+
+非 trace 的 `oaiusercontent.com` 目标探测 `https://files.oaiusercontent.com/`，G3 核对该主机的路由记录，G2 保留根域检查 ID 并显示实际 URL。路由保护仍匹配根域及所有子域名；实际服务不可达仍报告失败，不跳过检测，不将可达性冒充出口 IP 证据。
 
 隔离规则：
 
@@ -224,6 +231,7 @@ Controller（Rust，唯一对外的业务入口）
 - E3 内核：生成运行配置（凭据从凭据管理器注入，文件放在数据目录 `core\`，退出时删除），启动 relay 任务和 `aec-mihomo.exe`，15 秒内端口进入监听，controller 的 `/version` 响应正常。
 - E4 全局状态：对每个适配器执行 `plan → apply → verify`。接管门关闭时只记录 dry-run 计划，变更日志中标 `dryRun: true`。`proxyScope.mode = explicit_only` 时不规划系统代理变更。
 - E5 入口：只启动用户这次选中的入口（默认是档案里第一个浏览器入口）。浏览器如果已有同一 user-data-dir 的实例：启动参数一致就只开新窗口；不一致就弹窗请用户关闭该实例，绝不强制结束进程，用户取消则这一项记为失败。
+- Claude 桌面版由用户正常启动，通过可选系统代理接管进入同一套路由；它不是本应用入口，不加入 owned 进程、不改安装/配置/语言、不要求启动前退出，也不产生浏览器 G5/R3–R5。其 Node/MCP/Cowork 等独立路径是否遵循代理必须分别验证。
 - E6 检查：执行第 4.5 节的检查，生成 CheckReport，然后按硬门槛判定是 ready 还是 unverified。
 
 **退出步骤**：
@@ -272,6 +280,9 @@ Controller（Rust，唯一对外的业务入口）
 | R8 系统代理现状 | `explicit_only` 模式下，展示当前系统代理指向哪里 | 不产生警告，只展示 |
 | R10 时区归属 | G4 通过时，时区是否由本应用在本次会话中设置 | 不是本应用设置的，并且进入时存在外部写入者（替代上文「G4 另加一条警告」的说法） |
 | R9 非目标流量出口 | 经代理请求 `www.cloudflare.com/cdn-cgi/trace` 得到的 IP 和地区（默认路由模板下它和目标流量同一出口；分流模板下才会不同） | 不产生警告，只展示；用于说明分流规则的效果 |
+| R11 Claude 桌面版当前连接 | 两次 Windows TCP 读取间稳定的桌面进程身份与本应用内核实时连接表关联，核对域名路由及实际出站链 | Claude 服务域名命中 DIRECT/REJECT，或当前链不符合档案（包括显式 select 成员）；无证据为未知 |
+
+R11 只证明观测到的连接，至少一个 Claude 服务域名有证据且全部稳定样本可判定、符合路由才通过；不能用 G1–G3 探测请求或 G6 配置读回冒充桌面证据。源 IP/端口、入站端口、PID、创建时间和可执行路径必须对应，控制口/mixed-port 所属内核身份必须在 API 读取前后核对。当前支持 `AnthropicClaude/app-<数字版本>/claude.exe`；空闲、已关闭连接、其他安装形态、IP-only、前置 Geo/IP 无匹配证据或读取失败均未知。固定 ISP 的实际出口仍由 G1/G2 给证据。R11 不参与就绪判定，不读取对话内容、不写系统、不替用户发消息或管理 Claude 进程。
 
 不计算任何总分。
 
@@ -341,7 +352,18 @@ UI 提供单项复制和「复制全部问题」。只写剪贴板，不调用�
 
 - 设置页直接编辑档案，保存前做 schema 校验，错误逐字段显示。
 - 凭据保存到 Windows 凭据管理器，目标名为 `AgentEgressController:<credentialRef>`，档案中只存引用。进入时按需注入内核/relay 临时运行配置，退出时删除，不回显、不写日志或提示词。
-- 开机自启是设置项，默认关闭；开启时写入 HKCU Run，关闭时删除。
+- 登录自启在托盘与看板均可设置，默认关闭；只写 HKCU Run `AgentEgressController`，精确指向当前安装 exe 和 `--enter`。拒绝覆盖另一安装的注册；未恢复会话及接管门不被绕过。
+- 托盘和看板可主动创建当前用户桌面、开始菜单的托盘和看板快捷方式；看板用 `--dashboard` 转交已有实例。拒绝覆盖不同目标的同名入口；不注册服务、URL 协议或文件关联。
+
+### 4.10.1 看板与固定出口保护（ADR-0010，0.3.0）
+
+本机看板复用设置服务，GET dashboard/state 与 POST rules/path/startup/shortcuts 均要求随机令牌和正确 Host；写请求还要求本机 Origin。只接收结构化表单，不接收任意命令、原始 YAML 或路径。操作串行进入 worker，限制 128 站点、512 规则，校验失败不修改档案。
+
+保护域名与子域名优先于全部用户规则。规则类型、出站与排序由选项管理，允许自定义域名/IP，Geo 分类建议是否可用以可信用户数据为准。新增站点默认仅测可达性，已有 trace 属性保留。
+
+`egress.fixedExit` 和 `connectionPath` 兼容旧档案，默认不启用保护；启用要求精确预期 IP。路径为 direct、tunnel-auto 或 tunnel-N，第一跳 DIRECT 只直接连接 ISP 代理。固定模式无自动直连回退。内部 relay select 默认 REJECT，只有独立 probe 强制走 ISP 并核对精确 IP 后放行；probe 监听默认 17327，第一跳监听 17326。
+
+切换/重载前撤销就绪、阻断并关闭本应用内核连接，失败维持阻断。周期检测约 30 秒，未知或不匹配重新阻断；控制口阻断失败必须报错。保护仅涵盖经本应用路由的保护域名，并不保证整机或供应商两次巡检之间永不换 IP。固定模式的普通组切换菜单被禁用，使用看板第一跳切换。
 
 ### 4.11 日志与错误
 
@@ -365,6 +387,7 @@ UI 提供单项复制和「复制全部问题」。只写剪贴板，不调用�
 - 单个候选失败立即切到下一个；每轮按顺序尝试，最多 `maxRounds` 轮。
 - 并发上游连接不超过 `maxInflight`。
 - 一条入站连接的候选总耗时受 `dialBudgetMs` 约束，必须小于内核的 5 秒拨号超时（legacy 实测这个超时不可配置）。
+- 拨号和握手超时只约束连接建立阶段。上游握手成功后清除上游读写超时，入站进入转发前清除客户端读写超时；不把这些短超时当成响应或流式传输的空闲超时。转发阶段等待数据或真正的 EOF/错误，任一方向结束时关闭两端。
 - 失败候选进入 `cooldownMs` 冷却。
 - 全部候选失败时如实返回失败，不伪造响应；日志记录尝试过哪些候选、各自的错误和握手阶段。
 
@@ -381,11 +404,11 @@ legacy `tcp-relay.py` 的语义逐条编号，Rust 实现和测试按编号对�
 | S7 | HTTP 上游先匿名，失败后才带 Basic 凭据 | `s7_http_upstream_is_tried_anonymously_first` |
 | S8 | SOCKS5 上游先只报 0x00，失败后才只报 0x02 | `s8_socks5_upstream_offers_one_method_at_a_time` |
 | S9 | 全部失败如实回 0x01，不伪造响应 | `s9_s11_s12_all_candidates_failing_is_reported_truthfully` |
-| S10 | 双向转发，任一方向结束就关闭两边 | `s4_s10_fails_over_to_a_working_candidate_and_relays_bytes` |
+| S10 | 双向转发，不继承握手超时；任一方向结束就关闭两边 | `s4_s10_fails_over_to_a_working_candidate_and_relays_bytes`、`s10_delayed_first_response_survives_upstream_handshake_timeout`、`s10_streaming_gap_survives_upstream_step_timeout`、`s10_client_idle_survives_inbound_handshake_timeout`、`s10_direct_dial_caller_can_wait_for_response_after_handshake`、`s10_tunnelled_transfer_survives_handshake_timeout` |
 | S11 | 失败日志带上候选、错误、耗时和握手阶段；同类消息 2 秒内合并计数，第一条一定写入 | `s9_s11_s12_…`、`s2_…` |
 | S12 | 日志里只有 host:port(proto)，没有凭据 | `s4_fails_over_…`、`s9_s11_s12_…` |
 
-端到端测试 `crates/aec-dev/tests/relay_chain.rs`（需要 mihomo 二进制，`--include-ignored`）：客户端 → aec-mihomo → aec-relay → 失效候选 → 可用候选（本地假 SOCKS5）→ 本地 HTTP 服务。
+端到端测试 `crates/aec-dev/tests/relay_chain.rs`（需要 mihomo 二进制，`--include-ignored`）：客户端 → aec-mihomo → aec-relay → 失效候选 → 可用候选（本地假 SOCKS5）→ 本地 HTTP 服务。HTTP 服务延迟 1.8 秒才给首个响应，超过默认 1.2 秒握手超时，仍须完整返回。
 
 ### 4.14 权限
 

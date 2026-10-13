@@ -1,5 +1,5 @@
-//! `aec-dev`: development command line for the core library. It never writes system state: the only
-//! things it changes are files under the development data directory and its own core process.
+//! `aec-dev`: development command line for the core library. Global changes are dry-run; read-only
+//! status and desktop commands never launch or reconfigure applications.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -99,6 +99,8 @@ const USAGE: &str = "usage:
   aec-dev check [--local-only] [--proxy-port N] [--json]
                                    run G1, G2, R1, R2, R9 through this application's core, or through
                                    another proxy port (observation only; nothing is reconfigured)
+  aec-dev desktop check [--json]   read-only Claude Desktop active-connection routing sample (R11);
+                                   does not launch Claude or change the system proxy
   aec-dev enter [--direct] [--entry ID]...
                                    enter Agent mode (global changes are dry-run in this version);
                                    --entry starts a profile entry, e.g. edge or chrome
@@ -111,6 +113,75 @@ const USAGE: &str = "usage:
   aec-dev prompt [ID|--all] [--mask-ip]
                                    print troubleshooting prompts for the last report, restore
                                    failures, profile gaps and the takeover gate (nothing is sent)";
+
+#[cfg(windows)]
+fn desktop_cmd(args: &[String], data_dir: &Path) -> ExitCode {
+    use aec_core::checks::Status;
+    use aec_core::controller::ControllerState;
+    use aec_core::desktop::{observe, WindowsDesktopProbe};
+
+    if args.first().map(String::as_str) != Some("check") || args[1..].iter().any(|a| a != "--json")
+    {
+        eprintln!("usage: aec-dev desktop check [--json] [--data-dir <directory>]");
+        return ExitCode::from(2);
+    }
+    let set = match ProfileStore::new(data_dir).load() {
+        Ok(set) => set,
+        Err(_) => {
+            eprintln!("profile unavailable; select the tray's data directory with --data-dir");
+            return ExitCode::FAILURE;
+        }
+    };
+    let state: ControllerState = match std::fs::read(data_dir.join("state.json")) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(state) => state,
+            Err(_) => {
+                eprintln!("controller state unreadable");
+                return ExitCode::FAILURE;
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ControllerState::default(),
+        Err(_) => {
+            eprintln!("controller state unreadable");
+            return ExitCode::FAILURE;
+        }
+    };
+    let profile = match state.profile_id.as_ref() {
+        Some(id) => set.agent.iter().find(|p| &p.id == id),
+        None => set.agent.first(),
+    };
+    let Some(profile) = profile else {
+        eprintln!("active profile unavailable");
+        return ExitCode::FAILURE;
+    };
+    let core = aec_core::core::process::CoreManager::dev(&repo_root(), data_dir);
+    let result = observe(profile, core.ports.mixed, &WindowsDesktopProbe(&core));
+    let text = if args.iter().any(|a| a == "--json") {
+        serde_json::to_string_pretty(&result).expect("check serializes")
+    } else {
+        format!(
+            "R11: {:?} ({})\n{}",
+            result.status,
+            result
+                .reason
+                .as_deref()
+                .unwrap_or("observed routing matches"),
+            result
+                .evidence
+                .iter()
+                .map(|e| format!("{}: {}", e.source, e.detail))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    println!("{}", aec_core::prompts::redact(&text, false));
+    // Unknown is deliberately nonzero for scripts: an idle app is not a verified app.
+    if result.status == Status::Pass {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
 
 #[cfg(windows)]
 fn prompt_cmd(args: &[String], data_dir: &Path) -> ExitCode {
@@ -191,13 +262,13 @@ fn mode_cmd(cmd: &str, args: &[String], data_dir: &Path) -> ExitCode {
             .expect("profile sets have an agent profile"),
         Err(_) => profile::ProfileSet::default().agent.remove(0),
     };
-    // No settings store yet (ticket 13): takeover stays off, so every global change is a dry-run.
+    // Respect this installation's ports, but keep CLI global writes dry-run.
+    let mut settings = Settings::load(data_dir);
+    settings.takeover_enabled = false;
     let mut c = match Controller::open(
         LivePlatform::dev(&repo_root(), data_dir),
         data_dir,
-        Settings {
-            takeover_enabled: false,
-        },
+        settings,
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -798,6 +869,8 @@ fn main() -> ExitCode {
         Some("snapshots") => snapshots_cmd(&data_dir),
         #[cfg(windows)]
         Some("check") => check_cmd(&args[1..], &data_dir),
+        #[cfg(windows)]
+        Some("desktop") => desktop_cmd(&args[1..], &data_dir),
         #[cfg(windows)]
         Some(cmd @ ("enter" | "recheck" | "exit" | "ack" | "state")) => {
             mode_cmd(cmd, &args[1..], &data_dir)

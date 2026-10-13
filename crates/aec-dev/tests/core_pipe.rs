@@ -54,3 +54,38 @@ fn core_up_returns_when_stdout_is_a_pipe() {
     assert!(text.contains("core running"), "{text}");
     assert!(String::from_utf8_lossy(&down.stdout).contains("core stopped"));
 }
+
+#[test]
+fn core_commands_use_the_saved_mixed_port() {
+    let data = std::env::temp_dir().join(format!("aec-saved-port-{}", std::process::id()));
+    std::fs::create_dir_all(&data).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    aec_core::controller::Settings {
+        takeover_enabled: false,
+        core_mixed_port: Some(port),
+    }
+    .save(&data)
+    .unwrap();
+    let invoke = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_aec-dev"))
+            .args(args)
+            .env("AEC_DEV_DATA_DIR", &data)
+            .env_remove("AEC_DEV_PORTS")
+            .output()
+            .unwrap()
+    };
+    let generated = invoke(&["core", "config", "--direct"]);
+    let config = String::from_utf8_lossy(&generated.stdout);
+    let _ = std::fs::remove_dir_all(&data);
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    assert!(
+        config.contains(&format!("mixed-port: {port}\n")),
+        "saved port ignored by core command"
+    );
+}
