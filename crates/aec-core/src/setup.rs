@@ -21,7 +21,7 @@ use crate::profile::{
 
 /// The one credential the settings page manages.
 pub const CREDENTIAL_REF: &str = "exit";
-const MAX_BODY: usize = 16 * 1024;
+const MAX_BODY: usize = 128 * 1024;
 const MAX_PORTS: usize = 20;
 
 /// (key, label, Windows id, IANA name). The IANA name is what Chromium reports for the Windows id,
@@ -705,6 +705,21 @@ pub trait SetupBackend: Send + Sync {
     fn view(&self) -> SetupView;
     /// Validate and store. Errors are per field.
     fn save(&self, form: ExitForm) -> Result<(), Vec<FieldError>>;
+    fn startup(&self, _enabled: bool) -> Result<(), Vec<FieldError>> {
+        Err(vec![err("startup", "自启管理不可用")])
+    }
+    fn shortcuts(&self) -> Result<(), Vec<FieldError>> {
+        Err(vec![err("shortcuts", "入口管理不可用")])
+    }
+    fn dashboard(&self) -> Option<crate::dashboard::View> {
+        None
+    }
+    fn rules(&self, _form: crate::dashboard::RulesForm) -> Result<(), Vec<FieldError>> {
+        Err(vec![err("rules", "看板不可用")])
+    }
+    fn path(&self, _path: String) -> Result<(), Vec<FieldError>> {
+        Err(vec![err("path", "看板不可用")])
+    }
 }
 
 pub struct SetupServer {
@@ -789,13 +804,35 @@ fn handle(mut s: TcpStream, port: u16, token: &str, backend: &dyn SetupBackend) 
         return respond(&mut s, "403 Forbidden", "text/plain", "host rejected");
     }
     match (method, path) {
+        ("GET", "/dashboard" | "/state") if token_ok => match backend.dashboard() {
+            Some(view) => {
+                let (ctype, body) = if path == "/state" {
+                    (
+                        "application/json; charset=utf-8",
+                        serde_json::to_string(&view).expect("serializes"),
+                    )
+                } else {
+                    (
+                        "text/html; charset=utf-8",
+                        crate::dashboard::page(token, &view),
+                    )
+                };
+                respond(&mut s, "200 OK", ctype, &body)
+            }
+            None => respond(
+                &mut s,
+                "404 Not Found",
+                "text/plain",
+                "dashboard unavailable",
+            ),
+        },
         ("GET", "/setup") if token_ok => respond(
             &mut s,
             "200 OK",
             "text/html; charset=utf-8",
             &page(token, &backend.view()),
         ),
-        ("POST", "/save") if token_ok => {
+        ("POST", "/save" | "/rules" | "/path" | "/startup" | "/shortcuts") if token_ok => {
             if header(&head, "origin") != Some(format!("http://{me}").as_str()) {
                 return respond(&mut s, "403 Forbidden", "text/plain", "origin rejected");
             }
@@ -812,9 +849,36 @@ fn handle(mut s: TcpStream, port: u16, token: &str, backend: &dyn SetupBackend) 
                 }
             }
             let body = &buf[head_end..buf.len().min(head_end + len)];
-            let result = match serde_json::from_slice::<ExitForm>(body) {
-                Ok(form) => backend.save(form),
-                Err(e) => Err(vec![err("form", &format!("表单格式不对：{e}"))]),
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct PathForm {
+                path: String,
+            }
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct StartupForm {
+                enabled: bool,
+            }
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct EmptyForm {}
+            let malformed = || vec![err("form", "表单格式不对")];
+            let result = match path {
+                "/startup" => serde_json::from_slice::<StartupForm>(body)
+                    .map_err(|_| malformed())
+                    .and_then(|form| backend.startup(form.enabled)),
+                "/shortcuts" => serde_json::from_slice::<EmptyForm>(body)
+                    .map_err(|_| malformed())
+                    .and_then(|_| backend.shortcuts()),
+                "/rules" => serde_json::from_slice(body)
+                    .map_err(|_| malformed())
+                    .and_then(|form| backend.rules(form)),
+                "/path" => serde_json::from_slice::<PathForm>(body)
+                    .map_err(|_| malformed())
+                    .and_then(|form| backend.path(form.path)),
+                _ => serde_json::from_slice::<ExitForm>(body)
+                    .map_err(|_| malformed())
+                    .and_then(|form| backend.save(form)),
             };
             buf.iter_mut().for_each(|b| *b = 0);
             let reply = match result {
@@ -828,14 +892,19 @@ fn handle(mut s: TcpStream, port: u16, token: &str, backend: &dyn SetupBackend) 
                 &reply.to_string(),
             )
         }
-        (_, "/setup") | (_, "/save") => {
-            respond(&mut s, "403 Forbidden", "text/plain", "token rejected")
-        }
+        (
+            _,
+            "/setup" | "/save" | "/dashboard" | "/state" | "/rules" | "/path" | "/startup"
+            | "/shortcuts",
+        ) => respond(&mut s, "403 Forbidden", "text/plain", "token rejected"),
         _ => respond(&mut s, "404 Not Found", "text/plain", "not found"),
     }
 }
 
 impl SetupServer {
+    pub fn dashboard_url(&self) -> String {
+        format!("http://127.0.0.1:{}/dashboard?t={}", self.port, self.token)
+    }
     /// Listen on 127.0.0.1:`port` (0 picks a free port).
     pub fn start(
         port: u16,
@@ -1408,6 +1477,15 @@ mod tests {
 
     struct Fake(std::sync::Mutex<Vec<ExitForm>>);
     impl SetupBackend for Fake {
+        fn dashboard(&self) -> Option<crate::dashboard::View> {
+            Some(crate::dashboard::view(
+                &ProfileSet::default(),
+                "daily",
+                false,
+                false,
+                None,
+            ))
+        }
         fn view(&self) -> SetupView {
             view(&ProfileSet::default(), &input(None))
         }
@@ -1425,6 +1503,50 @@ mod tests {
         out
     }
 
+    #[test]
+    fn startup_routes_dispatch_only_valid_authenticated_changes() {
+        struct Entrances(std::sync::Mutex<(bool, usize)>);
+        impl SetupBackend for Entrances {
+            fn view(&self) -> SetupView {
+                view(&ProfileSet::default(), &input(None))
+            }
+            fn save(&self, _form: ExitForm) -> Result<(), Vec<FieldError>> {
+                unreachable!()
+            }
+            fn startup(&self, enabled: bool) -> Result<(), Vec<FieldError>> {
+                self.0.lock().unwrap().0 = enabled;
+                Ok(())
+            }
+            fn shortcuts(&self) -> Result<(), Vec<FieldError>> {
+                self.0.lock().unwrap().1 += 1;
+                Ok(())
+            }
+            fn dashboard(&self) -> Option<crate::dashboard::View> {
+                let mut v =
+                    crate::dashboard::view(&ProfileSet::default(), "daily", false, false, None);
+                v.autostart = self.0.lock().unwrap().0;
+                Some(v)
+            }
+        }
+        let backend = Arc::new(Entrances(std::sync::Mutex::new((false, 0))));
+        let srv = SetupServer::start(0, "tok".into(), backend.clone()).unwrap();
+        let port = srv.port;
+        let post = |path: &str, body: &str| {
+            send(port, &format!("POST /{path}?t=tok HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\nContent-Length: {}\r\n\r\n{body}", body.len()))
+        };
+        assert!(post("startup", r#"{"enabled":true}"#).contains("\"ok\":true"));
+        assert!(send(
+            port,
+            &format!("GET /state?t=tok HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n")
+        )
+        .contains("\"autostart\":true"));
+        assert!(post("startup", r#"{"enabled":"false"}"#).contains("\"ok\":false"));
+        assert!(backend.0.lock().unwrap().0);
+        assert!(post("startup", r#"{"enabled":false}"#).contains("\"ok\":true"));
+        assert!(post("shortcuts", "{}").contains("\"ok\":true"));
+        assert!(post("shortcuts", r#"{"command":"must-not-run"}"#).contains("\"ok\":false"));
+        assert_eq!(*backend.0.lock().unwrap(), (false, 1));
+    }
     #[test]
     fn server_requires_token_host_and_origin() {
         let backend = Arc::new(Fake(Default::default()));
@@ -1455,5 +1577,32 @@ mod tests {
         assert!(backend.0.lock().unwrap().is_empty());
         assert!(post(&format!("http://127.0.0.1:{port}")).contains("\"ok\":true"));
         assert_eq!(backend.0.lock().unwrap()[0].username, "alice");
+        for path in ["dashboard", "state"] {
+            assert!(
+                send(port, &format!("GET /{path}?t=bad HTTP/1.1\r\n{h}\r\n"))
+                    .starts_with("HTTP/1.1 403")
+            );
+            assert!(send(
+                port,
+                &format!("GET /{path}?t=tok HTTP/1.1\r\nHost: evil.example\r\n\r\n")
+            )
+            .starts_with("HTTP/1.1 403"));
+            assert!(
+                send(port, &format!("GET /{path}?t=tok HTTP/1.1\r\n{h}\r\n"))
+                    .starts_with("HTTP/1.1 200")
+            );
+        }
+        for path in ["rules", "path", "startup", "shortcuts"] {
+            let body = r#"{"path":"direct","password":"must-not-echo"}"#;
+            let post = |token: &str, origin: &str| {
+                send(port,&format!("POST /{path}?t={token} HTTP/1.1\r\n{h}Origin: {origin}\r\nContent-Length: {}\r\n\r\n{body}",body.len()))
+            };
+            assert!(post("bad", &format!("http://127.0.0.1:{port}")).starts_with("HTTP/1.1 403"));
+            assert!(post("tok", "http://evil.example").starts_with("HTTP/1.1 403"));
+            assert!(send(port, &format!("POST /{path}?t=tok HTTP/1.1\r\nHost: evil.example\r\nOrigin: http://127.0.0.1:{port}\r\nContent-Length: {}\r\n\r\n{body}", body.len())).starts_with("HTTP/1.1 403"));
+            let response = post("tok", &format!("http://127.0.0.1:{port}"));
+            assert!(response.contains("表单格式不对"));
+            assert!(!response.contains("must-not-echo"));
+        }
     }
 }

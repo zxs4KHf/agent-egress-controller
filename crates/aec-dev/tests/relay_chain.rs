@@ -18,6 +18,9 @@ fn http_target() -> u16 {
             let mut s = s;
             let mut buf = [0u8; 2048];
             let _ = s.read(&mut buf);
+            // Longer than the default relay's 1200 ms handshake timeout: a successful CONNECT
+            // must remain usable while the target prepares its first response.
+            std::thread::sleep(Duration::from_millis(1800));
             let _ = s.write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Length: 14\r\nConnection: close\r\n\r\nrelay-chain-ok",
             );
@@ -73,6 +76,142 @@ fn aec_dev(data: &Path, args: &[&str]) -> std::process::Output {
 
 fn listening(port: u16) -> bool {
     TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_millis(300)).is_ok()
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "needs pinned mihomo and aec-relay; loopback only, no global state"]
+fn fixed_gate_blocks_reload_and_closes_existing_connections() {
+    use aec_core::{
+        core::{config, process::CoreManager, CorePorts},
+        profile::{Candidate, ProfileSet, UpstreamProto},
+        windows::WindowsHost,
+    };
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    let data = std::env::temp_dir().join(format!("aec-fixed-chain-{}", std::process::id()));
+    let mut manager = CoreManager::dev(&root, &data);
+    manager.relay_bin = PathBuf::from(env!("CARGO_BIN_EXE_aec-relay"));
+    manager.ports = CorePorts {
+        mixed: 32893,
+        controller: 32909,
+        dns: 32553,
+        relay: 32325,
+        tunnel: 32326,
+    };
+    let mut p = ProfileSet::default().agent.remove(0);
+    p.egress.fixed_exit = true;
+    p.egress.expected.ip = Some("198.51.100.7".into());
+    p.egress.candidates = vec![Candidate {
+        id: "fake".into(),
+        host: "127.0.0.1".into(),
+        port: socks5_upstream(),
+        proto: UpstreamProto::Socks5,
+        credential_ref: None,
+    }];
+    p.targets = vec![aec_core::profile::Target {
+        domain: HOST.into(),
+        trace: false,
+    }];
+    p.routing.rules.clear();
+    p.routing.final_target = "DIRECT".into();
+    let relay = config::relay_config(&p, &manager.ports, &config::NoCredentials).unwrap();
+    let target = http_target();
+    let request = |port| {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
+        write!(s,"GET http://{HOST}:{target}/ HTTP/1.1\r\nHost: {HOST}:{target}\r\nConnection: close\r\n\r\n").unwrap();
+        let mut out = String::new();
+        let _ = s.read_to_string(&mut out);
+        out
+    };
+    let result = std::panic::catch_unwind(|| {
+        manager
+            .up_with_relay(&WindowsHost, &relay, |ports, secret| {
+                config::from_profile(&p, ports, secret, &config::NoCredentials)
+                    .map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert!(
+            !request(manager.ports.mixed).contains("relay-chain-ok"),
+            "startup must be blocked"
+        );
+        assert!(
+            request(32327).contains("relay-chain-ok"),
+            "probe must work while gate is blocked"
+        );
+        manager
+            .select(&WindowsHost, "relay", aec_core::fixed::TRANSPORT)
+            .unwrap();
+        assert!(
+            request(manager.ports.mixed).contains("relay-chain-ok"),
+            "protected rule must override DIRECT"
+        );
+        let hold = TcpListener::bind("127.0.0.1:0").unwrap();
+        let hold_port = hold.local_addr().unwrap().port();
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut peer, _) = hold.accept().unwrap();
+            let mut b = [0];
+            peer.read_exact(&mut b).unwrap();
+            let _ = arrived_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(20));
+        });
+        let mut active = TcpStream::connect(("127.0.0.1", manager.ports.mixed)).unwrap();
+        active
+            .set_read_timeout(Some(Duration::from_secs(8)))
+            .unwrap();
+        write!(
+            active,
+            "CONNECT {HOST}:{hold_port} HTTP/1.1\r\nHost: {HOST}\r\n\r\n"
+        )
+        .unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut b = [0];
+            active.read_exact(&mut b).unwrap();
+            head.push(b[0]);
+        }
+        assert!(String::from_utf8(head).unwrap().contains("200"));
+        active.write_all(b"x").unwrap();
+        arrived_rx.recv_timeout(Duration::from_secs(8)).unwrap();
+        manager
+            .reload(&WindowsHost, &p, &config::NoCredentials)
+            .unwrap();
+        assert!(
+            !request(manager.ports.mixed).contains("relay-chain-ok"),
+            "reload must remain blocked"
+        );
+        let mut byte = [0];
+        match active.read(&mut byte) {
+            Ok(0) => {}
+            Err(e) => assert!(!matches!(
+                e.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )),
+            other => panic!("old connection remained usable: {other:?}"),
+        }
+        let _ = release_tx.send(());
+        assert!(
+            request(32327).contains("relay-chain-ok"),
+            "probe must still work after reload"
+        );
+        manager
+            .select(&WindowsHost, "relay", aec_core::fixed::TRANSPORT)
+            .unwrap();
+        assert!(request(manager.ports.mixed).contains("relay-chain-ok"));
+    });
+    let cleanup = manager.down(&WindowsHost);
+    if cleanup.is_ok() {
+        let _ = std::fs::remove_dir_all(&data);
+    }
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+    cleanup.unwrap();
 }
 
 #[test]

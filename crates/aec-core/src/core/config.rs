@@ -125,6 +125,15 @@ fn local_cidr_rules(y: &mut String) {
 /// Render rules in their declared order. Notes are comments, never YAML values or extra rules.
 fn rules(profile: &AgentProfile) -> String {
     let mut y = String::from("rules:\n");
+    if profile.egress.fixed_exit {
+        for t in &profile.targets {
+            let _ = writeln!(
+                y,
+                "  - {}",
+                quote(&format!("DOMAIN-SUFFIX,{},relay", t.domain))
+            );
+        }
+    }
     for rule in &profile.routing.rules {
         if let Some(note) = &rule.note {
             for line in note.lines() {
@@ -195,6 +204,24 @@ pub fn from_profile(
     if profile.egress.candidates.is_empty() {
         return Err(ConfigError::NoCandidates);
     }
+    if profile.egress.fixed_exit
+        && (profile
+            .egress
+            .expected
+            .ip
+            .as_ref()
+            .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+            .is_none()
+            || crate::fixed::probe_port(ports).is_none()
+            || [ports.relay, ports.tunnel]
+                .iter()
+                .any(|p| ports.all().contains(p))
+            || ports.relay == ports.tunnel)
+    {
+        return Err(ConfigError::InvalidRouting(
+            "fixed exit requires a valid exact IP and distinct listener ports".into(),
+        ));
+    }
     let route_errors = crate::profile::validate_routing(&profile.routing);
     if let Some(error) = route_errors.first() {
         return Err(ConfigError::InvalidRouting(format!(
@@ -224,7 +251,7 @@ pub fn from_profile(
     let _ = writeln!(
         y,
         "proxies:\n  - name: {}\n    type: socks5\n    server: \"127.0.0.1\"\n    port: {}\n    udp: false",
-        quote(RELAY_PROXY),
+        quote(if profile.egress.fixed_exit { crate::fixed::TRANSPORT } else { RELAY_PROXY }),
         ports.relay
     );
     for outbound in &profile.routing.outbounds {
@@ -273,11 +300,35 @@ pub fn from_profile(
             );
         }
     }
-    y.push_str(if profile.routing.groups.is_empty() && tunnel.is_none() {
-        "proxy-groups: []\n"
-    } else {
-        "proxy-groups:\n"
-    });
+    y.push_str(
+        if profile.routing.groups.is_empty() && tunnel.is_none() && !profile.egress.fixed_exit {
+            "proxy-groups: []\n"
+        } else {
+            "proxy-groups:\n"
+        },
+    );
+    if profile.egress.fixed_exit {
+        let _ = writeln!(
+            y,
+            "  - name: \"relay\"\n    type: select\n    proxies:\n      - \"REJECT\"\n      - {}",
+            quote(crate::fixed::TRANSPORT)
+        );
+        let _ = writeln!(
+            y,
+            "  - name: {}\n    type: select\n    proxies:\n      - \"DIRECT\"",
+            quote(crate::fixed::FIRST_HOP)
+        );
+        if let Some(t) = tunnel {
+            let _ = writeln!(y, "      - {}", quote(TUNNEL_GROUP));
+            for i in 0..t.servers.len() {
+                let _ = writeln!(
+                    y,
+                    "      - {}",
+                    quote(&format!("{TUNNEL_PROXY_PREFIX}{}", i + 1))
+                );
+            }
+        }
+    }
     for group in &profile.routing.groups {
         let kind = match group.kind {
             RoutingGroupKind::Select => "select",
@@ -315,6 +366,8 @@ pub fn from_profile(
                 quote(&format!("{TUNNEL_PROXY_PREFIX}{}", i + 1))
             );
         }
+    }
+    if tunnel.is_some() || profile.egress.fixed_exit {
         // The relay's way in: a loopback-only listener whose every connection goes to the tunnel,
         // whatever the rules below say.
         let _ = writeln!(
@@ -322,8 +375,11 @@ pub fn from_profile(
             "listeners:\n  - name: {}\n    type: mixed\n    listen: \"127.0.0.1\"\n    port: {}\n    udp: false\n    proxy: {}",
             quote(TUNNEL_LISTENER),
             ports.tunnel,
-            quote(TUNNEL_GROUP)
+            quote(if profile.egress.fixed_exit { crate::fixed::FIRST_HOP } else { TUNNEL_GROUP })
         );
+        if profile.egress.fixed_exit {
+            let _ = writeln!(y, "  - name: \"aec-exit-probe\"\n    type: mixed\n    listen: \"127.0.0.1\"\n    port: {}\n    udp: false\n    proxy: {}", crate::fixed::probe_port(ports).expect("validated"), quote(crate::fixed::TRANSPORT));
+        }
     }
     y.push_str(&rules(profile));
     Ok(y)
@@ -393,7 +449,17 @@ pub fn relay_config(
     }
     // With a tunnel, every candidate is tried through it first; the direct attempts follow only when
     // the profile allows them. The exit host is the same either way, so S1 still holds.
-    if let Some(t) = profile.egress.tunnel.as_ref().filter(|t| t.enabled) {
+    if profile.egress.fixed_exit {
+        for u in &mut candidates {
+            u.via = Some(format!("127.0.0.1:{}", ports.tunnel));
+            u.step_timeout_ms = profile
+                .egress
+                .tunnel
+                .as_ref()
+                .filter(|t| t.enabled)
+                .map(|t| t.step_timeout_ms.into());
+        }
+    } else if let Some(t) = profile.egress.tunnel.as_ref().filter(|t| t.enabled) {
         let tunnelled = candidates.iter().cloned().map(|mut u| {
             u.via = Some(format!("127.0.0.1:{}", ports.tunnel));
             u.step_timeout_ms = Some(t.step_timeout_ms.into());

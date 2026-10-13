@@ -83,8 +83,15 @@ impl Layout {
     }
 }
 
-#[derive(Debug)]
 pub enum Cmd {
+    Startup(bool, Sender<Result<(), Vec<FieldError>>>),
+    Shortcuts(Sender<Result<(), Vec<FieldError>>>),
+    Save(Box<ExitForm>, Sender<Result<(), Vec<FieldError>>>),
+    Rules(
+        aec_core::dashboard::RulesForm,
+        Sender<Result<(), Vec<FieldError>>>,
+    ),
+    Path(String, Sender<Result<(), Vec<FieldError>>>),
     Enter,
     Open(String),
     Switch {
@@ -114,6 +121,7 @@ pub struct Note {
 
 #[derive(Debug, Clone)]
 pub struct Shared {
+    pub fixed_blocked: bool,
     pub mode: Mode,
     /// Set while a command runs; menu actions are disabled.
     pub busy: Option<&'static str>,
@@ -142,6 +150,7 @@ fn agent_profile(data_dir: &Path) -> AgentProfile {
 }
 
 pub struct Worker {
+    last_fixed_probe: std::time::Instant,
     layout: Layout,
     controller: Controller<LivePlatform>,
     shared: SharedRef,
@@ -163,6 +172,7 @@ impl Worker {
         )
         .map_err(|e| e.to_string())?;
         let w = Self {
+            last_fixed_probe: std::time::Instant::now(),
             layout,
             controller,
             shared,
@@ -195,6 +205,7 @@ impl Worker {
         {
             let mut s = self.shared.lock().expect("lock");
             s.mode = self.controller.state().mode;
+            s.fixed_blocked = p.egress.fixed_exit && !self.controller.platform().fixed_verified();
             s.busy = busy;
             s.configured = profile::validate(&set).is_empty();
             s.entries = p
@@ -244,6 +255,9 @@ impl Worker {
                 continue;
             }
             let label = match &cmd {
+                Cmd::Startup(..) | Cmd::Shortcuts(..) => "正在保存启动入口…",
+                Cmd::Save(..) | Cmd::Rules(..) => "正在保存设置…",
+                Cmd::Path(..) => "正在核对固定出口…",
                 Cmd::Enter => "正在进入 Agent 模式…",
                 Cmd::Open(_) => "正在打开并检测…",
                 Cmd::Switch { .. } => "正在切换路由并重新检测…",
@@ -292,6 +306,46 @@ impl Worker {
     fn handle(&mut self, cmd: Cmd) -> bool {
         let data_dir = self.layout.data_dir.clone();
         match cmd {
+            Cmd::Startup(enabled, done) => {
+                let result = crate::startup::set(enabled);
+                match &result {
+                    Ok(()) => self.note(
+                        "登录自启设置已保存",
+                        if enabled {
+                            "下次登录启动本安装并尝试进入 Agent 模式；未恢复会话需要先恢复。"
+                        } else {
+                            "下次登录不再自动启动本安装。"
+                        },
+                        false,
+                    ),
+                    Err(e) => self.note("登录自启未保存", e, true),
+                }
+                let _ = done.send(result.map_err(field_error));
+            }
+            Cmd::Shortcuts(done) => {
+                let result = crate::startup::shortcuts();
+                match &result {
+                    Ok(()) => self.note(
+                        "启动入口已创建",
+                        "桌面和开始菜单已有托盘、看板快捷方式；可在 Windows 搜索 Agent Egress。",
+                        false,
+                    ),
+                    Err(e) => self.note("创建入口失败", e, true),
+                }
+                let _ = done.send(result.map_err(field_error));
+            }
+            Cmd::Save(form, done) => {
+                let result = self.save_settings(*form);
+                let _ = done.send(result);
+            }
+            Cmd::Rules(form, done) => {
+                let result = self.edit_rules(form);
+                let _ = done.send(result.map_err(field_error));
+            }
+            Cmd::Path(path, done) => {
+                let result = self.change_path(path);
+                let _ = done.send(result.map_err(field_error));
+            }
             Cmd::Enter => {
                 let set = load_set(&data_dir);
                 if !profile::validate(&set).is_empty() {
@@ -330,7 +384,7 @@ impl Worker {
                     true,
                 ),
             },
-            Cmd::Recheck => match self.controller.recheck(&agent_profile(&data_dir)) {
+            Cmd::Recheck => match self.recheck() {
                 Ok(_) => self.after_checks("重新检测完成"),
                 Err(f) => self.note("没能重新检测", &f.to_string(), true),
             },
@@ -383,11 +437,47 @@ impl Worker {
             ),
             Some(KeepOutcome::Failed(e)) => self.note("系统代理巡检失败", &e, true),
         }
+        let p = agent_profile(&self.layout.data_dir);
+        if p.egress.fixed_exit
+            && matches!(
+                self.controller.state().mode,
+                Mode::AgentReady | Mode::AgentUnverified
+            )
+            && self.last_fixed_probe.elapsed() >= std::time::Duration::from_secs(30)
+        {
+            self.last_fixed_probe = std::time::Instant::now();
+            if let Err(e) = self.controller.platform().verify_fixed(&p) {
+                let was_verified = self.controller.platform().fixed_verified();
+                let blocked = self.controller.platform().block_fixed();
+                self.shared.lock().expect("lock").fixed_blocked = true;
+                let _ = self.controller.invalidate_routing_checks();
+                if let Err(block_error) = blocked {
+                    self.note(
+                        "固定出口失去验证，阻断操作失败",
+                        &format!(
+                            "{}；{}。请停止使用受保护服务并恢复会话。",
+                            e.message, block_error.message
+                        ),
+                        true,
+                    );
+                } else if was_verified {
+                    self.note("固定出口已阻断", &e.message, true);
+                }
+            }
+        }
         self.write_report();
         self.publish(None);
     }
 
     fn switch_route(&mut self, group: &str, member: &str) {
+        if agent_profile(&self.layout.data_dir).egress.fixed_exit {
+            self.note(
+                "请使用看板管理规则",
+                "固定出口模式的变更需要阻断、断开旧连接和重新核对出口。",
+                true,
+            );
+            return;
+        }
         let result = (|| -> Result<(), String> {
             let store = ProfileStore::new(&self.layout.data_dir);
             let mut set = store.load().map_err(|e| e.to_string())?;
@@ -489,11 +579,155 @@ impl Worker {
     }
 }
 
+fn field_error(message: String) -> Vec<FieldError> {
+    vec![FieldError {
+        path: "form".into(),
+        message,
+    }]
+}
+
+impl Worker {
+    fn active(&self) -> bool {
+        matches!(
+            self.controller.state().mode,
+            Mode::AgentReady | Mode::AgentUnverified
+        )
+    }
+    fn block(&mut self) -> Result<(), String> {
+        self.shared.lock().expect("lock").fixed_blocked = true;
+        let invalidate = self.controller.invalidate_routing_checks();
+        let block = self.controller.platform().block_fixed();
+        invalidate.and(block).map_err(|e| e.to_string())
+    }
+    fn open_fixed(&mut self, p: &AgentProfile) -> Result<(), String> {
+        self.controller
+            .platform()
+            .open_fixed(p)
+            .map_err(|e| e.to_string())?;
+        self.shared.lock().expect("lock").fixed_blocked = false;
+        self.last_fixed_probe = std::time::Instant::now();
+        self.controller.recheck(p).map_err(|e| e.to_string())?;
+        self.write_report();
+        Ok(())
+    }
+    fn recheck(&mut self) -> Result<(), aec_core::controller::Fault> {
+        let p = agent_profile(&self.layout.data_dir);
+        if p.egress.fixed_exit {
+            self.block()
+                .and_then(|()| self.open_fixed(&p))
+                .map_err(|e| aec_core::controller::Fault::new("FIXED_EXIT_UNVERIFIED", e))?;
+        } else {
+            self.controller.recheck(&p)?;
+        }
+        Ok(())
+    }
+    fn change_path(&mut self, path: String) -> Result<(), String> {
+        let store = ProfileStore::new(&self.layout.data_dir);
+        let mut set = store.load().map_err(|e| e.to_string())?;
+        if aec_core::fixed::path_member(&set.agent[0], &path).is_none() {
+            return Err("所选连接路径不可用".into());
+        }
+        if !set.agent[0].egress.fixed_exit && self.controller.state().mode != Mode::Daily {
+            return Err("首次启用固定出口保护需要先退出 Agent 模式".into());
+        }
+        if !self.active() && self.controller.state().mode != Mode::Daily {
+            return Err("当前模式不可修改连接路径".into());
+        }
+        set.agent[0].egress.fixed_exit = true;
+        set.agent[0].egress.connection_path = Some(path);
+        let errors = profile::validate(&set);
+        if !errors.is_empty() {
+            return Err("请先在出口设置中配置精确 IP 和有效出口参数".into());
+        }
+        if self.active() {
+            self.block()?;
+        }
+        store.save(&set).map_err(|e| e.to_string())?;
+        if self.active() {
+            self.open_fixed(&set.agent[0])?;
+        }
+        Ok(())
+    }
+    fn edit_rules(&mut self, form: aec_core::dashboard::RulesForm) -> Result<(), String> {
+        let store = ProfileStore::new(&self.layout.data_dir);
+        let mut set = store.load().map_err(|e| e.to_string())?;
+        if self.active() && !set.agent[0].egress.fixed_exit {
+            return Err("先退出 Agent 模式，再启用固定出口保护或修改规则".into());
+        }
+        if !self.active() && self.controller.state().mode != Mode::Daily {
+            return Err("当前模式不可编辑规则".into());
+        }
+        aec_core::dashboard::apply(&mut set, form).map_err(|errors| {
+            errors
+                .into_iter()
+                .map(|e| format!("{}: {}", e.path, e.message))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })?;
+        if self.active() {
+            self.block()?;
+        }
+        store.save(&set).map_err(|e| e.to_string())?;
+        if self.active() {
+            self.controller
+                .platform()
+                .core
+                .reload(
+                    &aec_core::windows::WindowsHost,
+                    &set.agent[0],
+                    &WindowsCredentials,
+                )
+                .map_err(|e| e.to_string())?;
+            self.open_fixed(&set.agent[0])?;
+        }
+        Ok(())
+    }
+    fn save_settings(&mut self, form: ExitForm) -> Result<(), Vec<FieldError>> {
+        if self.controller.state().mode != Mode::Daily {
+            return Err(field_error(
+                "现在处于 Agent 模式，先退出再修改出口设置".into(),
+            ));
+        }
+        let mut set = load_set(&self.layout.data_dir);
+        let creds = WindowsCredentials;
+        let user = creds
+            .user_name(setup::CREDENTIAL_REF)
+            .map_err(field_error)?;
+        let stored = creds
+            .exists(setup::TUNNEL_CREDENTIAL_REF)
+            .map_err(field_error)?;
+        let applied = setup::apply(&mut set, &form, user.as_deref(), stored)?;
+        for (reference, change) in [
+            (setup::CREDENTIAL_REF, applied.exit),
+            (setup::TUNNEL_CREDENTIAL_REF, applied.tunnel),
+        ] {
+            match change {
+                CredentialChange::Store { user, pass } => {
+                    creds.store(reference, &user, &pass).map_err(field_error)?
+                }
+                CredentialChange::Delete => {
+                    creds.delete(reference).map_err(field_error)?;
+                }
+                CredentialChange::Keep => {}
+            }
+        }
+        ProfileStore::new(&self.layout.data_dir)
+            .save(&set)
+            .map_err(|e| field_error(e.to_string()))?;
+        Settings {
+            takeover_enabled: applied.takeover,
+        }
+        .save(&self.layout.data_dir)
+        .map_err(|e| field_error(e.to_string()))?;
+        Ok(())
+    }
+}
+
 /// The settings page's view of this installation.
 pub struct Backend {
+    pub tx: Sender<Cmd>,
     pub data_dir: PathBuf,
     pub shared: SharedRef,
-    pub notify: Box<dyn Fn() + Send + Sync>,
 }
 
 impl Backend {
@@ -503,6 +737,50 @@ impl Backend {
 }
 
 impl SetupBackend for Backend {
+    fn dashboard(&self) -> Option<aec_core::dashboard::View> {
+        let s = self.shared.lock().expect("lock").clone();
+        let mut view = aec_core::dashboard::view(
+            &load_set(&self.data_dir),
+            s.mode.as_str(),
+            s.busy.is_some(),
+            s.fixed_blocked,
+            s.summary,
+        );
+        view.autostart = crate::startup::enabled();
+        Some(view)
+    }
+    fn startup(&self, enabled: bool) -> Result<(), Vec<FieldError>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(Cmd::Startup(enabled, tx))
+            .map_err(|_| field_error("托盘服务已退出".into()))?;
+        rx.recv()
+            .map_err(|_| field_error("托盘服务已退出".into()))?
+    }
+    fn shortcuts(&self) -> Result<(), Vec<FieldError>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(Cmd::Shortcuts(tx))
+            .map_err(|_| field_error("托盘服务已退出".into()))?;
+        rx.recv()
+            .map_err(|_| field_error("托盘服务已退出".into()))?
+    }
+    fn rules(&self, form: aec_core::dashboard::RulesForm) -> Result<(), Vec<FieldError>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(Cmd::Rules(form, tx))
+            .map_err(|_| field_error("托盘服务已退出".into()))?;
+        rx.recv()
+            .map_err(|_| field_error("托盘服务已退出".into()))?
+    }
+    fn path(&self, path: String) -> Result<(), Vec<FieldError>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(Cmd::Path(path, tx))
+            .map_err(|_| field_error("托盘服务已退出".into()))?;
+        rx.recv()
+            .map_err(|_| field_error("托盘服务已退出".into()))?
+    }
     fn view(&self) -> SetupView {
         let set = load_set(&self.data_dir);
         let user = WindowsCredentials
@@ -524,45 +802,11 @@ impl SetupBackend for Backend {
     }
 
     fn save(&self, form: ExitForm) -> Result<(), Vec<FieldError>> {
-        let fe = |m: String| {
-            vec![FieldError {
-                path: "form".into(),
-                message: m,
-            }]
-        };
-        if self.locked() {
-            return Err(fe("现在处于 Agent 模式，先退出再修改设置".into()));
-        }
-        let mut set = load_set(&self.data_dir);
-        let creds = WindowsCredentials;
-        let user = creds.user_name(setup::CREDENTIAL_REF).map_err(fe)?;
-        let tunnel_stored = creds.exists(setup::TUNNEL_CREDENTIAL_REF).map_err(fe)?;
-        let applied = setup::apply(&mut set, &form, user.as_deref(), tunnel_stored)?;
-        for (reference, change) in [
-            (setup::CREDENTIAL_REF, applied.exit),
-            (setup::TUNNEL_CREDENTIAL_REF, applied.tunnel),
-        ] {
-            match change {
-                CredentialChange::Store { user, pass } => {
-                    creds.store(reference, &user, &pass).map_err(fe)?
-                }
-                CredentialChange::Delete => {
-                    creds.delete(reference).map_err(fe)?;
-                }
-                CredentialChange::Keep => {}
-            }
-        }
-        let takeover = applied.takeover;
-        ProfileStore::new(&self.data_dir)
-            .save(&set)
-            .map_err(|e| fe(e.to_string()))?;
-        Settings {
-            takeover_enabled: takeover,
-        }
-        .save(&self.data_dir)
-        .map_err(|e| fe(e.to_string()))?;
-        self.shared.lock().expect("lock").configured = true;
-        (self.notify)();
-        Ok(())
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(Cmd::Save(Box::new(form), tx))
+            .map_err(|_| field_error("托盘服务已退出".into()))?;
+        rx.recv()
+            .map_err(|_| field_error("托盘服务已退出".into()))?
     }
 }

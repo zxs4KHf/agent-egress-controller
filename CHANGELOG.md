@@ -4,7 +4,13 @@
 
 ## [未发布]
 
+## [0.3.0] - 2026-10-12
+
 ### 新增
+
+- 托盘本机看板，受保护站点和有序规则增删排序，类型/出站选项及常用内容建议。
+- 固定 ISP 第一跳选择（直连、官方隧道自动选择、单节点）；切换/重载先阻断与断开旧连接，精确出口检测后放行，约 30 秒巡检。
+- 托盘和看板登录自启开关，单个当前用户启动项；创建桌面与开始菜单的托盘/看板快捷方式，`--dashboard` 转交已有实例。
 
 - Claude 桌面版系统代理接入与 ISP 分流验收说明，无需专用启动入口，保留自定义路由和用户进程。
 - R11 桌面连接只读抽样及 `aec-dev desktop check`：关联稳定的 Windows 进程连接与本应用内核当前连接表，核对出站链/选择；缺证据未知，Claude 域名走 DIRECT/REJECT 或路由不一致告警，不把内核探测当成桌面证据。
@@ -12,6 +18,11 @@
 ### 修改
 
 - Issue #1 任务说明按维护者确认改为正常启动的 Claude 桌面版遵循系统代理和已有分流，废弃专用启动/关闭及入口迁移方案。更新 README、用户指南和行为规格的验证边界。
+
+### 修复
+
+- relay 成功握手后清除两端的握手超时，避免较慢的首个响应、流式响应间隔或客户端空闲被误当成断线。拨号/握手预算继续生效；任一方向真正结束时仍关闭两端。
+- 固定保护的桌面流量识别要求实际传输出站链；保留自定义站点检测方式，新站点仅测可达性，不伪造 IP 证据。
 
 ## [0.2.0] - 2026-10-12
 
@@ -78,6 +89,7 @@
 - 时区真实写入和真实出口端到端还没有在维护者以外的机器上验证过。
 - 没有开机自启，没有安装包；通知来源显示为 `aec-tray.exe`。
 
-[未发布]: https://github.com/zxs4KHf/agent-egress-controller/compare/v0.2.0...HEAD
+[未发布]: https://github.com/zxs4KHf/agent-egress-controller/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/zxs4KHf/agent-egress-controller/releases/tag/v0.3.0
 [0.2.0]: https://github.com/zxs4KHf/agent-egress-controller/releases/tag/v0.2.0
 [0.1.0]: https://github.com/zxs4KHf/agent-egress-controller/releases/tag/v0.1.0

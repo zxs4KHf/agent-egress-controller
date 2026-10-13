@@ -1,10 +1,10 @@
-# 0.2.0 用户交付指南
+# 0.3.0 用户交付指南
 
 本产品用于 Windows 10/11 x64 的本机 AI 出口控制，包含托盘、mihomo、Rust relay 和配置命令行。用户需要自己的 HTTP/SOCKS5 出口；远程 AI API 网关本身需要另外部署。
 
 ## 下载与首次使用
 
-从 [GitHub Releases](https://github.com/zxs4KHf/agent-egress-controller/releases) 下载 0.2.0 zip 和 SHA256SUMS.txt。PowerShell 用 `Get-FileHash .\AgentEgressController-0.2.0-portable.zip -Algorithm SHA256` 对照校验。完整解压到可写目录，保留 portable.flag、bin 目录、三个应用 exe 和说明文件。
+从 [GitHub Releases](https://github.com/zxs4KHf/agent-egress-controller/releases) 下载 0.3.0 zip 和 SHA256SUMS.txt。PowerShell 用 `Get-FileHash .\AgentEgressController-0.3.0-portable.zip -Algorithm SHA256` 对照校验。完整解压到可写目录，保留 portable.flag、bin 目录、三个应用 exe 和说明文件。
 
 双击 aec-tray.exe，在首次打开的本机设置页填出口、端口、协议和账号。端口可逐项附协议，例如 `12324/socks5`、`12323/http`；同一候选池的地址必须相同，备用端口用于拨号切换，不表示多个出口。
 
@@ -51,7 +51,7 @@ select 组导入后可从托盘选择成员，仅 switchable: true 会显示选�
 
 ### Claude 桌面版接入与核验
 
-无需托盘启动入口，也不改变 Claude 的安装文件、配置、语言或进程归属。0.2.0 已有系统代理接管；下面的 R11 和 `desktop check` 是源码/下一版本的新增功能，0.2.0 发布包尚未包含。
+无需托盘启动入口，也不改变 Claude 的安装文件、配置、语言或进程归属。0.3.0 包含系统代理接管、R11 和 `desktop check`。
 
 1. 设置页填写自己的 ISP 出口。需要中转时启用隧道；中转服务器不是最终出口。
 2. 选择「分流」，保留附加域名 `anthropic.com`、`claude.ai`、`claude.com`、`claudeusercontent.com`。`DOMAIN-SUFFIX,anthropic.com` 覆盖 `api.anthropic.com`；仅有 `www.anthropic.com` 不覆盖它。AI 域名规则应先于 GEOSITE/GEOIP 和 MATCH。导入表不会自动补规则或被覆盖，需要自己检查 Claude 域名命中的组、成员和固定 ISP 节点。
@@ -84,10 +84,30 @@ Electron 的 [系统代理模式](https://www.electronjs.org/docs/latest/api/str
 
 ## 退出、更新与交付
 
+如果 Claude 能登录，但 Code 请求反复 `Request failed`/`Retry`，应核对请求路由与同一时间的 relay 日志；登录成功不代表长请求能持续传输。0.3.0 修复 relay 将拨号/握手超时带入传输阶段的问题，连接成功后不会因这些短超时主动切断等待或流式响应间隔，失败拨号仍受预算限制。更新 relay 后需要正常退出并重新进入 Agent 模式来加载新程序，已有进程不会自动采用新代码；这项修复不等于证明供应商隧道或每个真实 Claude 请求都正常。
+
 退出会请求关闭本应用启动且身份一致的浏览器，按快照恢复已实际接管的项，停止本应用内核与 relay。CLI 由用户关闭。恢复冲突保留外部状态，失败变红，提供重试或明确接受现状；崩溃后先恢复未完成会话，再删数据。
 
 升级先退出旧程序并恢复，备份 data，将新 zip 解压到新目录，再复制需要保留的数据。旧模板档案在读取时转换，保存才更新。换用户或机器需重新填写密码，credentialRef 不能替代跨机器密码。
 
 给其他用户交付全新 zip、SHA256SUMS、无私人凭据的路由示例和自己的服务说明。不要交付维护者 data、浏览器 profile、日志、快照、真实出口或带密码 YAML。内核/relay 启动时会使用临时凭据配置，正常退出会清理；崩溃后需先恢复，不能把运行中的 core 目录当作无敏感信息的示例。仓库 `crates/aec-core/tests/fixtures/routing.yaml` 是纯合成示例，不能直接联网。
 
-卸载前退出并完成恢复，再删目录；凭据条目以 AgentEgressController: 开头，可手动清理。排查提示词只复制、不自动发送，分享前自行决定是否遮盖 IP。
+卸载前关闭登录自启、退出并完成恢复，移除桌面和开始菜单的四个 Agent Egress 快捷方式，再删目录；凭据条目以 AgentEgressController: 开头，可手动清理。排查提示词只复制、不自动发送，分享前自行决定是否遮盖 IP。
+
+## 看板与固定 ISP 保护
+
+托盘「打开看板」管理受保护站点和有序规则。类型、出站、不解析 DNS 都有选项，常用站点和 Geo 分类提供建议；网站、IP 段和自定义类别仍由用户填写。类别是否存在取决于 GeoSite/GeoIP 文件，保存或内核预检失败会报错。可新增、移除、上下移动规则，最后兜底单独选择。已有注释保留，普通规则不能覆盖受保护域名及子域名。
+
+首次启用固定出口保护：先退出 Agent 模式，在设置填写精确预期 IP，再到看板保存连接路径，然后进入。可选择直接连接 ISP、官方隧道自动选择或具体节点。固定模式下不自动从隧道退到直连；各路径连接同一候选出口，不提供另一个 ISP 作为备用。
+
+运行中切换或保存规则先选择 REJECT 并断开本应用内核的旧连接，再选择第一跳/重载规则，经独立 probe 入口核对精确 IP，成功后放行；失败保持阻断。阻断操作本身失败会通知，不宣称已安全阻断。巡检约每 30 秒执行；供应商在两次检测间改变 IP 仍是风险。只覆盖通过本程序并匹配保护规则的流量，普通 DIRECT、忽略系统代理的进程不属于保护范围。
+
+已有站点的 trace 检测方式保留；新站点默认 HTTPS 可达性检查，没有网站 trace 就不声称该网站证明出口。固定保护另外使用强制走 ISP 的 Cloudflare trace，不沿用系统代理的分流结果。
+
+## 自启、快捷方式与便携目录
+
+托盘和看板均有「登录时自动启动」开关。只写 HKCU Run 的 `AgentEgressController` 值，命令为本安装 `aec-tray.exe --enter`；不安装服务或任务。登录后自动尝试进入，但上次未恢复和接管门仍会阻止进入或真实写入。自启默认关闭。
+
+从托盘或看板点「创建桌面和开始菜单快捷方式」，在当前用户桌面和开始菜单 Programs 下各建两个入口：`Agent Egress Controller` 打开托盘，`Agent Egress Dashboard` 打开看板。已有托盘时看板请求交给该实例。开始菜单可搜索 Agent Egress。
+
+命令行可用 `aec-tray.exe --enable-autostart`、`--disable-autostart`、`--create-shortcuts`、`--dashboard`。注册或同名快捷方式属于其他安装时拒绝覆盖；在旧安装先关闭自启，核对并移除旧入口，再在新目录重新创建。移动便携目录前也按这个顺序处理。不开文件关联、URL 协议、系统服务或全局环境变量，避免让不必要的系统注册残留。

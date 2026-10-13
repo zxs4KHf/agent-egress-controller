@@ -345,7 +345,18 @@ UI 提供单项复制和「复制全部问题」。只写剪贴板，不调用�
 
 - 设置页直接编辑档案，保存前做 schema 校验，错误逐字段显示。
 - 凭据保存到 Windows 凭据管理器，目标名为 `AgentEgressController:<credentialRef>`，档案中只存引用。进入时按需注入内核/relay 临时运行配置，退出时删除，不回显、不写日志或提示词。
-- 开机自启是设置项，默认关闭；开启时写入 HKCU Run，关闭时删除。
+- 登录自启在托盘与看板均可设置，默认关闭；只写 HKCU Run `AgentEgressController`，精确指向当前安装 exe 和 `--enter`。拒绝覆盖另一安装的注册；未恢复会话及接管门不被绕过。
+- 托盘和看板可主动创建当前用户桌面、开始菜单的托盘和看板快捷方式；看板用 `--dashboard` 转交已有实例。拒绝覆盖不同目标的同名入口；不注册服务、URL 协议或文件关联。
+
+### 4.10.1 看板与固定出口保护（ADR-0010，0.3.0）
+
+本机看板复用设置服务，GET dashboard/state 与 POST rules/path/startup/shortcuts 均要求随机令牌和正确 Host；写请求还要求本机 Origin。只接收结构化表单，不接收任意命令、原始 YAML 或路径。操作串行进入 worker，限制 128 站点、512 规则，校验失败不修改档案。
+
+保护域名与子域名优先于全部用户规则。规则类型、出站与排序由选项管理，允许自定义域名/IP，Geo 分类建议是否可用以可信用户数据为准。新增站点默认仅测可达性，已有 trace 属性保留。
+
+`egress.fixedExit` 和 `connectionPath` 兼容旧档案，默认不启用保护；启用要求精确预期 IP。路径为 direct、tunnel-auto 或 tunnel-N，第一跳 DIRECT 只直接连接 ISP 代理。固定模式无自动直连回退。内部 relay select 默认 REJECT，只有独立 probe 强制走 ISP 并核对精确 IP 后放行；probe 监听默认 17327，第一跳监听 17326。
+
+切换/重载前撤销就绪、阻断并关闭本应用内核连接，失败维持阻断。周期检测约 30 秒，未知或不匹配重新阻断；控制口阻断失败必须报错。保护仅涵盖经本应用路由的保护域名，并不保证整机或供应商两次巡检之间永不换 IP。固定模式的普通组切换菜单被禁用，使用看板第一跳切换。
 
 ### 4.11 日志与错误
 
@@ -369,6 +380,7 @@ UI 提供单项复制和「复制全部问题」。只写剪贴板，不调用�
 - 单个候选失败立即切到下一个；每轮按顺序尝试，最多 `maxRounds` 轮。
 - 并发上游连接不超过 `maxInflight`。
 - 一条入站连接的候选总耗时受 `dialBudgetMs` 约束，必须小于内核的 5 秒拨号超时（legacy 实测这个超时不可配置）。
+- 拨号和握手超时只约束连接建立阶段。上游握手成功后清除上游读写超时，入站进入转发前清除客户端读写超时；不把这些短超时当成响应或流式传输的空闲超时。转发阶段等待数据或真正的 EOF/错误，任一方向结束时关闭两端。
 - 失败候选进入 `cooldownMs` 冷却。
 - 全部候选失败时如实返回失败，不伪造响应；日志记录尝试过哪些候选、各自的错误和握手阶段。
 
@@ -385,11 +397,11 @@ legacy `tcp-relay.py` 的语义逐条编号，Rust 实现和测试按编号对�
 | S7 | HTTP 上游先匿名，失败后才带 Basic 凭据 | `s7_http_upstream_is_tried_anonymously_first` |
 | S8 | SOCKS5 上游先只报 0x00，失败后才只报 0x02 | `s8_socks5_upstream_offers_one_method_at_a_time` |
 | S9 | 全部失败如实回 0x01，不伪造响应 | `s9_s11_s12_all_candidates_failing_is_reported_truthfully` |
-| S10 | 双向转发，任一方向结束就关闭两边 | `s4_s10_fails_over_to_a_working_candidate_and_relays_bytes` |
+| S10 | 双向转发，不继承握手超时；任一方向结束就关闭两边 | `s4_s10_fails_over_to_a_working_candidate_and_relays_bytes`、`s10_delayed_first_response_survives_upstream_handshake_timeout`、`s10_streaming_gap_survives_upstream_step_timeout`、`s10_client_idle_survives_inbound_handshake_timeout`、`s10_direct_dial_caller_can_wait_for_response_after_handshake`、`s10_tunnelled_transfer_survives_handshake_timeout` |
 | S11 | 失败日志带上候选、错误、耗时和握手阶段；同类消息 2 秒内合并计数，第一条一定写入 | `s9_s11_s12_…`、`s2_…` |
 | S12 | 日志里只有 host:port(proto)，没有凭据 | `s4_fails_over_…`、`s9_s11_s12_…` |
 
-端到端测试 `crates/aec-dev/tests/relay_chain.rs`（需要 mihomo 二进制，`--include-ignored`）：客户端 → aec-mihomo → aec-relay → 失效候选 → 可用候选（本地假 SOCKS5）→ 本地 HTTP 服务。
+端到端测试 `crates/aec-dev/tests/relay_chain.rs`（需要 mihomo 二进制，`--include-ignored`）：客户端 → aec-mihomo → aec-relay → 失效候选 → 可用候选（本地假 SOCKS5）→ 本地 HTTP 服务。HTTP 服务延迟 1.8 秒才给首个响应，超过默认 1.2 秒握手超时，仍须完整返回。
 
 ### 4.14 权限
 

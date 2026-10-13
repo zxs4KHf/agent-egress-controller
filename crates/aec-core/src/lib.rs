@@ -12,8 +12,10 @@ pub mod core;
 pub mod credentials;
 #[cfg(windows)]
 pub mod crypto;
+pub mod dashboard;
 pub mod desktop;
 pub mod entries;
+pub mod fixed;
 pub mod http;
 pub mod import;
 #[cfg(windows)]

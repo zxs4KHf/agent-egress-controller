@@ -516,10 +516,15 @@ pub fn dial_upstream(
     deadline: Instant,
 ) -> io::Result<TcpStream> {
     let timeout = up.step_timeout_ms.map_or(timeout, Duration::from_millis);
-    match up.proto {
+    let stream = match up.proto {
         UpstreamProto::Http => connect_http(up, host, port, timeout, deadline),
         UpstreamProto::Socks5 => connect_socks5(up, host, port, timeout, deadline),
-    }
+    }?;
+    // The dial/handshake deadline ends here. A quiet response or streaming gap is not a
+    // failed dial; leave subsequent transfer timeouts to the caller (including non-relay users).
+    stream.set_read_timeout(None)?;
+    stream.set_write_timeout(None)?;
+    Ok(stream)
 }
 
 // ---- inbound SOCKS5 (S2, S9, S10) -------------------------------------------------------------
@@ -767,6 +772,14 @@ fn handle_client(
     gate.release();
     match (outcome.stream, outcome.winner) {
         (Some(up), Some(i)) => {
+            if let Err(e) = client
+                .set_read_timeout(None)
+                .and_then(|()| client.set_write_timeout(None))
+            {
+                sink("fail", &format!("{host}:{port} cannot enter transfer: {e}"));
+                let _ = client.write_all(&REPLY_FAIL);
+                return;
+            }
             if client.write_all(&REPLY_OK).is_err() {
                 return;
             }

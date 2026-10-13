@@ -18,3 +18,4 @@ path = "src/relay_main.rs"
 aec-core = { path = "../aec-core" }
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml_ng.workspace = true

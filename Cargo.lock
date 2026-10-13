@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "aec-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -14,16 +14,17 @@ dependencies = [
 
 [[package]]
 name = "aec-dev"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aec-core",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
 ]
 
 [[package]]
 name = "aec-tray"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aec-core",
  "serde_json",

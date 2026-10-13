@@ -443,7 +443,11 @@ fn dns_path(input: &CheckInput, mark: Option<u64>) -> CheckResult {
                 let mut evidence = Vec::new();
                 let (mut wrong, mut missing, mut uncertain) = (Vec::new(), Vec::new(), Vec::new());
                 for t in &input.profile.targets {
-                    let group = input.profile.routing.target_for_domain(&t.domain);
+                    let group = if crate::fixed::protects(input.profile, &t.domain) {
+                        Some("relay")
+                    } else {
+                        input.profile.routing.target_for_domain(&t.domain)
+                    };
                     if group.is_none() {
                         uncertain.push(t.domain.clone());
                     }

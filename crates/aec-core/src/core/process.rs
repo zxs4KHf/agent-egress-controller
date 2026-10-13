@@ -93,6 +93,91 @@ pub struct CoreManager {
 pub const GEODATA_FILES: [&str; 2] = ["GeoSite.dat", "GeoIP.dat"];
 
 impl CoreManager {
+    /// Mutations require the live process and its controller port to remain ours before and after.
+    fn control(
+        &self,
+        evidence: &dyn WriterEvidence,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> Result<(), CoreError> {
+        let owned = self
+            .owned()
+            .filter(still_ours)
+            .ok_or_else(|| CoreError::new("CORE_NOT_RUNNING", "no owned core"))?;
+        let verify = || {
+            let ports = preflight::check(evidence, &[self.ports.controller], Some(&owned))
+                .map_err(|_| {
+                    CoreError::new("PORT_PROBE_FAILED", "cannot verify controller owner")
+                })?;
+            if !still_ours(&owned) || !matches!(ports.first(), Some((_, PortState::Ours))) {
+                return Err(CoreError::new(
+                    "PORT_IN_USE",
+                    "controller does not belong to this session",
+                ));
+            }
+            Ok(())
+        };
+        verify()?;
+        let secret = fs::read_to_string(self.config_path())
+            .ok()
+            .and_then(|s| secret_from(&s))
+            .ok_or_else(|| CoreError::new("CFG_INVALID", "control secret unavailable"))?;
+        let result = http_local(self.ports.controller, method, path, Some(&secret), body);
+        verify()?;
+        match result {
+            Ok((200 | 204, _)) => Ok(()),
+            _ => Err(CoreError::new(
+                "CORE_CONTROL_FAILED",
+                "control request did not complete",
+            )),
+        }
+    }
+
+    /// Disconnect every connection in our core, including in-flight relay first hops.
+    pub fn close_connections(&self, evidence: &dyn WriterEvidence) -> Result<(), CoreError> {
+        self.control(evidence, "DELETE", "/connections", "")
+    }
+
+    /// Reload while the caller holds the fixed-exit gate closed. New configs also default to REJECT.
+    pub fn reload(
+        &self,
+        evidence: &dyn WriterEvidence,
+        profile: &crate::profile::AgentProfile,
+        creds: &dyn config::CredentialSource,
+    ) -> Result<(), CoreError> {
+        // Verify ownership before touching runtime files, and close old flows before reload.
+        if profile.egress.fixed_exit {
+            self.select(evidence, "relay", "REJECT")?;
+        }
+        self.close_connections(evidence)?;
+        let original = fs::read_to_string(self.config_path())
+            .map_err(io("CFG_INVALID", &self.config_path()))?;
+        let secret = secret_from(&original)
+            .ok_or_else(|| CoreError::new("CFG_INVALID", "control secret unavailable"))?;
+        let next = config::from_profile(profile, &self.ports, &secret, creds)
+            .map_err(|e| CoreError::new("CFG_INVALID", e.to_string()))?;
+        if profile.routing.uses_geodata() {
+            self.install_geodata()?;
+        }
+        write_atomic(&self.config_path(), next.as_bytes())
+            .map_err(|e| CoreError::new("IO_WRITE", e.to_string()))?;
+        if let Err(e) = self.test_config() {
+            let _ = write_atomic(&self.config_path(), original.as_bytes());
+            return Err(e);
+        }
+        let path = self
+            .config_path()
+            .canonicalize()
+            .map_err(io("CFG_INVALID", &self.config_path()))?;
+        let body = serde_json::json!({"path":crate::paths::strip_verbatim(&path),"force":true})
+            .to_string();
+        self.control(evidence, "PUT", "/configs", &body)?;
+        if profile.egress.fixed_exit {
+            self.select(evidence, "relay", "REJECT")?;
+        }
+        self.apply_selections(evidence, &profile.routing)
+    }
     fn geodata_source(&self) -> PathBuf {
         self.bin
             .parent()
@@ -631,9 +716,11 @@ impl CoreManager {
         if out.status.success() {
             Ok(())
         } else {
-            let text = String::from_utf8_lossy(&out.stdout).into_owned()
-                + &String::from_utf8_lossy(&out.stderr);
-            Err(CoreError::new("CORE_CONFIG_INVALID", config::redact(&text)))
+            // Parser diagnostics can quote an entire credential-bearing YAML scalar.
+            Err(CoreError::new(
+                "CORE_CONFIG_INVALID",
+                "generated configuration was rejected by mihomo",
+            ))
         }
     }
 

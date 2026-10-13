@@ -81,7 +81,7 @@ fn claude_service(host: &str) -> bool {
 
 /// The API reports chains from the leaf outbound to the top-level group. Check the actual path,
 /// including an explicit select member, rather than just finding a familiar group name in it.
-fn chain_matches(routing: &Routing, target: &str, chain: &[String]) -> bool {
+fn chain_matches(routing: &Routing, fixed_exit: bool, target: &str, chain: &[String]) -> bool {
     let mut target = target;
     let mut rest = chain;
     loop {
@@ -89,6 +89,9 @@ fn chain_matches(routing: &Routing, target: &str, chain: &[String]) -> bool {
             return false;
         }
         rest = &rest[..rest.len() - 1];
+        if fixed_exit && target == "relay" {
+            return rest == [crate::fixed::TRANSPORT];
+        }
         let Some(group) = routing.groups.iter().find(|g| g.name == target) else {
             return rest.is_empty()
                 && (matches!(target, "relay" | "DIRECT" | "REJECT")
@@ -157,12 +160,21 @@ pub fn observe(profile: &AgentProfile, mixed: u16, probe: &dyn DesktopProbe) -> 
             continue;
         }
         service |= claude_service(&host);
-        let expected = profile.routing.target_for_domain(&host);
+        let expected = if crate::fixed::protects(profile, &host) {
+            Some("relay")
+        } else {
+            profile.routing.target_for_domain(&host)
+        };
         let leaf = c.chains.first().map(String::as_str);
         if claude_service(&host) && matches!(leaf, Some("DIRECT" | "REJECT")) {
             warning = Some("claude_target_not_proxied");
         } else if let Some(target) = expected {
-            if !chain_matches(&profile.routing, target, &c.chains) {
+            if !chain_matches(
+                &profile.routing,
+                profile.egress.fixed_exit,
+                target,
+                &c.chains,
+            ) {
                 warning.get_or_insert("routing_mismatch");
             }
         } else {
@@ -301,6 +313,26 @@ mod tests {
             records,
             calls: Cell::new(0),
             fail: None,
+        }
+    }
+
+    #[test]
+    fn fixed_protection_overrides_user_rules_and_requires_transport() {
+        let mut p = profile();
+        p.egress.fixed_exit = true;
+        p.routing.rules.clear();
+        p.routing.final_target = "DIRECT".into();
+        for (chain, expected) in [
+            (vec![crate::fixed::TRANSPORT, "relay"], Status::Pass),
+            (vec!["relay"], Status::Warn),
+            (vec!["DIRECT"], Status::Warn),
+            (vec!["REJECT", "relay"], Status::Warn),
+        ] {
+            let f = probe(
+                vec![flow(APP, 50000)],
+                vec![connection(50000, "claude.ai", &chain)],
+            );
+            assert_eq!(observe(&p, MIXED, &f).status, expected, "{chain:?}");
         }
     }
 
