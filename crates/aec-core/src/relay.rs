@@ -166,7 +166,7 @@ pub fn dial_pool<S>(
     let mut tried = Vec::new();
     for _ in 0..max_rounds {
         let order = pool.order(now());
-        for (position, &i) in order.iter().enumerate() {
+        for &i in order.iter() {
             if now() + MIN_ATTEMPT_BUDGET >= deadline {
                 tried.push("dial budget exhausted".to_string());
                 return DialOutcome {
@@ -177,22 +177,12 @@ pub fn dial_pool<S>(
                 };
             }
             let t0 = now();
-            // A silent encrypted entrance must leave time for the same exit's direct path.
-            // Share the first half among tunnel attempts; the second half remains available to
-            // direct candidates. Pools without direct fallback retain the whole budget.
-            let attempt_deadline = if pool.upstreams[i].via.is_some()
-                && order[position + 1..]
-                    .iter()
-                    .any(|&j| pool.upstreams[j].via.is_none())
-            {
-                start + budget / 2
-            } else {
-                deadline
-            };
-            if now() + MIN_ATTEMPT_BUDGET >= attempt_deadline {
-                continue;
-            }
-            match dial(i, attempt_deadline) {
+            // One attempt waits for at most its own step timeout, so a stalled entrance cannot eat
+            // the whole budget and every later candidate still gets what is left. Reserving the
+            // second half for the direct candidates was worse than that: with two tunnel candidates
+            // the second was skipped outright, and a pool whose only working path sat behind a dead
+            // tunnel failed every connection.
+            match dial(i, deadline) {
                 Ok(s) => {
                     pool.note_ok(i);
                     return DialOutcome {

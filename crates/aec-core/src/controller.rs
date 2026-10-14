@@ -564,10 +564,13 @@ impl<P: Platform> Controller<P> {
         let gate = TakeoverGate::evaluate(enabled, &status.foreign_writers, true);
         self.state.system_proxy_gate = gate.system_proxy.clone();
         self.state.timezone_writable = gate.allows(GlobalItem::Timezone);
+        // R10 asks who maintains the time zone. A client that only holds the system proxy's port
+        // leaves the time zone alone, so naming it there reported a conflict that does not exist.
         self.state.foreign_writers = status
             .foreign_writers
             .writers
             .iter()
+            .filter(|w| crate::snapshot::writer_items(w.kind).contains(&GlobalItem::Timezone))
             .map(|w| w.evidence.clone())
             .collect();
         self.event(
@@ -797,10 +800,14 @@ impl<P: Platform> Controller<P> {
         Some(r)
     }
 
-    /// Observe external system-proxy changes without writing over another application. Invalidate
-    /// readiness immediately and notify once per observed value; a full recheck can restore it.
+    /// Observe the system proxy while Agent mode runs. An external change is a conflict, not a
+    /// reason to compete for a single Windows-wide setting (ADR-0004).
     pub fn keep_system_proxy(&mut self) -> Option<KeepOutcome> {
         if !matches!(self.state.mode, Mode::AgentReady | Mode::AgentUnverified) {
+            return None;
+        }
+        if !self.settings.takeover_enabled || self.state.system_proxy_gate.state != GateState::Open
+        {
             return None;
         }
         let ours = self.state.journal.iter().rev().find_map(|e| match e {
@@ -833,10 +840,16 @@ impl<P: Platform> Controller<P> {
         };
         if current == ours {
             self.last_proxy_change = None;
+            if let Err(e) = self.proxy_check(Status::Pass, None) {
+                return Some(KeepOutcome::Failed(e.to_string()));
+            }
             return None;
         }
         if self.last_proxy_change.as_ref() == Some(&current) {
             return None;
+        }
+        if let Err(e) = self.proxy_check(Status::Fail, Some("system_proxy_changed")) {
+            return Some(KeepOutcome::Failed(e.to_string()));
         }
         self.last_proxy_change = Some(current.clone());
         let found = match &current {
@@ -847,23 +860,33 @@ impl<P: Platform> Controller<P> {
             GlobalValue::SystemProxy { .. } => "off".into(),
             other => format!("{other:?}"),
         };
-        self.state.mode = Mode::AgentUnverified;
-        if let Some(report) = &mut self.state.last_report {
-            if let Some(g6) = report.results.iter_mut().find(|r| r.id == "G6") {
-                *g6 =
-                    CheckResult::new("G6", Kind::Hard, Status::Fail, Some("system_proxy_changed"))
-                        .with("system proxy", found.clone());
-            }
-        }
-        if let Err(f) = self.persist() {
-            return Some(KeepOutcome::Failed(f.to_string()));
-        }
         self.event(
             Level::Warn,
             "observe.system_proxy.changed",
             json!({ "found": found }),
         );
         Some(KeepOutcome::Changed { found })
+    }
+
+    /// Periodic observation must reflect actual G6 evidence, while preserving every other gate.
+    fn proxy_check(&mut self, status: Status, reason: Option<&str>) -> Result<(), Fault> {
+        let Some(report) = &mut self.state.last_report else {
+            return Ok(());
+        };
+        let Some(g6) = report.results.iter_mut().find(|r| r.id == "G6") else {
+            return Ok(());
+        };
+        if g6.status == status && g6.reason.as_deref() == reason {
+            return Ok(());
+        }
+        *g6 = CheckResult::new("G6", Kind::Hard, status, reason)
+            .with("source", "system proxy periodic observation");
+        self.state.mode = if is_ready(report) {
+            Mode::AgentReady
+        } else {
+            Mode::AgentUnverified
+        };
+        self.persist()
     }
 
     fn abort(&mut self, _profile: &AgentProfile, fault: Fault) -> Result<EnterOutcome, Fault> {
@@ -1748,7 +1771,7 @@ mod tests {
     }
 
     #[test]
-    fn external_proxy_change_is_reported_without_competing_writes() {
+    fn an_external_proxy_change_is_reported_without_competing_writes() {
         let d = tmp("keep");
         let mut c = open(FakePlatform::new(), &d, true);
         let prof = system_scope();
@@ -1759,27 +1782,46 @@ mod tests {
             None,
             "nothing to do while it is ours"
         );
-
-        // A Clash-style client turns its own "system proxy" switch on.
+        let ours = c.platform().host.borrow().proxy.clone();
+        // A Clash-style client turns its own "system proxy" switch on. We report the conflict,
+        // invalidate G6, and leave its value untouched so neither application fights for ownership.
         let clash = ProxySettings {
             flags: proxy_flags::DIRECT | proxy_flags::PROXY,
             proxy_server: Some("127.0.0.1:7890".into()),
             bypass: None,
             auto_config_url: None,
         };
+        let writes = c.platform().writes.borrow().len();
         c.platform().host.borrow_mut().proxy = clash.clone();
-        let r = c.recheck(&prof).unwrap();
         assert_eq!(
-            (g6(&r).status, g6(&r).reason.as_deref()),
-            (Status::Fail, Some("system_proxy_changed"))
+            c.keep_system_proxy(),
+            Some(KeepOutcome::Changed {
+                found: "127.0.0.1:7890".into()
+            })
         );
-        let _ = c.keep_system_proxy();
+        assert_eq!(c.platform().host.borrow().proxy, clash);
         assert_eq!(
-            c.platform().host.borrow().proxy,
-            clash,
-            "ADR-0004: observe an external writer, never fight it"
+            c.platform().writes.borrow().len(),
+            writes,
+            "no competing write"
         );
         assert_eq!(c.state().mode, Mode::AgentUnverified);
+        assert_eq!(
+            g6(c.state().last_report.as_ref().unwrap()).status,
+            Status::Fail
+        );
+        // The unchanged conflict is not repeatedly announced or rewritten.
+        assert_eq!(c.keep_system_proxy(), None);
+        assert_eq!(c.platform().host.borrow().proxy, clash);
+        assert_eq!(c.platform().writes.borrow().len(), writes, "still no write");
+        // Once the user turns the other client's system proxy switch off, G6 returns.
+        c.platform().host.borrow_mut().proxy = ours;
+        assert_eq!(c.keep_system_proxy(), None);
+        assert_eq!(c.state().mode, Mode::AgentReady);
+        assert_eq!(
+            g6(c.state().last_report.as_ref().unwrap()).status,
+            Status::Pass
+        );
     }
 
     #[test]

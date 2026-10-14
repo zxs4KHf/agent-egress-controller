@@ -95,8 +95,10 @@ impl LivePlatform {
         self.fixed_verified
             .store(false, std::sync::atomic::Ordering::Relaxed);
         // Both steps are attempted: failure to select must not preserve existing connections.
+        // Only the relay's own connections are cut. A protected site loses its path when the exit
+        // is unverified; traffic that never used the exit keeps running, as the legacy chain did.
         let gate = self.core.select(&WindowsHost, "relay", "REJECT");
-        let close = self.core.close_connections(&WindowsHost);
+        let close = self.core.close_relay_connections(&WindowsHost);
         gate.and(close).map_err(|e| fault(e, "FIXED_BLOCK_FAILED"))
     }
 

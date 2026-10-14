@@ -14,6 +14,10 @@ path = "src/main.rs"
 name = "aec-relay"
 path = "src/relay_main.rs"
 
+[[bin]]
+name = "aec-agent"
+path = "src/agent_main.rs"
+
 [dependencies]
 aec-core = { path = "../aec-core" }
 serde.workspace = true

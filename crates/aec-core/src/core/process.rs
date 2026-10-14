@@ -101,6 +101,17 @@ impl CoreManager {
         path: &str,
         body: &str,
     ) -> Result<(), CoreError> {
+        self.control_body(evidence, method, path, body).map(|_| ())
+    }
+
+    /// The same guards, handing the response body back for the calls that have to read it.
+    fn control_body(
+        &self,
+        evidence: &dyn WriterEvidence,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> Result<String, CoreError> {
         let owned = self
             .owned()
             .filter(still_ours)
@@ -126,7 +137,7 @@ impl CoreManager {
         let result = http_local(self.ports.controller, method, path, Some(&secret), body);
         verify()?;
         match result {
-            Ok((200 | 204, _)) => Ok(()),
+            Ok((200 | 204, body)) => Ok(body),
             _ => Err(CoreError::new(
                 "CORE_CONTROL_FAILED",
                 "control request did not complete",
@@ -137,6 +148,25 @@ impl CoreManager {
     /// Disconnect every connection in our core, including in-flight relay first hops.
     pub fn close_connections(&self, evidence: &dyn WriterEvidence) -> Result<(), CoreError> {
         self.control(evidence, "DELETE", "/connections", "")
+    }
+
+    /// Disconnect only the connections that leave through the relay.
+    ///
+    /// A fixed exit that loses its evidence must cost the protected sites their path and nothing
+    /// else. Traffic that never entered the relay did not depend on the exit, and the legacy chain
+    /// behaved exactly this way: a broken tunnel took those sites down and left the rest working.
+    /// The core names the outbounds behind every live connection, so the ones to cut are known.
+    pub fn close_relay_connections(&self, evidence: &dyn WriterEvidence) -> Result<(), CoreError> {
+        let report = self.control_body(evidence, "GET", "/connections", "")?;
+        for id in relay_connection_ids(&report)? {
+            self.control(
+                evidence,
+                "DELETE",
+                &format!("/connections/{}", encode_segment(&id)),
+                "",
+            )?;
+        }
+        Ok(())
     }
 
     /// Reload while the caller holds the fixed-exit gate closed. New configs also default to REJECT.
@@ -400,6 +430,44 @@ fn encode_segment(name: &str) -> String {
         }
     }
     encoded
+}
+
+/// The connections whose outbound chain goes through the relay, taken from the core's own report.
+///
+/// Unreadable evidence returns an error, never a blanket disconnect or a claim of successful closure.
+fn relay_connection_ids(report: &str) -> Result<Vec<String>, CoreError> {
+    let invalid = || {
+        CoreError::new(
+            "CORE_CONTROL_FAILED",
+            "connection closure evidence unavailable",
+        )
+    };
+    let parsed: serde_json::Value = serde_json::from_str(report).map_err(|_| invalid())?;
+    let list = parsed
+        .get("connections")
+        .and_then(|c| c.as_array())
+        .ok_or_else(invalid)?;
+    let mut ids = Vec::new();
+    for connection in list {
+        let chains = connection
+            .get("chains")
+            .and_then(|c| c.as_array())
+            .ok_or_else(invalid)?;
+        let mut relay = false;
+        for name in chains {
+            let name = name.as_str().ok_or_else(invalid)?;
+            relay |= name == config::RELAY_PROXY || name == crate::fixed::TRANSPORT;
+        }
+        if relay {
+            let id = connection
+                .get("id")
+                .and_then(|id| id.as_str())
+                .filter(|id| !id.is_empty())
+                .ok_or_else(invalid)?;
+            ids.push(id.to_owned());
+        }
+    }
+    Ok(ids)
 }
 
 impl CoreManager {
@@ -990,6 +1058,43 @@ mod tests {
     #[test]
     fn dechunks_bodies() {
         assert_eq!(dechunk("4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n"), "Wikipedia");
+    }
+
+    #[test]
+    fn only_relay_connections_are_named_for_closing() {
+        let report = r#"{"connections":[
+            {"id":"a1","chains":["aec-relay-transport","relay"]},
+            {"id":"b2","chains":["DIRECT"]},
+            {"id":"c3","chains":["daily-group","daily-upstream"]},
+            {"id":"d4","chains":["relay"]},
+            {"id":"e5","chains":["relay-custom"]}
+        ]}"#;
+        assert_eq!(
+            relay_connection_ids(report).unwrap(),
+            vec!["a1".to_string(), "d4".to_string()]
+        );
+        assert!(
+            relay_connection_ids("upstream error").is_err(),
+            "missing closure evidence must be an error"
+        );
+        for invalid in [
+            r#"{}"#,
+            r#"{"connections":[{"id":"a"}]}"#,
+            r#"{"connections":[{"chains":["relay"]}]}"#,
+            r#"{"connections":[{"id":"a","chains":[null]}]}"#,
+        ] {
+            assert!(relay_connection_ids(invalid).is_err());
+        }
+        assert_eq!(
+            relay_connection_ids(
+                r#"{"connections":[{"id":"probe","chains":["aec-relay-transport"]}]}"#
+            )
+            .unwrap(),
+            ["probe"]
+        );
+        assert!(relay_connection_ids(r#"{"connections":[]}"#)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

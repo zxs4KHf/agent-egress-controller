@@ -28,7 +28,7 @@ try {
         throw "Release output already exists; preserve it and use a fresh version or move it aside"
     }
     New-Item -ItemType Directory -Path (Join-Path $output "bin"), (Join-Path $output "docs") -Force | Out-Null
-    foreach ($exe in @("aec-tray.exe", "aec-dev.exe", "aec-relay.exe")) {
+    foreach ($exe in @("aec-tray.exe", "aec-dev.exe", "aec-relay.exe", "aec-agent.exe")) {
         Copy-Item -LiteralPath (Join-Path $repo "target/release/$exe") -Destination (Join-Path $output $exe)
     }
     Copy-Item -LiteralPath $core -Destination (Join-Path $output "bin/aec-mihomo.exe")
@@ -43,7 +43,7 @@ try {
         New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
         Copy-Item -LiteralPath (Join-Path $repo $file) -Destination $destination
     }
-    foreach ($file in @("USER-GUIDE.md", "RELEASE-0.2.0.md")) {
+    foreach ($file in @("USER-GUIDE.md", "AGENT-INTEGRATION.md", "RELEASE-0.4.0.md", "RELEASE-0.2.0.md")) {
         Copy-Item -LiteralPath (Join-Path $repo "docs/$file") -Destination (Join-Path $output "docs/$file")
     }
     # Keep the script ASCII so Windows PowerShell 5.1 also reads it correctly without a BOM.

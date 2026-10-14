@@ -18,6 +18,69 @@ use aec_core::store::ProfileStore;
 
 use crate::text;
 
+/// Periodic fixed-exit recovery never writes globals or changes the saved path/exit identity.
+trait FixedGate {
+    fn verified(&self) -> bool;
+    fn verify(&self) -> Result<(), aec_core::controller::Fault>;
+    fn block(&self) -> Result<(), aec_core::controller::Fault>;
+    fn open(&self) -> Result<(), aec_core::controller::Fault>;
+}
+
+enum FixedPoll {
+    Healthy,
+    Recovered,
+    Blocked {
+        was_verified: bool,
+        probe_error: aec_core::controller::Fault,
+        block_error: Option<aec_core::controller::Fault>,
+    },
+}
+
+fn poll_fixed(gate: &impl FixedGate) -> FixedPoll {
+    let was_verified = gate.verified();
+    let result = gate.verify().and_then(|()| {
+        if was_verified {
+            Ok(false)
+        } else {
+            // open() reselects only the saved first hop and requires another exact probe.
+            gate.open().map(|()| true)
+        }
+    });
+    match result {
+        Ok(false) => FixedPoll::Healthy,
+        Ok(true) => FixedPoll::Recovered,
+        Err(probe_error) => FixedPoll::Blocked {
+            was_verified,
+            probe_error,
+            block_error: gate.block().err(),
+        },
+    }
+}
+
+fn needs_refresh(poll: &FixedPoll, _mode: Mode) -> bool {
+    _mode == Mode::AgentUnverified && matches!(poll, FixedPoll::Healthy)
+}
+
+struct LiveFixedGate<'a> {
+    platform: &'a LivePlatform,
+    profile: &'a AgentProfile,
+}
+
+impl FixedGate for LiveFixedGate<'_> {
+    fn verified(&self) -> bool {
+        self.platform.fixed_verified()
+    }
+    fn verify(&self) -> Result<(), aec_core::controller::Fault> {
+        self.platform.verify_fixed(self.profile)
+    }
+    fn block(&self) -> Result<(), aec_core::controller::Fault> {
+        self.platform.block_fixed()
+    }
+    fn open(&self) -> Result<(), aec_core::controller::Fault> {
+        self.platform.open_fixed(self.profile)
+    }
+}
+
 /// Where the binaries and the data are.
 #[derive(Debug, Clone)]
 pub struct Layout {
@@ -83,6 +146,9 @@ impl Layout {
 }
 
 pub enum Cmd {
+    Configure(serde_json::Value, Sender<Result<(), Vec<FieldError>>>),
+    AgentAccess(bool, Sender<Result<(), Vec<FieldError>>>),
+    AgentAction(String, Sender<Result<(), Vec<FieldError>>>),
     Startup(bool, Sender<Result<(), Vec<FieldError>>>),
     Shortcuts(Sender<Result<(), Vec<FieldError>>>),
     Save(Box<ExitForm>, Sender<Result<(), Vec<FieldError>>>),
@@ -149,6 +215,7 @@ fn agent_profile(data_dir: &Path) -> AgentProfile {
 }
 
 pub struct Worker {
+    _session: aec_core::store::SessionLease,
     last_fixed_probe: std::time::Instant,
     layout: Layout,
     controller: Controller<LivePlatform>,
@@ -162,6 +229,7 @@ impl Worker {
         shared: SharedRef,
         notify: Box<dyn Fn() + Send>,
     ) -> Result<Self, String> {
+        let session = aec_core::store::SessionLease::acquire(&layout.data_dir)?;
         std::fs::create_dir_all(&layout.data_dir)
             .map_err(|e| format!("{}: {e}", layout.data_dir.display()))?;
         let controller = Controller::open(
@@ -171,6 +239,7 @@ impl Worker {
         )
         .map_err(|e| e.to_string())?;
         let w = Self {
+            _session: session,
             last_fixed_probe: std::time::Instant::now(),
             layout,
             controller,
@@ -254,8 +323,10 @@ impl Worker {
                 continue;
             }
             let label = match &cmd {
+                Cmd::AgentAccess(..) => "正在保存 Agent 接入…",
+                Cmd::AgentAction(..) => "正在执行 Agent 操作…",
                 Cmd::Startup(..) | Cmd::Shortcuts(..) => "正在保存启动入口…",
-                Cmd::Save(..) | Cmd::Rules(..) => "正在保存设置…",
+                Cmd::Save(..) | Cmd::Rules(..) | Cmd::Configure(..) => "正在保存设置…",
                 Cmd::Path(..) => "正在核对固定出口…",
                 Cmd::Enter => "正在进入 Agent 模式…",
                 Cmd::Open(_) => "正在打开并检测…",
@@ -305,6 +376,68 @@ impl Worker {
     fn handle(&mut self, cmd: Cmd) -> bool {
         let data_dir = self.layout.data_dir.clone();
         match cmd {
+            Cmd::Configure(patch, done) => {
+                // Merge in the serial worker, after earlier panel/API saves have completed.
+                let form = aec_core::agent::patch_settings(
+                    Backend::read_view(&data_dir, self.controller.state().mode != Mode::Daily),
+                    patch,
+                );
+                let result = form.and_then(|form| self.save_settings(form));
+                let _ = done.send(result);
+            }
+            Cmd::AgentAccess(enabled, done) => {
+                let result = std::fs::write(
+                    data_dir.join(aec_core::agent::ACCESS),
+                    if enabled {
+                        b"true".as_slice()
+                    } else {
+                        b"false".as_slice()
+                    },
+                )
+                .map_err(|_| field_error("Agent 接入选项保存失败".into()));
+                let _ = done.send(result);
+            }
+            Cmd::AgentAction(action, done) => {
+                let result = match action.as_str() {
+                    "enter" => {
+                        let set = load_set(&data_dir);
+                        if !profile::validate(&set).is_empty() {
+                            Err(aec_core::controller::Fault::new(
+                                "PROFILE_INVALID",
+                                "请先在看板配置出口",
+                            ))
+                        } else {
+                            self.controller.set_settings(Settings::load(&data_dir));
+                            self.controller
+                                .enter(&set.agent[0], EnterOptions::default())
+                                .and_then(|out| out.fault.map_or(Ok(()), Err))
+                        }
+                    }
+                    "recheck" => self.recheck().map(|_| ()),
+                    "exit" => self.controller.exit().and_then(|out| {
+                        if out.mode_after == Mode::Daily {
+                            Ok(())
+                        } else {
+                            Err(aec_core::controller::Fault::new(
+                                "RESTORE_INCOMPLETE",
+                                "恢复未完成，请查看看板",
+                            ))
+                        }
+                    }),
+                    _ => Err(aec_core::controller::Fault::new(
+                        "ACTION_INVALID",
+                        "不支持的操作",
+                    )),
+                };
+                self.write_report();
+                // Publish the final state before the synchronous reply, so API success cannot
+                // expose an old ready state or merely mean "queued".
+                self.publish(None);
+                let _ =
+                    done.send(result.map_err(|_| {
+                        field_error("操作失败，请查看看板中的实际状态和检测报告".into())
+                    }));
+            }
             Cmd::Startup(enabled, done) => {
                 let result = crate::startup::set(enabled);
                 match &result {
@@ -428,9 +561,9 @@ impl Worker {
         match self.controller.keep_system_proxy() {
             None => {}
             Some(KeepOutcome::Changed { found }) => self.note(
-                "系统代理被其他程序改写",
+                "系统代理发生冲突",
                 &format!(
-                    "当前系统代理为 {found}。Agent 就绪状态已撤销；请关闭冲突程序的系统代理开关，再退出并重新进入 Agent 模式。"
+                    "检测到系统代理被改为 {found}，已撤销就绪状态；本程序不会与其他程序争写。请关闭另一代理客户端的「系统代理」开关（可保留内核并切换节点），不要同时启用 VPN/TUN/全局代理。具体步骤见托盘菜单「代理冲突说明」，处理后退出并重新进入 Agent 模式。"
                 ),
                 true,
             ),
@@ -444,25 +577,49 @@ impl Worker {
             )
             && self.last_fixed_probe.elapsed() >= std::time::Duration::from_secs(30)
         {
-            self.last_fixed_probe = std::time::Instant::now();
-            if let Err(e) = self.controller.platform().verify_fixed(&p) {
-                let was_verified = self.controller.platform().fixed_verified();
-                let blocked = self.controller.platform().block_fixed();
-                self.shared.lock().expect("lock").fixed_blocked = true;
-                let _ = self.controller.invalidate_routing_checks();
-                if let Err(block_error) = blocked {
-                    self.note(
-                        "固定出口失去验证，阻断操作失败",
-                        &format!(
-                            "{}；{}。请停止使用受保护服务并恢复会话。",
-                            e.message, block_error.message
-                        ),
-                        true,
-                    );
-                } else if was_verified {
-                    self.note("固定出口已阻断", &e.message, true);
+            let poll = poll_fixed(&LiveFixedGate {
+                platform: self.controller.platform(),
+                profile: &p,
+            });
+            let refresh_unverified = needs_refresh(&poll, self.controller.state().mode);
+            match poll {
+                FixedPoll::Healthy => {}
+                FixedPoll::Recovered => {
+                    self.publish(Some("固定出口已恢复，正在重新检测…"));
+                    if let Err(e) = self.controller.recheck(&p) {
+                        let _ = self.controller.invalidate_routing_checks();
+                        self.note("固定出口恢复后的检测失败", &e.message, true);
+                    }
+                }
+                FixedPoll::Blocked {
+                    was_verified,
+                    probe_error,
+                    block_error,
+                } => {
+                    self.shared.lock().expect("lock").fixed_blocked = true;
+                    let _ = self.controller.invalidate_routing_checks();
+                    if let Some(block_error) = block_error {
+                        self.note(
+                            "固定出口失去验证，阻断操作失败",
+                            &format!(
+                                "{}；{}。请停止使用受保护服务并恢复会话。",
+                                probe_error.message, block_error.message
+                            ),
+                            true,
+                        );
+                    } else if was_verified {
+                        self.note("固定出口已阻断", &format!("{}。将定期重新核对同一出口，取得精确证据后自动恢复；也可点击重新检测。", probe_error.message), true);
+                    }
                 }
             }
+            if refresh_unverified {
+                self.publish(Some("网络已恢复，正在重新检测…"));
+                if let Err(e) = self.controller.recheck(&p) {
+                    self.note("网络恢复后的检测未通过", &e.message, true);
+                }
+            }
+            // A full recovery check can take time; do not immediately poll again afterwards.
+            self.last_fixed_probe = std::time::Instant::now();
         }
         self.write_report();
         self.publish(None);
@@ -736,9 +893,63 @@ impl Backend {
     fn locked(&self) -> bool {
         self.shared.lock().expect("lock").mode != Mode::Daily
     }
+    fn read_view(data_dir: &Path, locked: bool) -> SetupView {
+        let set = load_set(data_dir);
+        let user = WindowsCredentials
+            .user_name(setup::CREDENTIAL_REF)
+            .ok()
+            .flatten();
+        let tunnel_stored = WindowsCredentials
+            .exists(setup::TUNNEL_CREDENTIAL_REF)
+            .unwrap_or(false);
+        let settings = Settings::load(data_dir);
+        setup::view(
+            &set,
+            &setup::ViewInput {
+                core_mixed_port: settings.core_mixed_port,
+                stored_user: user.as_deref(),
+                tunnel_password_stored: tunnel_stored,
+                takeover_enabled: settings.takeover_enabled,
+                locked,
+            },
+        )
+    }
 }
 
 impl SetupBackend for Backend {
+    fn configure(&self, patch: serde_json::Value) -> Result<(), Vec<FieldError>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(Cmd::Configure(patch, tx))
+            .map_err(|_| field_error("托盘服务已退出".into()))?;
+        rx.recv()
+            .map_err(|_| field_error("托盘服务已退出".into()))?
+    }
+    fn action(&self, action: &str) -> Result<(), Vec<FieldError>> {
+        if !["enter", "exit", "recheck"].contains(&action) {
+            return Err(field_error("不支持的模式操作".into()));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(Cmd::AgentAction(action.into(), tx))
+            .map_err(|_| field_error("托盘服务已退出".into()))?;
+        rx.recv()
+            .map_err(|_| field_error("托盘服务已退出".into()))?
+    }
+    fn agent_access(&self, enabled: bool) -> Result<(), Vec<FieldError>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(Cmd::AgentAccess(enabled, tx))
+            .map_err(|_| field_error("托盘服务已退出".into()))?;
+        rx.recv()
+            .map_err(|_| field_error("托盘服务已退出".into()))?
+    }
+    fn agent_info(&self) -> serde_json::Value {
+        let exe = std::env::current_exe()
+            .unwrap_or_default()
+            .with_file_name("aec-agent.exe");
+        serde_json::json!({"available":self.data_dir.join(aec_core::agent::DISCOVERY).is_file(),"enabled":aec_core::agent::enabled(&self.data_dir),"mcpConfig":aec_core::agent::config(&self.data_dir,&exe)})
+    }
     fn dashboard(&self) -> Option<aec_core::dashboard::View> {
         let s = self.shared.lock().expect("lock").clone();
         let mut view = aec_core::dashboard::view(
@@ -784,24 +995,7 @@ impl SetupBackend for Backend {
             .map_err(|_| field_error("托盘服务已退出".into()))?
     }
     fn view(&self) -> SetupView {
-        let set = load_set(&self.data_dir);
-        let user = WindowsCredentials
-            .user_name(setup::CREDENTIAL_REF)
-            .ok()
-            .flatten();
-        let tunnel_stored = WindowsCredentials
-            .exists(setup::TUNNEL_CREDENTIAL_REF)
-            .unwrap_or(false);
-        setup::view(
-            &set,
-            &setup::ViewInput {
-                core_mixed_port: Settings::load(&self.data_dir).core_mixed_port,
-                stored_user: user.as_deref(),
-                tunnel_password_stored: tunnel_stored,
-                takeover_enabled: Settings::load(&self.data_dir).takeover_enabled,
-                locked: self.locked(),
-            },
-        )
+        Self::read_view(&self.data_dir, self.locked())
     }
 
     fn save(&self, form: ExitForm) -> Result<(), Vec<FieldError>> {
@@ -811,5 +1005,170 @@ impl SetupBackend for Backend {
             .map_err(|_| field_error("托盘服务已退出".into()))?;
         rx.recv()
             .map_err(|_| field_error("托盘服务已退出".into()))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aec_core::controller::Fault;
+    use aec_core::http::{HttpClient, HttpError, Request, Response};
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+
+    struct Client(Result<Response, HttpError>);
+    impl HttpClient for Client {
+        fn send(&self, request: &Request) -> Result<Response, HttpError> {
+            assert_eq!(request.route, aec_core::http::Route::Proxy(17327));
+            self.0.clone()
+        }
+    }
+
+    fn evidence(body: Option<&str>) -> Result<(), Fault> {
+        let response = body.map_or(Err(HttpError::Timeout), |body| {
+            Ok(Response {
+                status: 200,
+                body: body.into(),
+                elapsed: std::time::Duration::ZERO,
+            })
+        });
+        aec_core::fixed::verify(&Client(response), 17327, Some("198.51.100.7"))
+            .map_err(|message| Fault::new("FIXED_PROBE", message))
+    }
+
+    struct Gate {
+        verified: Cell<bool>,
+        probes: RefCell<VecDeque<Result<(), Fault>>>,
+        reopen: RefCell<VecDeque<Result<(), Fault>>>,
+        calls: RefCell<Vec<&'static str>>,
+        block_fails: bool,
+    }
+    impl Gate {
+        fn new(verified: bool, probes: Vec<Result<(), Fault>>) -> Self {
+            Self {
+                verified: Cell::new(verified),
+                probes: RefCell::new(probes.into()),
+                reopen: RefCell::new(vec![evidence(Some("ip=198.51.100.7\n"))].into()),
+                calls: RefCell::new(Vec::new()),
+                block_fails: false,
+            }
+        }
+    }
+    impl FixedGate for Gate {
+        fn verified(&self) -> bool {
+            self.verified.get()
+        }
+        fn verify(&self) -> Result<(), Fault> {
+            self.calls.borrow_mut().push("verify");
+            self.probes.borrow_mut().pop_front().expect("probe fixture")
+        }
+        fn block(&self) -> Result<(), Fault> {
+            self.calls.borrow_mut().push("block");
+            self.verified.set(false);
+            if self.block_fails {
+                Err(Fault::new("BLOCK", "control unavailable"))
+            } else {
+                Ok(())
+            }
+        }
+        fn open(&self) -> Result<(), Fault> {
+            self.calls.borrow_mut().push("open_saved_path");
+            // Like LivePlatform::open_fixed: a second exact probe is required before release.
+            self.reopen
+                .borrow_mut()
+                .pop_front()
+                .expect("reopen fixture")?;
+            self.verified.set(true);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn transient_failure_recovers_only_after_fresh_exact_evidence() {
+        let gate = Gate::new(
+            true,
+            vec![evidence(None), evidence(Some("ip=198.51.100.7\n"))],
+        );
+        assert!(matches!(
+            poll_fixed(&gate),
+            FixedPoll::Blocked {
+                was_verified: true,
+                block_error: None,
+                ..
+            }
+        ));
+        assert!(!gate.verified());
+        assert!(
+            matches!(poll_fixed(&gate), FixedPoll::Recovered),
+            "restored evidence must reopen the previously blocked saved path"
+        );
+        assert!(gate.verified());
+        assert_eq!(
+            *gate.calls.borrow(),
+            ["verify", "block", "verify", "open_saved_path"]
+        );
+    }
+
+    #[test]
+    fn wrong_or_unknown_exit_never_reopens() {
+        for probe in [
+            evidence(None),
+            evidence(Some("ip=198.51.100.8\n")),
+            evidence(Some("invalid")),
+        ] {
+            let gate = Gate::new(false, vec![probe]);
+            assert!(matches!(poll_fixed(&gate), FixedPoll::Blocked { .. }));
+            assert!(!gate.verified());
+            assert_eq!(*gate.calls.borrow(), ["verify", "block"]);
+        }
+    }
+
+    #[test]
+    fn failed_second_probe_or_reopen_stays_blocked() {
+        for failure in [
+            evidence(None),
+            evidence(Some("ip=198.51.100.8\n")),
+            Err(Fault::new("SELECT", "selection failed")),
+        ] {
+            let gate = Gate::new(false, vec![evidence(Some("ip=198.51.100.7\n"))]);
+            *gate.reopen.borrow_mut() = vec![failure].into();
+            assert!(matches!(poll_fixed(&gate), FixedPoll::Blocked { .. }));
+            assert!(!gate.verified());
+            assert_eq!(*gate.calls.borrow(), ["verify", "open_saved_path", "block"]);
+        }
+    }
+
+    #[test]
+    fn healthy_verified_gate_does_not_reselect_or_close_connections() {
+        let gate = Gate::new(true, vec![evidence(Some("ip=198.51.100.7\n"))]);
+        assert!(matches!(poll_fixed(&gate), FixedPoll::Healthy));
+        assert!(gate.verified());
+        assert_eq!(*gate.calls.borrow(), ["verify"]);
+    }
+
+    #[test]
+    fn healthy_exit_retries_a_previously_failed_report_without_reopening() {
+        let gate = Gate::new(true, vec![evidence(Some("ip=198.51.100.7\n"))]);
+        let poll = poll_fixed(&gate);
+        assert!(
+            needs_refresh(&poll, Mode::AgentUnverified),
+            "a stale unverified report needs a new complete check after exact exit evidence"
+        );
+        assert!(!needs_refresh(&poll, Mode::AgentReady));
+        assert_eq!(*gate.calls.borrow(), ["verify"]);
+    }
+
+    #[test]
+    fn block_failure_is_not_hidden() {
+        let mut gate = Gate::new(true, vec![evidence(None)]);
+        gate.block_fails = true;
+        assert!(matches!(
+            poll_fixed(&gate),
+            FixedPoll::Blocked {
+                block_error: Some(_),
+                ..
+            }
+        ));
+        assert!(!gate.verified());
     }
 }

@@ -63,7 +63,7 @@ impl ItemGate {
 /// and what leaving Agent mode puts back; while Agent mode runs, the controller keeps the system
 /// proxy on the core and backs off if that client keeps rewriting it. Treating it as a blocker
 /// made system-level routing impossible for exactly the users who have such a client.
-fn writer_items(kind: WriterKind) -> &'static [GlobalItem] {
+pub(crate) fn writer_items(kind: WriterKind) -> &'static [GlobalItem] {
     match kind {
         WriterKind::ProxyListener => &[],
         WriterKind::LegacyGuardMutex | WriterKind::LegacyTrayMutex | WriterKind::StartupItem => {

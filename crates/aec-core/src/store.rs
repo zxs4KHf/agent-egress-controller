@@ -41,6 +41,33 @@ impl std::fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
+/// One owner of an installation's mutable session at a time. The OS releases ownership on exit,
+/// including a crash; the empty marker file itself never signifies an unfinished session.
+pub struct SessionLease {
+    _file: fs::File,
+}
+
+impl SessionLease {
+    pub fn acquire(data_dir: &Path) -> Result<Self, String> {
+        fs::create_dir_all(data_dir).map_err(|e| format!("SESSION_LOCK: {e}"))?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(data_dir.join("session.lock"))
+            .map_err(|e| format!("SESSION_LOCK: {e}"))?;
+        file.try_lock().map_err(|e| match e {
+            fs::TryLockError::WouldBlock => {
+                "SESSION_BUSY: 本安装的会话正在使用中；请在托盘重新检测或正常退出，再运行修改命令。"
+                    .into()
+            }
+            fs::TryLockError::Error(e) => format!("SESSION_LOCK: {e}"),
+        })?;
+        Ok(Self { _file: file })
+    }
+}
+
 fn io_err(path: &Path) -> impl FnOnce(io::Error) -> StoreError + '_ {
     move |source| StoreError::Io {
         path: path.to_path_buf(),

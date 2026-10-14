@@ -447,19 +447,14 @@ pub fn relay_config(
             step_timeout_ms: None,
         });
     }
-    // With a tunnel, every candidate is tried through it first; the direct attempts follow only when
-    // the profile allows them. The exit host is the same either way, so S1 still holds.
-    if profile.egress.fixed_exit {
-        for u in &mut candidates {
-            u.via = Some(format!("127.0.0.1:{}", ports.tunnel));
-            u.step_timeout_ms = profile
-                .egress
-                .tunnel
-                .as_ref()
-                .filter(|t| t.enabled)
-                .map(|t| t.step_timeout_ms.into());
-        }
-    } else if let Some(t) = profile.egress.tunnel.as_ref().filter(|t| t.enabled) {
+    // With a tunnel, every candidate is tried through it first; the direct attempts follow when the
+    // profile allows them. The exit host is the same either way, so S1 still holds.
+    //
+    // A fixed exit draws from the same pool. The tunnel can be reset, throttled or blocked while
+    // the exit itself is still reachable from the home address; without a direct candidate that
+    // condition reads as "the exit is gone", and the gate then blocks traffic that never depended
+    // on it. The protected sites must lose their path in that case, not the whole machine.
+    if let Some(t) = profile.egress.tunnel.as_ref().filter(|t| t.enabled) {
         let tunnelled = candidates.iter().cloned().map(|mut u| {
             u.via = Some(format!("127.0.0.1:{}", ports.tunnel));
             u.step_timeout_ms = Some(t.step_timeout_ms.into());
@@ -647,6 +642,32 @@ mod tests {
         let only = relay_config(&with_tunnel(false), &CorePorts::default(), &TunnelCreds).unwrap();
         assert!(only.candidates.iter().all(|u| u.via.is_some()));
         assert_eq!(only.candidates.len(), 2);
+    }
+
+    #[test]
+    fn a_fixed_exit_keeps_the_direct_candidates() {
+        let mut p = with_tunnel(true);
+        p.egress.fixed_exit = true;
+        p.egress.expected.ip = Some("198.51.100.7".into());
+        let r = relay_config(&p, &CorePorts::default(), &TunnelCreds).unwrap();
+        let shape: Vec<(u16, Option<&str>)> = r
+            .candidates
+            .iter()
+            .map(|u| (u.port, u.via.as_deref()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (12324, Some("127.0.0.1:17326")),
+                (12323, Some("127.0.0.1:17326")),
+                (12324, None),
+                (12323, None),
+            ],
+            "a blocked tunnel must fall back to the exit's direct path"
+        );
+        p.egress.tunnel.as_mut().unwrap().direct_fallback = false;
+        let strict = relay_config(&p, &CorePorts::default(), &TunnelCreds).unwrap();
+        assert!(strict.candidates.iter().all(|u| u.via.is_some()));
     }
 
     #[test]

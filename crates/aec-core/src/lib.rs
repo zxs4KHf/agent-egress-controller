@@ -4,6 +4,7 @@
 //! machine sits behind the traits in [`probe`], so the rest of the crate is testable with
 //! [`testing::FakeHost`] and never changes system state by accident.
 
+pub mod agent;
 pub mod checkpage;
 pub mod checks;
 pub mod cli;

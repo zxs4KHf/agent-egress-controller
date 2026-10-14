@@ -89,3 +89,59 @@ fn core_commands_use_the_saved_mixed_port() {
         "saved port ignored by core command"
     );
 }
+
+#[test]
+fn cli_mutations_cannot_overwrite_an_active_session() {
+    let data = std::env::temp_dir().join(format!("aec-session-owner-{}", std::process::id()));
+    std::fs::create_dir_all(&data).unwrap();
+    // Model the tray's lifetime ownership using an OS lock, not a removable PID marker.
+    let owner = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(data.join("session.lock"))
+        .unwrap();
+    owner.try_lock().unwrap();
+    let state = aec_core::controller::ControllerState {
+        mode: aec_core::controller::Mode::RestoreIncomplete,
+        ..Default::default()
+    };
+    let original = serde_json::to_vec(&state).unwrap();
+    std::fs::write(data.join("state.json"), &original).unwrap();
+    for args in [
+        &["ack"][..],
+        &["recheck"],
+        &["exit"],
+        &["enter"],
+        &["core", "down"],
+        &["core", "select", "test", "DIRECT"],
+        &["profile", "init"],
+    ] {
+        let result = aec_dev(&data, args).output().unwrap();
+        assert!(
+            !result.status.success(),
+            "CLI must refuse to mutate a tray-owned session: {args:?}"
+        );
+        assert!(String::from_utf8_lossy(&result.stderr).contains("SESSION_BUSY"));
+        assert_eq!(
+            std::fs::read(data.join("state.json")).unwrap(),
+            original,
+            "CLI overwrote active state"
+        );
+    }
+    assert!(
+        aec_dev(&data, &["state"])
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "read-only state remains available"
+    );
+    drop(owner);
+    assert!(
+        aec_dev(&data, &["ack"]).output().unwrap().status.success(),
+        "OS ownership is released when the holder exits"
+    );
+    let _ = std::fs::remove_dir_all(&data);
+}

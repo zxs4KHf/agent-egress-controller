@@ -678,9 +678,12 @@ fn a_silent_tunnel_reserves_budget_for_direct_fallback() {
     let clock = Clock::new();
     let direct = up(12324, UpstreamProto::Socks5);
     let pool = Pool::new(vec![via(direct.clone(), 17326), direct]).unwrap();
+    // A silent entrance is answered by the step timeout, never by the end of the budget.
     let mut dial = |i: usize, deadline: Instant| {
+        clock.advance(
+            Duration::from_millis(2500).min(deadline.saturating_duration_since(clock.now())),
+        );
         if i == 0 {
-            clock.advance(deadline.saturating_duration_since(clock.now()));
             Err(io::Error::new(io::ErrorKind::TimedOut, "silent tunnel"))
         } else {
             Ok(())
@@ -698,6 +701,38 @@ fn a_silent_tunnel_reserves_budget_for_direct_fallback() {
         out.winner,
         Some(1),
         "a stalled tunnel must not consume the direct attempt's budget"
+    );
+}
+
+#[test]
+fn a_working_tunnel_behind_a_dead_one_is_still_tried() {
+    let clock = Clock::new();
+    let dead = up(12324, UpstreamProto::Socks5);
+    let good = up(12323, UpstreamProto::Http);
+    let direct = up(12323, UpstreamProto::Http);
+    let pool = Pool::new(vec![via(dead, 17326), via(good, 17326), direct]).unwrap();
+    let mut dial = |i: usize, deadline: Instant| {
+        clock.advance(
+            Duration::from_millis(2500).min(deadline.saturating_duration_since(clock.now())),
+        );
+        if i == 0 {
+            Err(io::Error::new(io::ErrorKind::TimedOut, "dead tunnel"))
+        } else {
+            Ok(())
+        }
+    };
+    let out = dial_pool(
+        &pool,
+        Duration::from_secs(4),
+        1,
+        Duration::from_secs(3),
+        &|| clock.now(),
+        &mut dial,
+    );
+    assert_eq!(
+        out.winner,
+        Some(1),
+        "a second tunnel candidate must not be skipped for the direct one"
     );
 }
 

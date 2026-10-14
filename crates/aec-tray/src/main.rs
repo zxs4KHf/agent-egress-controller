@@ -80,6 +80,7 @@ mod tray {
     const ID_DASHBOARD: usize = 10;
     const ID_STARTUP: usize = 11;
     const ID_SHORTCUTS: usize = 12;
+    const ID_PROXY_HELP: usize = 13;
     const ID_ENTRY_BASE: usize = 100;
     const ID_SWITCH_BASE: usize = 10000;
     const TIMER_REFRESH: usize = 1;
@@ -96,6 +97,7 @@ mod tray {
         layout: Layout,
         icons: [HICON; 4],
         setup: Option<SetupServer>,
+        _agent: Option<aec_core::agent::Server>,
         taskbar_created: u32,
         quitting: bool,
     }
@@ -251,6 +253,16 @@ mod tray {
             })
         }
 
+        fn open_proxy_help(&mut self) -> Effect {
+            match self.open_page(false) {
+                Effect::Open(_) => self
+                    .setup
+                    .as_ref()
+                    .map_or(Effect::None, |s| Effect::Open(s.proxy_help_url())),
+                effect => effect,
+            }
+        }
+
         fn send(&self, cmd: Cmd) {
             let _ = self.tx.send(cmd);
         }
@@ -319,6 +331,7 @@ mod tray {
                 add(on(idle), ID_PROMPTS, "复制排查提示词");
                 add(MF_STRING, ID_SETTINGS, "设置出口和分流…");
                 add(MF_STRING, ID_DASHBOARD, "打开看板（连接路径与规则）");
+                add(MF_STRING, ID_PROXY_HELP, "代理冲突说明");
                 add(
                     MF_STRING
                         | if crate::startup::enabled() {
@@ -359,6 +372,7 @@ mod tray {
                 }
                 ID_SETTINGS => return self.open_page(false),
                 ID_DASHBOARD => return self.open_page(true),
+                ID_PROXY_HELP => return self.open_proxy_help(),
                 ID_STARTUP => {
                     let (tx, _rx) = channel();
                     self.send(Cmd::Startup(!crate::startup::enabled(), tx));
@@ -484,6 +498,7 @@ mod tray {
                 "--dashboard" => Some(ID_DASHBOARD),
                 "--enter" => Some(ID_ENTER),
                 "--quit" => Some(ID_QUIT),
+                "--recheck" => Some(ID_RECHECK),
                 _ => None,
             });
             if let Some(request) = request {
@@ -502,7 +517,7 @@ mod tray {
             );
             return;
         }
-        if std::env::args().any(|a| a == "--quit") {
+        if std::env::args().any(|a| a == "--quit" || a == "--recheck") {
             return;
         }
 
@@ -587,8 +602,7 @@ mod tray {
             unsafe { DestroyWindow(hwnd) };
             return;
         }
-        // System-proxy observation every 30 seconds. It does nothing unless Agent mode
-        // runs with the system proxy taken over; it stops when the worker is gone.
+        // Observe external system-proxy changes; never compete with another global writer.
         {
             let keep_tx = tx.clone();
             std::thread::spawn(move || loop {
@@ -600,6 +614,21 @@ mod tray {
         }
 
         let tc = wide("TaskbarCreated");
+        let agent = aec_core::agent::Server::start(
+            &layout.data_dir,
+            Arc::new(Backend {
+                tx: tx.clone(),
+                data_dir: layout.data_dir.clone(),
+                shared: shared.clone(),
+            }),
+        );
+        if agent.is_err() {
+            win::message_box(
+                hwnd,
+                "本机 Agent 控制接口未能启动；网络控制继续运行。请从看板查看 Agent 接入状态。",
+                "Agent 出口控制器",
+            );
+        }
         let ui = Ui {
             hwnd,
             tx,
@@ -612,6 +641,7 @@ mod tray {
                 win::dot_icon(RED),
             ],
             setup: None,
+            _agent: agent.ok(),
             taskbar_created: unsafe { RegisterWindowMessageW(tc.as_ptr()) },
             quitting: false,
         };

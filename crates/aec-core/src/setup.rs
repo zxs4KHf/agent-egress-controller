@@ -755,6 +755,18 @@ pub fn apply_settings(
 
 /// What the page server needs from its owner.
 pub trait SetupBackend: Send + Sync {
+    fn configure(&self, patch: serde_json::Value) -> Result<(), Vec<FieldError>> {
+        self.save(crate::agent::patch_settings(self.view(), patch)?)
+    }
+    fn action(&self, _action: &str) -> Result<(), Vec<FieldError>> {
+        Err(vec![err("action", "模式控制不可用")])
+    }
+    fn agent_access(&self, _enabled: bool) -> Result<(), Vec<FieldError>> {
+        Err(vec![err("agent", "Agent 接口不可用")])
+    }
+    fn agent_info(&self) -> serde_json::Value {
+        serde_json::json!({"enabled":false})
+    }
     fn view(&self) -> SetupView;
     /// Validate and store. Errors are per field.
     fn save(&self, form: ExitForm) -> Result<(), Vec<FieldError>>;
@@ -830,7 +842,13 @@ pub fn page(token: &str, view: &SetupView) -> String {
         )
 }
 
-fn handle(mut s: TcpStream, port: u16, token: &str, backend: &dyn SetupBackend) {
+fn handle(
+    mut s: TcpStream,
+    port: u16,
+    token: &str,
+    backend: &dyn SetupBackend,
+    agent: Option<&crate::agent::Auth>,
+) {
     let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -856,7 +874,63 @@ fn handle(mut s: TcpStream, port: u16, token: &str, backend: &dyn SetupBackend) 
     if header(&head, "host") != Some(me.as_str()) {
         return respond(&mut s, "403 Forbidden", "text/plain", "host rejected");
     }
+    if let Some(auth) = agent {
+        if header(&head, "authorization") != Some(format!("Bearer {}", auth.token).as_str())
+            || header(&head, "origin").is_some()
+            || header(&head, "transfer-encoding").is_some()
+            || !header(&head, "content-type").is_some_and(|v| {
+                v.split(';')
+                    .next()
+                    .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json"))
+            })
+            || !auth.enabled()
+        {
+            return respond(
+                &mut s,
+                "403 Forbidden",
+                "application/json",
+                "{\"error\":\"access denied\"}",
+            );
+        }
+        let len = header(&head, "content-length").and_then(|v| v.parse::<usize>().ok());
+        if method != "POST" || target != "/api/v1/call" || len.is_none() || len.unwrap() > MAX_BODY
+        {
+            return respond(
+                &mut s,
+                "400 Bad Request",
+                "application/json",
+                "{\"error\":\"expected POST /api/v1/call with Content-Length\"}",
+            );
+        }
+        let len = len.unwrap();
+        while buf.len() < head_end + len {
+            match s.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+        let result = serde_json::from_slice::<crate::agent::Call>(&buf[head_end..head_end + len])
+            .map_err(|_| "invalid request".to_string())
+            .and_then(|call| crate::agent::call(backend, call));
+        buf.fill(0);
+        let body = match result {
+            Ok(value) => serde_json::json!({"ok":true,"result":value}),
+            Err(error) => serde_json::json!({"ok":false,"error":error}),
+        };
+        return respond(
+            &mut s,
+            "200 OK",
+            "application/json; charset=utf-8",
+            &body.to_string(),
+        );
+    }
     match (method, path) {
+        ("GET", "/agent") if token_ok => respond(
+            &mut s,
+            "200 OK",
+            "text/html; charset=utf-8",
+            &crate::agent::page(token, &backend.agent_info()),
+        ),
         ("GET", "/dashboard" | "/state") if token_ok => match backend.dashboard() {
             Some(view) => {
                 let (ctype, body) = if path == "/state" {
@@ -885,7 +959,16 @@ fn handle(mut s: TcpStream, port: u16, token: &str, backend: &dyn SetupBackend) 
             "text/html; charset=utf-8",
             &page(token, &backend.view()),
         ),
-        ("POST", "/save" | "/rules" | "/path" | "/startup" | "/shortcuts") if token_ok => {
+        ("GET", "/proxy-help") if token_ok => respond(
+            &mut s,
+            "200 OK",
+            "text/html; charset=utf-8",
+            &proxy_help_page(token),
+        ),
+        (
+            "POST",
+            "/save" | "/rules" | "/path" | "/startup" | "/shortcuts" | "/action" | "/agent-access",
+        ) if token_ok => {
             if header(&head, "origin") != Some(format!("http://{me}").as_str()) {
                 return respond(&mut s, "403 Forbidden", "text/plain", "origin rejected");
             }
@@ -917,6 +1000,12 @@ fn handle(mut s: TcpStream, port: u16, token: &str, backend: &dyn SetupBackend) 
             struct EmptyForm {}
             let malformed = || vec![err("form", "表单格式不对")];
             let result = match path {
+                "/agent-access" => serde_json::from_slice::<StartupForm>(body)
+                    .map_err(|_| malformed())
+                    .and_then(|form| backend.agent_access(form.enabled)),
+                "/action" => serde_json::from_slice::<PathForm>(body)
+                    .map_err(|_| malformed())
+                    .and_then(|form| backend.action(&form.path)),
                 "/startup" => serde_json::from_slice::<StartupForm>(body)
                     .map_err(|_| malformed())
                     .and_then(|form| backend.startup(form.enabled)),
@@ -947,8 +1036,8 @@ fn handle(mut s: TcpStream, port: u16, token: &str, backend: &dyn SetupBackend) 
         }
         (
             _,
-            "/setup" | "/save" | "/dashboard" | "/state" | "/rules" | "/path" | "/startup"
-            | "/shortcuts",
+            "/setup" | "/proxy-help" | "/save" | "/dashboard" | "/state" | "/rules" | "/path"
+            | "/startup" | "/shortcuts" | "/agent" | "/agent-access" | "/action",
         ) => respond(&mut s, "403 Forbidden", "text/plain", "token rejected"),
         _ => respond(&mut s, "404 Not Found", "text/plain", "not found"),
     }
@@ -958,11 +1047,30 @@ impl SetupServer {
     pub fn dashboard_url(&self) -> String {
         format!("http://127.0.0.1:{}/dashboard?t={}", self.port, self.token)
     }
+    pub fn proxy_help_url(&self) -> String {
+        format!("http://127.0.0.1:{}/proxy-help?t={}", self.port, self.token)
+    }
     /// Listen on 127.0.0.1:`port` (0 picks a free port).
     pub fn start(
         port: u16,
         token: String,
         backend: Arc<dyn SetupBackend>,
+    ) -> std::io::Result<Self> {
+        Self::start_inner(port, token, backend, None)
+    }
+
+    pub(crate) fn start_agent(
+        backend: Arc<dyn SetupBackend>,
+        auth: crate::agent::Auth,
+    ) -> std::io::Result<Self> {
+        Self::start_inner(0, String::new(), backend, Some(auth))
+    }
+
+    fn start_inner(
+        port: u16,
+        token: String,
+        backend: Arc<dyn SetupBackend>,
+        agent: Option<crate::agent::Auth>,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind(("127.0.0.1", port))?;
         let port = listener.local_addr()?.port();
@@ -974,7 +1082,7 @@ impl SetupServer {
                 match listener.accept() {
                     Ok((s, _)) => {
                         let _ = s.set_nonblocking(false);
-                        handle(s, port, &token2, backend.as_ref());
+                        handle(s, port, &token2, backend.as_ref(), agent.as_ref());
                     }
                     Err(_) => std::thread::sleep(Duration::from_millis(50)),
                 }
@@ -991,6 +1099,9 @@ impl SetupServer {
     pub fn url(&self) -> String {
         format!("http://127.0.0.1:{}/setup?t={}", self.port, self.token)
     }
+    pub fn port(&self) -> u16 {
+        self.port
+    }
 }
 
 impl Drop for SetupServer {
@@ -1001,6 +1112,39 @@ impl Drop for SetupServer {
         }
     }
 }
+
+fn proxy_help_page(token: &str) -> String {
+    PROXY_HELP_PAGE.replace("__TOKEN__", token)
+}
+
+const PROXY_HELP_PAGE: &str = r##"<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>代理共存与固定出口</title>
+<style>
+:root{--bg:#f6f7f5;--panel:#fff;--fg:#1d2420;--muted:#58645e;--line:#d8ddd9;--accent:#246648;--warn:#fff2d4}
+@media(prefers-color-scheme:dark){:root{--bg:#141816;--panel:#1d2320;--fg:#e6ebe8;--muted:#a0aaa5;--line:#333b37;--accent:#72c49a;--warn:#39301e}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,"Microsoft YaHei UI",sans-serif}
+main{max-width:760px;margin:0 auto;padding:24px 16px 48px}h1{font-size:23px;margin:0 0 6px}h2{font-size:17px;margin:0 0 8px}p{margin:8px 0}section{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;margin-top:14px}.muted{color:var(--muted)}.warn{background:var(--warn);padding:12px 14px;border-radius:6px;margin-top:14px}ol{padding-left:24px}li{padding:3px 0}a{color:var(--accent)}
+</style></head><body><main>
+<h1>代理共存与固定出口</h1>
+<p class="muted">系统级分流需要有一个明确的系统代理所有者。这里解释冲突提示的原因、推荐配置和目前未支持的替代方式。</p>
+<div class="warn"><b>检测到其他程序改写 Windows 系统代理。</b>当前值不会被 AEC 自动覆盖。G6 已失败、Agent 就绪已撤销；绕过 AEC 的系统流量不受固定出口保护，请先按下面步骤处理冲突。</div>
+<section><h2>推荐：AEC 接管系统代理，另一客户端只提供上游</h2>
+<ol><li>打开 Clash、mihomo 或其他代理客户端设置，关闭「系统代理 / Set as system proxy」。</li>
+<li>同时关闭该客户端的 VPN、TUN、透明代理或全局接管模式。只保留本地内核运行。</li>
+<li>在客户端内照常选择或切换节点。切换节点不需要重新打开「系统代理」。</li>
+<li>在 AEC 设置的「分流 → 本机代理」填写该客户端的本地监听地址和端口（例如 <code>127.0.0.1:7890</code>），作为普通流量上游。受保护 AI 域名继续按 AEC 固定 ISP 规则走。</li>
+<li>保持 AEC 的「接管 Windows 系统代理」开启。回到托盘，退出 Agent 模式，再重新进入；确认 G6 通过。</li></ol>
+<p>原因：Windows 的系统代理只有一个全局值。AEC 接管时会把它指向 AEC 自己的入口；若另一客户端开启同名开关，它会把该值改成自己的端口，系统请求便绕过 AEC 的分流。两个程序反复写回只会互相覆盖，因此 AEC 保留外部改动并要求用户处理，不会静默抢回。</p>
+<p>VPN/TUN/透明代理可能接管整个网络接口，连 AEC 到 ISP 代理的连接也可能被再次转发，导致出口 IP 改变或验证失败。它们无法作为“只切普通流量节点”的开关使用。</p>
+</section>
+<section><h2>高级替代：让代理客户端继续持有系统代理</h2>
+<p>理论上可由兼容的 Clash/Mihomo 配置把受保护域名规则转发到 AEC 本地入口，再由 AEC 连接固定 ISP；普通域名仍由该客户端按节点处理。这样用户可以继续打开它的系统代理开关。</p>
+<p>这需要客户端规则、端口和 AEC 路由三者精确配合，避免循环代理；还要处理客户端配置覆盖、规则优先级和节点变化。当前 AEC 不生成或维护这类外部客户端配置，桌面连接归属检测也不能把经 Clash 转发的流量当作 Claude 直连 AEC 的证据。因此它目前是未支持的集成方向，不应仅按通用配置片段启用或据此宣称固定出口已验证。</p>
+</section>
+<p><a href="/setup?t=__TOKEN__">返回出口与分流设置</a></p>
+</main></body></html>"##;
 
 const PAGE: &str = r##"<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -1075,7 +1219,7 @@ button:disabled{opacity:.5;cursor:default}
 <div id="splitBox" class="sub">
 <div class="row"><div><label for="localProxy">本机代理（可选）</label><input id="localProxy" type="text" placeholder="例如 127.0.0.1:7890，没有就留空"><div class="fe" data-for="localProxy"></div></div>
 <div class="narrow"><label for="localProxyProto">协议</label><select id="localProxyProto"><option value="socks5">SOCKS5</option><option value="http">HTTP</option></select></div></div>
-<div class="hint">留空：其他网站直连。本机代理不可用时可回退到直连；每 15 秒进行一次健康检查，恢复可用后重新选择。</div>
+<div class="hint">留空：其他网站直连。本机代理不可用时可回退到直连；每 15 秒进行一次健康检查，恢复可用后重新选择。若使用 Clash 等客户端的端口作为上游，请关闭该客户端的「系统代理」和 VPN/TUN/全局接管开关；内核保持运行即可，节点仍可在客户端内切换。</div>
 <label for="extraDomains">也走出口的其他域名</label><textarea id="extraDomains" placeholder="每行一个，例如 openai.com"></textarea>
 <div class="hint">按后缀匹配，<code>openai.com</code> 也包括 <code>api.openai.com</code>。想让某个站点改走本机代理（比如 ChatGPT），就把它从这里和下面的「检测站点」里都删掉。 <button type="button" class="link" id="suggest">填入常用 AI 域名</button></div>
 <div class="fe" data-for="extraDomains"></div>
@@ -1091,7 +1235,7 @@ button:disabled{opacity:.5;cursor:default}
 <label for="coreMixedPort">本机代理入口端口</label><input id="coreMixedPort" type="number" min="0" max="65535" placeholder="默认 17893"><div class="fe" data-for="coreMixedPort"></div>
 <div class="hint">留空或 0 使用默认端口。接替已有代理时，填写客户端当前使用的入口端口；不会改写用户级代理环境变量。保存后下次进入生效。若本机程序依赖这个端口，先核对，避免断网。</div>
 <label class="check"><input id="systemProxy" type="checkbox"><span>进入 Agent 模式时接管 Windows 系统代理，退出时恢复原样
-<div class="hint">电脑上跟随 Windows 系统代理的程序也使用上面的规则；是否遵循系统代理由各程序决定。发现其他程序改写时会撤销就绪并告警，请关闭冲突程序的系统代理开关后重新进入。默认关闭，真实写入需要接管门放行。</div></span></label>
+<div class="hint">Windows 只有一个系统代理设置。本程序接管后会把它指向自己的入口端口；不要同时打开 Clash 等客户端的「系统代理」、VPN/TUN 或全局代理开关。可以保留对方内核运行，在上方「本机代理」填它的本地端口作为普通流量上游，并照常切换节点。检测到其他程序改写时，本程序不会抢写，会撤销就绪并提示关闭冲突开关后退出、重新进入。默认关闭，真实写入需要接管门放行。</div></span></label>
 </section>
 
 <section><h2>时区与语言</h2>
@@ -1671,7 +1815,7 @@ mod tests {
         assert!(backend.0.lock().unwrap().is_empty());
         assert!(post(&format!("http://127.0.0.1:{port}")).contains("\"ok\":true"));
         assert_eq!(backend.0.lock().unwrap()[0].username, "alice");
-        for path in ["dashboard", "state"] {
+        for path in ["dashboard", "state", "proxy-help"] {
             assert!(
                 send(port, &format!("GET /{path}?t=bad HTTP/1.1\r\n{h}\r\n"))
                     .starts_with("HTTP/1.1 403")
@@ -1698,5 +1842,44 @@ mod tests {
             assert!(response.contains("表单格式不对"));
             assert!(!response.contains("must-not-echo"));
         }
+    }
+
+    #[test]
+    fn agent_http_requires_credential_and_never_accepts_browser_origin() {
+        let data = std::env::temp_dir().join(format!("aec-agent-auth-{}", std::process::id()));
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join(crate::agent::ACCESS), b"true").unwrap();
+        let backend: Arc<dyn SetupBackend> = Arc::new(Fake(Default::default()));
+        let server = SetupServer::start_inner(
+            0,
+            String::new(),
+            backend,
+            Some(crate::agent::Auth {
+                token: "private-token".into(),
+                data: data.clone(),
+            }),
+        )
+        .unwrap();
+        let port = server.port;
+        let body = r#"{"name":"aec_state","arguments":{}}"#;
+        let request = |auth: &str, origin: Option<&str>, content_type: &str| {
+            let origin = origin.map_or(String::new(), |v| format!("Origin: {v}\r\n"));
+            send(port,&format!("POST /api/v1/call HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: {auth}\r\n{origin}Content-Type: {content_type}\r\nContent-Length: {}\r\n\r\n{body}",body.len()))
+        };
+        assert!(request("Bearer wrong", None, "application/json").starts_with("HTTP/1.1 403"));
+        assert!(request(
+            "Bearer private-token",
+            Some("http://127.0.0.1"),
+            "application/json"
+        )
+        .starts_with("HTTP/1.1 403"));
+        assert!(request("Bearer private-token", None, "text/plain").starts_with("HTTP/1.1 403"));
+        assert!(request("Bearer private-token", None, "application/json").contains("\"ok\":true"));
+        std::fs::write(data.join(crate::agent::ACCESS), b"false").unwrap();
+        assert!(
+            request("Bearer private-token", None, "application/json").starts_with("HTTP/1.1 403")
+        );
+        drop(server);
+        let _ = std::fs::remove_dir_all(data);
     }
 }

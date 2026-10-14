@@ -851,6 +851,30 @@ fn main() -> ExitCode {
             .data_dir()
         });
 
+    // Read-only diagnostics remain available while the tray runs. Commands that change the
+    // session, core, profile or snapshot must never compete with the tray's in-memory controller.
+    let changes_session = match args.first().map(String::as_str) {
+        Some("enter" | "recheck" | "exit" | "ack" | "snapshot") => true,
+        Some("core") => matches!(
+            args.get(1).map(String::as_str),
+            Some("up" | "down" | "select" | "install")
+        ),
+        Some("profile") => {
+            matches!(args.get(1).map(String::as_str), Some("init" | "import")) && !has("--dry-run")
+        }
+        _ => false,
+    };
+    let _session = if changes_session {
+        match aec_core::store::SessionLease::acquire(&data_dir) {
+            Ok(lease) => Some(lease),
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
     match args.first().map(String::as_str) {
         Some("status") => {
             let s = status::collect(&host(), Some(&data_dir));
