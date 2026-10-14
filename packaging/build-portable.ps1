@@ -113,6 +113,12 @@ try {
     $zipSums = Join-Path $dist "SHA256SUMS-$version.txt"
     "$zipHash  $name.zip" | Set-Content -LiteralPath $zipSums -Encoding utf8
     $makensis = Get-Command makensis.exe -ErrorAction SilentlyContinue
+    if (-not $makensis) {
+        $defaultMakensis = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'NSIS\makensis.exe'
+        if (Test-Path -LiteralPath $defaultMakensis -PathType Leaf) {
+            $makensis = [pscustomobject]@{ Source = $defaultMakensis }
+        }
+    }
     if ($makensis) {
         $installer = Join-Path $dist "AgentEgressController-$version-setup.exe"
         & $makensis.Source "/DPackageDir=$output" "/DProductVersion=$version" "/DInstallerOut=$installer" (Join-Path $repo "packaging/installer.nsi")

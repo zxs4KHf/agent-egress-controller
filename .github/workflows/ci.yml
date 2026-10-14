@@ -33,3 +33,35 @@ jobs:
       - name: Test interactive installer compilation
         shell: powershell
         run: ./packaging/test-installer.ps1
+      - name: Download and verify pinned mihomo for packaging
+        shell: powershell
+        run: |
+          $pin = Get-Content crates/aec-core/src/core/pin.rs -Raw
+          $url = [regex]::Match($pin, 'ASSET_URL: &str =\s*"([^"]+)"').Groups[1].Value
+          $assetHash = [regex]::Match($pin, 'ASSET_SHA256: &str = "([a-f0-9]{64})"').Groups[1].Value
+          $exeName = [regex]::Match($pin, 'EXE_IN_ASSET: &str = "([^"]+)"').Groups[1].Value
+          $exeHash = [regex]::Match($pin, 'EXE_SHA256: &str = "([a-f0-9]{64})"').Groups[1].Value
+          if (-not $url -or -not $assetHash -or -not $exeName -or -not $exeHash) { throw 'mihomo pin is incomplete' }
+          $archive = Join-Path $env:RUNNER_TEMP 'mihomo-pinned.zip'
+          $expanded = Join-Path $env:RUNNER_TEMP 'mihomo-pinned'
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $assetHash) { throw 'mihomo archive SHA256 mismatch' }
+          Expand-Archive -LiteralPath $archive -DestinationPath $expanded
+          $exe = Join-Path $expanded $exeName
+          if ((Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant() -ne $exeHash) { throw 'mihomo executable SHA256 mismatch' }
+          New-Item -ItemType Directory -Path runtime/bin -Force | Out-Null
+          Copy-Item -LiteralPath $exe -Destination runtime/bin/aec-mihomo.exe
+      - name: Build portable package and installer
+        shell: powershell
+        run: ./packaging/build-portable.ps1
+      - name: Upload release candidates
+        uses: actions/upload-artifact@v4
+        with:
+          name: AgentEgressController-0.5.0-windows
+          path: |
+            dist/AgentEgressController-0.5.0-portable.zip
+            dist/AgentEgressController-0.5.0-setup.exe
+            dist/SHA256SUMS-0.5.0.txt
+            dist/SHA256SETUP-0.5.0.txt
+          if-no-files-found: error
+          retention-days: 14
