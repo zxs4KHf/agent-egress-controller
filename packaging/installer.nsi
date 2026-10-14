@@ -15,9 +15,12 @@ Name "Agent Egress Controller ${ProductVersion}"
 OutFile "${InstallerOut}"
 InstallDir "$LOCALAPPDATA\Programs\Agent Egress Controller"
 RequestExecutionLevel user
-SetShellVarContext current
 ShowInstDetails show
 ShowUnInstDetails show
+
+Function .onInit
+  SetShellVarContext current
+FunctionEnd
 
 !define MUI_ABORTWARNING
 !define MUI_WELCOMEPAGE_TITLE "Agent Egress Controller 安装向导"
