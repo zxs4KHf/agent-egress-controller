@@ -87,8 +87,18 @@ try {
     $registries = Get-ChildItem -LiteralPath (Join-Path $cargoCache "registry/src") -Directory
     $lock = Get-Content -LiteralPath (Join-Path $repo "Cargo.lock") -Raw
     $packages = [regex]::Matches($lock, '(?ms)\[\[package\]\]\s+name = "([^"]+)"\s+version = "([^"]+)"\s+source = "registry')
+    $metadataOutput = & cargo metadata --format-version 1 --filter-platform x86_64-pc-windows-msvc --locked
+    if ($LASTEXITCODE) { throw "Cannot resolve Windows package dependencies" }
+    $metadata = ($metadataOutput -join [Environment]::NewLine) | ConvertFrom-Json
+    $usedRegistryPackages = @{}
+    foreach ($node in $metadata.resolve.nodes) {
+        if ($node.id -match '#([^@]+)@(.+)$') {
+            $usedRegistryPackages["$($Matches[1])-$($Matches[2])"] = $true
+        }
+    }
     foreach ($package in $packages) {
         $folder = "$($package.Groups[1].Value)-$($package.Groups[2].Value)"
+        if (-not $usedRegistryPackages.ContainsKey($folder)) { continue }
         $source = $registries | ForEach-Object { Join-Path $_.FullName $folder } | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
         if (-not $source) { continue } # unused cross-target crates are not in this binary
         $licenses = Get-ChildItem -LiteralPath $source -File | Where-Object { $_.Name -match '^(LICENSE|LICENCE|COPYING|NOTICE)' }
