@@ -18,9 +18,9 @@
 
 **[已验证]** `powershell.exe -NoProfile -ExecutionPolicy Bypass -File packaging/portable/aec-update.ps1 -SelfTest` 通过；覆盖目录穿越拒绝、data 保留和替换失败回滚。
 
-**[待 GitHub Windows CI 验证]** NSIS 安装器编译冒烟测试。本地环境没有安装 NSIS。
+**[已验证]** GitHub Actions Windows CI 通过 NSIS 安装器编译冒烟测试，并在 Windows runner 上完成实际便携 ZIP 与 per-user 安装 EXE 的 Release 构建。发布包包含各自的 SHA256 sidecar；构建前下载的 Mihomo 压缩包与解出的 EXE 均按 `pin.rs` 中的固定哈希校验。
 
-**[待实机验证]** WebView2 窗口视觉和交互、缺少 WebView2 Runtime 时的提示、登录自启选项、安装卸载流程。当前自动化只验证宿主编译、本机页面服务和更新器文件操作；未声称已完成桌面端到端 UI 验收。
+**[待实机验证]** WebView2 窗口视觉和交互、缺少 WebView2 Runtime 时的提示、登录自启选项、安装卸载流程。自动化已验证宿主编译、受令牌保护的本机页面、更新器文件操作、NSIS 编译以及 Windows 发布包构建；尚未声称完成人工桌面端到端 UI 和安装卸载验收。
 
 ## 回滚
 
