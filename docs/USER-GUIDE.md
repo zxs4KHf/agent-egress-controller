@@ -1,4 +1,4 @@
-# 0.4.0 用户交付指南
+# 0.5.0 用户交付指南
 
 ## AI Agent 自动配置
 
@@ -14,9 +14,9 @@ Agent 可帮助管理站点规则、连接第一跳、模式、检查、自启�
 
 ## 下载与首次使用
 
-本次交付版为 0.4.0，便携包包含四个应用 exe。以下命令中的版本号和文件名以实际 Release 资产为准。
+本次交付版为 0.5.0。安装版包含 per-user 安装向导；安装后在一个桌面窗口中使用出口设置、规则/站点、固定出口路径、Agent/MCP 和代理帮助。系统托盘继续独立显示状态并提供恢复、检测和打开看板入口。便携版保留完整功能。以下命令中的版本号和文件名以实际 Release 资产为准。
 
-从 [GitHub Releases](https://github.com/zxs4KHf/agent-egress-controller/releases) 下载 0.4.0 zip 和对应 SHA256 文件。PowerShell 用 `Get-FileHash .\AgentEgressController-0.4.0-portable.zip -Algorithm SHA256` 对照校验。完整解压到可写目录，保留 portable.flag、bin 目录、四个应用 exe 和说明文件。
+从 [GitHub Releases](https://github.com/zxs4KHf/agent-egress-controller/releases) 下载 `AgentEgressController-0.5.0-setup.exe` 或 `AgentEgressController-0.5.0-portable.zip`，并核对对应的 SHA256 文件。安装版只安装到当前用户目录，不需要管理员权限；登录自启为可选项且默认关闭。便携版需完整解压到可写目录，保留 `portable.flag`、`bin` 目录、应用 exe 和说明文件。桌面控制中心需要 Microsoft Edge WebView2 Runtime；程序不会自动下载，缺失时会提示用户处理。
 
 双击 aec-tray.exe，在首次打开的本机设置页填出口、端口、协议和账号。端口可逐项附协议，例如 `12324/socks5`、`12323/http`；同一候选池的地址必须相同，备用端口用于拨号切换，不表示多个出口。
 
@@ -110,7 +110,9 @@ Electron 的 [系统代理模式](https://www.electronjs.org/docs/latest/api/str
 
 退出会请求关闭本应用启动且身份一致的浏览器，按快照恢复已实际接管的项，停止本应用内核与 relay。CLI 由用户关闭。恢复冲突保留外部状态，失败变红，提供重试或明确接受现状；崩溃后先恢复未完成会话，再删数据。
 
-升级先退出旧程序并恢复，备份 data，将新 zip 解压到新目录，再复制需要保留的数据。旧模板档案在读取时转换，保存才更新。换用户或机器需重新填写密码，credentialRef 不能替代跨机器密码。
+升级入口在托盘「检查并安装更新」。用户确认后，更新器从项目 GitHub Releases 下载完整便携 ZIP 和 SHA256 校验文件，核验后在当前程序目录更新；这是保留用户环境的就地更新，不是按二进制差异下载的小补丁。更新只覆盖白名单程序文件，保留 `data\`、用户提供的 GeoSite/GeoIP 文件和当前用户 Credential Manager 条目，并把被覆盖的旧程序文件备份到安装目录 `.aec-update-backup\`。替换中出错会恢复旧文件。托盘菜单只在日常模式允许检查更新；安装期间托盘按正常退出流程关闭，连接可能短暂中断。
+
+0.5.0 之前的版本没有更新入口，首次升级需要手动下载完整 0.5.0 ZIP 和校验文件。旧便携版用户先正常退出并确认恢复完成，备份整个旧程序目录；把 ZIP 解压到临时新目录，进入其中的 `AgentEgressController-0.5.0-portable` 文件夹，将里面的程序文件复制到旧安装目录并允许覆盖。不要删除或覆盖旧目录的 `data\`、用户放入 `bin\` 的 GeoSite/GeoIP 文件；`portable.flag` 保持存在。完成后从旧目录启动 `aec-tray.exe`。如果改用安装 EXE，它会使用 `%LOCALAPPDATA%\AgentEgressController\` 作为独立数据位置，不会自动迁移旧便携目录的 `data\`。旧模板档案在读取时转换，保存才更新。换 Windows 用户或机器需重新填写密码，`credentialRef` 不能替代跨机器密码。
 
 给其他用户交付全新 zip、SHA256SUMS、无私人凭据的路由示例和自己的服务说明。不要交付维护者 data、浏览器 profile、日志、快照、真实出口或带密码 YAML。内核/relay 启动时会使用临时凭据配置，正常退出会清理；崩溃后需先恢复，不能把运行中的 core 目录当作无敏感信息的示例。仓库 `crates/aec-core/tests/fixtures/routing.yaml` 是纯合成示例，不能直接联网。
 

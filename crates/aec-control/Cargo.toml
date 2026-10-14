@@ -1,0 +1,16 @@
+[package]
+name = "aec-control"
+description = "Agent Egress Controller desktop control center"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "aec-control"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+tao = "0.30"
+wry = "0.47"
+windows-sys.workspace = true

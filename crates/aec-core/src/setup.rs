@@ -797,7 +797,7 @@ pub struct SetupServer {
 fn respond(s: &mut TcpStream, status: &str, ctype: &str, body: &str) {
     let _ = write!(
         s,
-        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: SAMEORIGIN\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
 }
@@ -925,6 +925,12 @@ fn handle(
         );
     }
     match (method, path) {
+        ("GET", "/app") if token_ok => respond(
+            &mut s,
+            "200 OK",
+            "text/html; charset=utf-8",
+            &control_page(port, token, query),
+        ),
         ("GET", "/agent") if token_ok => respond(
             &mut s,
             "200 OK",
@@ -1036,14 +1042,22 @@ fn handle(
         }
         (
             _,
-            "/setup" | "/proxy-help" | "/save" | "/dashboard" | "/state" | "/rules" | "/path"
-            | "/startup" | "/shortcuts" | "/agent" | "/agent-access" | "/action",
+            "/app" | "/setup" | "/proxy-help" | "/save" | "/dashboard" | "/state" | "/rules"
+            | "/path" | "/startup" | "/shortcuts" | "/agent" | "/agent-access" | "/action",
         ) => respond(&mut s, "403 Forbidden", "text/plain", "token rejected"),
         _ => respond(&mut s, "404 Not Found", "text/plain", "not found"),
     }
 }
 
 impl SetupServer {
+    pub fn control_url(&self) -> String {
+        format!("http://127.0.0.1:{}/app?t={}", self.port, self.token)
+    }
+
+    pub fn control_tab_url(&self, tab: &str) -> String {
+        format!("{}&tab={}", self.control_url(), tab)
+    }
+
     pub fn dashboard_url(&self) -> String {
         format!("http://127.0.0.1:{}/dashboard?t={}", self.port, self.token)
     }
@@ -1102,6 +1116,25 @@ impl SetupServer {
     pub fn port(&self) -> u16 {
         self.port
     }
+}
+
+fn control_page(port: u16, token: &str, query: &str) -> String {
+    let tab = query
+        .split('&')
+        .find_map(|part| part.strip_prefix("tab="))
+        .unwrap_or("setup");
+    let tabs = ["setup", "dashboard", "agent", "help"];
+    let config = serde_json::json!({
+        "pages": {
+            "setup": format!("http://127.0.0.1:{port}/setup?t={token}"),
+            "dashboard": format!("http://127.0.0.1:{port}/dashboard?t={token}"),
+            "agent": format!("http://127.0.0.1:{port}/agent?t={token}"),
+            "help": format!("http://127.0.0.1:{port}/proxy-help?t={token}")
+        },
+        "stateUrl": format!("http://127.0.0.1:{port}/state?t={token}"),
+        "tab": if tabs.contains(&tab) { tab } else { "setup" }
+    });
+    include_str!("control.html").replace("__CONFIG__", &config.to_string().replace("</", "<\\/"))
 }
 
 impl Drop for SetupServer {
@@ -1791,6 +1824,18 @@ mod tests {
         let srv = SetupServer::start(0, "tok".into(), backend.clone()).unwrap();
         let port = srv.port;
         let h = format!("Host: 127.0.0.1:{port}\r\n");
+        let app = send(
+            port,
+            &format!("GET /app?t=tok&tab=agent HTTP/1.1\r\n{h}\r\n"),
+        );
+        assert!(app.starts_with("HTTP/1.1 200"));
+        assert!(app.contains("X-Frame-Options: SAMEORIGIN"));
+        assert!(app.contains("Agent Egress Controller"));
+        assert!(app.contains("http://127.0.0.1:") && app.contains("agent?t=tok"));
+        assert!(!app.contains("__CONFIG__"));
+        assert!(
+            send(port, &format!("GET /app?t=bad HTTP/1.1\r\n{h}\r\n")).starts_with("HTTP/1.1 403")
+        );
         assert!(
             send(port, &format!("GET /setup?t=tok HTTP/1.1\r\n{h}\r\n")).contains("出口与分流设置")
         );

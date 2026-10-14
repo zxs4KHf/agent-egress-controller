@@ -81,6 +81,7 @@ mod tray {
     const ID_STARTUP: usize = 11;
     const ID_SHORTCUTS: usize = 12;
     const ID_PROXY_HELP: usize = 13;
+    const ID_UPDATE: usize = 14;
     const ID_ENTRY_BASE: usize = 100;
     const ID_SWITCH_BASE: usize = 10000;
     const TIMER_REFRESH: usize = 1;
@@ -117,6 +118,7 @@ mod tray {
     enum Effect {
         None,
         Open(String),
+        Control(String),
         Warn(String),
     }
 
@@ -124,6 +126,27 @@ mod tray {
         match e {
             Effect::None => {}
             Effect::Open(target) => win::shell_open(&target),
+            Effect::Control(url) => {
+                let app = std::env::current_exe()
+                    .ok()
+                    .and_then(|path| path.parent().map(|dir| dir.join("aec-control.exe")));
+                match app.filter(|path| path.is_file()) {
+                    Some(app) => {
+                        if let Err(error) = std::process::Command::new(app).arg(url).spawn() {
+                            win::message_box(
+                                hwnd,
+                                &format!("桌面控制中心无法启动：{error}"),
+                                "Agent 出口控制器",
+                            );
+                        }
+                    }
+                    None => win::message_box(
+                        hwnd,
+                        "桌面控制中心程序不存在，请重新解压完整便携包。",
+                        "Agent 出口控制器",
+                    ),
+                }
+            }
             Effect::Warn(text) => win::message_box(hwnd, &text, "Agent 出口控制器"),
         }
     }
@@ -245,20 +268,20 @@ mod tray {
                 }
             }
             self.setup.as_ref().map_or(Effect::None, |s| {
-                Effect::Open(if dashboard {
-                    s.dashboard_url()
+                Effect::Control(if dashboard {
+                    s.control_tab_url("dashboard")
                 } else {
-                    s.url()
+                    s.control_tab_url("setup")
                 })
             })
         }
 
         fn open_proxy_help(&mut self) -> Effect {
             match self.open_page(false) {
-                Effect::Open(_) => self
+                Effect::Control(_) => self
                     .setup
                     .as_ref()
-                    .map_or(Effect::None, |s| Effect::Open(s.proxy_help_url())),
+                    .map_or(Effect::None, |s| Effect::Control(s.control_tab_url("help"))),
                 effect => effect,
             }
         }
@@ -333,6 +356,11 @@ mod tray {
                 add(MF_STRING, ID_DASHBOARD, "打开看板（连接路径与规则）");
                 add(MF_STRING, ID_PROXY_HELP, "代理冲突说明");
                 add(
+                    on(idle && s.mode == Mode::Daily),
+                    ID_UPDATE,
+                    "检查并安装更新…",
+                );
+                add(
                     MF_STRING
                         | if crate::startup::enabled() {
                             MF_CHECKED
@@ -373,6 +401,35 @@ mod tray {
                 ID_SETTINGS => return self.open_page(false),
                 ID_DASHBOARD => return self.open_page(true),
                 ID_PROXY_HELP => return self.open_proxy_help(),
+                ID_UPDATE if s.mode == Mode::Daily && s.busy.is_none() => {
+                    let install_dir = std::env::current_exe()
+                        .ok()
+                        .and_then(|path| path.parent().map(std::path::Path::to_path_buf));
+                    let Some(script) = install_dir.map(|dir| dir.join("aec-update.ps1")) else {
+                        return Effect::Warn("无法定位便携程序目录".into());
+                    };
+                    if !script.is_file() {
+                        return Effect::Warn("更新器文件不存在，请重新下载完整便携包".into());
+                    }
+                    let result = std::process::Command::new("powershell.exe")
+                        .args([
+                            "-NoProfile",
+                            "-WindowStyle",
+                            "Hidden",
+                            "-ExecutionPolicy",
+                            "Bypass",
+                            "-File",
+                        ])
+                        .arg(script)
+                        .arg("-CurrentPid")
+                        .arg(std::process::id().to_string())
+                        .arg("-CurrentVersion")
+                        .arg(env!("CARGO_PKG_VERSION"))
+                        .spawn();
+                    if let Err(e) = result {
+                        return Effect::Warn(format!("启动更新检查失败：{e}"));
+                    }
+                }
                 ID_STARTUP => {
                     let (tx, _rx) = channel();
                     self.send(Cmd::Startup(!crate::startup::enabled(), tx));

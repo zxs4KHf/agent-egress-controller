@@ -2,7 +2,6 @@ name: ci
 
 on:
   push:
-    branches: [main]
   pull_request:
 
 permissions:
@@ -26,3 +25,11 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test
+      - name: Test portable updater safety and rollback
+        shell: powershell
+        run: ./packaging/portable/aec-update.ps1 -SelfTest
+      - name: Install NSIS for installer smoke test
+        run: choco install nsis --yes --no-progress
+      - name: Test interactive installer compilation
+        shell: powershell
+        run: ./packaging/test-installer.ps1
