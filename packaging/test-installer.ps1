@@ -1,6 +1,12 @@
 $ErrorActionPreference = "Stop"
-$compiler = Get-Command makensis.exe -ErrorAction SilentlyContinue
-if (-not $compiler) { throw "makensis.exe is required for the installer smoke test" }
+$compilerPath = (Get-Command makensis.exe -ErrorAction SilentlyContinue).Source
+if (-not $compilerPath) {
+    $defaultCompiler = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'NSIS\makensis.exe'
+    if (Test-Path -LiteralPath $defaultCompiler -PathType Leaf) {
+        $compilerPath = $defaultCompiler
+    }
+}
+if (-not $compilerPath) { throw "makensis.exe is required for the installer smoke test" }
 $temp = Join-Path ([IO.Path]::GetTempPath()) ("aec-installer-test-" + [guid]::NewGuid().ToString('N'))
 $payload = Join-Path $temp 'package'
 $output = Join-Path $temp 'AgentEgressController-test-setup.exe'
@@ -10,7 +16,7 @@ try {
         [IO.File]::WriteAllText((Join-Path $payload $file), 'installer smoke fixture')
     }
     $script = Join-Path $PSScriptRoot 'installer.nsi'
-    & $compiler.Source "/DPackageDir=$payload" '/DProductVersion=0.5.0' "/DInstallerOut=$output" $script
+    & $compilerPath "/DPackageDir=$payload" '/DProductVersion=0.5.0' "/DInstallerOut=$output" $script
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $output -PathType Leaf)) {
         throw "NSIS failed to compile the installer (exit $LASTEXITCODE)"
     }
