@@ -11,13 +11,7 @@ if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid release version' }
 Test-PackageIntegrity $Package
 New-Item -ItemType Directory -Path $Output -Force | Out-Null
 $files=@(Get-PackageFiles $Package | ForEach-Object {
-    $id=switch -Regex ($_.Relative) {
-        '^bin/aec-mihomo.exe$' { 'core'; break }
-        '^aec-.*\.exe$' { [IO.Path]::GetFileNameWithoutExtension($_); break }
-        '^aec-update.ps1$' { 'updater'; break }
-        '^ui/' { 'ui'; break }
-        default { 'resources' }
-    }
+    $id=Get-ComponentId $_.Relative
     [pscustomobject]@{ path=$_.Relative; component=$id; size=(Get-Item -LiteralPath $_.Source).Length; sha256=(Get-FileHash -LiteralPath $_.Source).Hash.ToLowerInvariant() }
 })
 $components=@()

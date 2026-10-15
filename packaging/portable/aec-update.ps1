@@ -408,6 +408,16 @@ function Assert-DownloadHash([string]$Path, [string]$Hash) {
     if ($Hash -notmatch '^[a-fA-F0-9]{64}$' -or (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -ne $Hash) { Stop-Update 'hash_mismatch' }
 }
 
+function Get-ComponentId([string]$Path) {
+    switch -Regex ($Path) {
+        '^bin/aec-mihomo.exe$' { return 'core' }
+        '^aec-(tray|dev|relay|agent|control)\.exe$' { return [IO.Path]::GetFileNameWithoutExtension($Path) }
+        '^aec-update.ps1$' { return 'updater' }
+        '^ui/' { return 'ui' }
+        default { return 'resources' }
+    }
+}
+
 function Assert-IncrementalManifest($Manifest, [string]$Version) {
     if ($Manifest.schemaVersion -ne 1 -or $Manifest.version -cne $Version -or
         @($Manifest.files).Count -lt 1 -or @($Manifest.files).Count -gt 10000 -or
@@ -426,6 +436,7 @@ function Assert-IncrementalManifest($Manifest, [string]$Version) {
         if ($p -cne (Get-SafeRelativePath $p) -or $p.Contains('\') -or $p -match '//|[<>"|?*]|[. ](/|$)' -or
             $p -match '(?i)(^|/)(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|/|$)' -or
             -not (Test-PackagePath $p) -or $paths.ContainsKey($p) -or -not $components.ContainsKey($f.component) -or
+            $f.component -cne (Get-ComponentId $p) -or
             $f.sha256 -notmatch '^[a-f0-9]{64}$' -or $f.size -isnot [ValueType] -or $f.size -lt 0 -or $f.size -gt 250MB) { Stop-Update 'manifest_invalid' }
         $paths[$p]=$true; $total += $f.size
     }

@@ -100,6 +100,9 @@ try {
     $bad=$manifest | ConvertTo-Json -Depth 8 | ConvertFrom-Json
     $bad.components[0].asset='https://example.invalid/evil.zip'
     Reject { Assert-IncrementalManifest $bad '9.0.0' } 'Foreign component URL accepted'
+    $bad=$manifest | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+    ($bad.files | Where-Object { $_.path -eq 'ui/active.json' }).component='core'
+    Reject { Assert-IncrementalManifest $bad '9.0.0' } 'Mixed UI/core component accepted'
     Reject { Receive-IncrementalPackage $manifest $plan $target (Join-Path $sandbox 'tamper-work') { param($c,$d) [IO.File]::WriteAllText($d,'tampered') } } 'Corrupt payload accepted'
 
     # The exact observability regression: exception gone and dialog closed, evidence remains on disk.
