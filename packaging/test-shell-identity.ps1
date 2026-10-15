@@ -17,6 +17,16 @@ public static class AecWindowProperties {
  }
  [DllImport("shell32.dll")] static extern int SHGetPropertyStoreForWindow(IntPtr hwnd, ref Guid iid, out Store store);
  [DllImport("ole32.dll")] static extern int PropVariantClear(ref Value value);
+ [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+ [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr hwnd, System.Text.StringBuilder title, int length);
+ [DllImport("user32.dll", SetLastError=true)] static extern bool PostMessage(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
+ public static void CloseVerified(IntPtr hwnd, uint expectedProcessId) {
+  uint processId; GetWindowThreadProcessId(hwnd,out processId);
+  var title=new System.Text.StringBuilder(256); GetWindowText(hwnd,title,title.Capacity);
+  if(processId!=expectedProcessId || title.ToString()!="Agent Egress Controller" || Read(hwnd,5)!="AgentEgress.Controller")
+   throw new InvalidOperationException("Refusing to close any window except the verified test-owned control center.");
+  if(!PostMessage(hwnd,0x0010,IntPtr.Zero,IntPtr.Zero)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+ }
  public static string Read(IntPtr hwnd, uint id) {
   Guid iid=typeof(Store).GUID; Store store; Marshal.ThrowExceptionForHR(SHGetPropertyStoreForWindow(hwnd,ref iid,out store));
   try { var key=new Key {fmtid=new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"),pid=id}; Value value; store.GetValue(ref key,out value);
@@ -51,6 +61,7 @@ public sealed class AecShellPage : IDisposable {
 '@
 $owned = $null
 $page = $null
+$window = $null
 $failure = $null
 try {
     if (-not $ExistingWindow) {
@@ -89,7 +100,13 @@ try {
     if ($owned -and -not $owned.HasExited) {
         $owned.Refresh()
         if ($owned.MainModule.FileName -ne $ControlExe) { throw 'Test process identity changed; refusing to close.' }
-        [void]$owned.CloseMainWindow()
+        # Keep the exact verified HWND: CloseMainWindow re-selects a window and can target a
+        # shared console/launcher on CI. Never let test cleanup close the invoking shell.
+        if ($window) {
+            [AecWindowProperties]::CloseVerified($window.MainWindowHandle, $owned.Id)
+        } else {
+            throw ('No verified application window to close safely. Original check: '+$failure)
+        }
         if (-not $owned.WaitForExit(10000)) { throw ('Test window did not close normally; not force-killing it. Original check: '+$failure) }
     }
 }
