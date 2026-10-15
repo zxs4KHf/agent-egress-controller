@@ -42,4 +42,6 @@ pub mod writers;
 
 pub mod brand;
 #[cfg(windows)]
+pub mod shell_identity;
+#[cfg(windows)]
 pub mod windows;

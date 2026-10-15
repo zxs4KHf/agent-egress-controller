@@ -84,51 +84,8 @@ pub fn set(enabled: bool) -> Result<(), String> {
     }
 }
 
-/// WScript.Shell serializes .lnk files. Paths travel as environment values, never shell code.
-/// Refuse an existing link with another target instead of overwriting a user's shortcut.
+/// Use the same native identity/shortcut implementation as the installer and control center.
 pub fn shortcuts() -> Result<(), String> {
-    use std::os::windows::process::CommandExt;
-    use std::process::{Command, Stdio};
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let exe = aec_core::paths::strip_verbatim(&exe);
-    let script = r#"$ErrorActionPreference='Stop'
-$shell=New-Object -ComObject WScript.Shell
-$destinations=@([Environment]::GetFolderPath('DesktopDirectory'),[Environment]::GetFolderPath('Programs'))
-$plans=@()
-foreach($directory in $destinations){
- if(-not $directory){throw 'Missing Windows folder'}
- foreach($entry in @(@('Agent Egress Controller.lnk',''),@('Agent Egress Dashboard.lnk','--dashboard'))){
-  $path=Join-Path $directory $entry[0]
-  $link=$shell.CreateShortcut($path)
-  if((Test-Path -LiteralPath $path) -and ($link.TargetPath -ne $env:AEC_SHORTCUT_EXE -or $link.Arguments -ne $entry[1])){throw 'Existing shortcut belongs to another installation'}
-  $plans+=@(@{Link=$link;Args=$entry[1]})
- }
-}
-foreach($plan in $plans){
- $link=$plan.Link
- $link.TargetPath=$env:AEC_SHORTCUT_EXE
- $link.Arguments=$plan.Args
- $link.WorkingDirectory=Split-Path -Parent $env:AEC_SHORTCUT_EXE
- $link.IconLocation=$env:AEC_SHORTCUT_EXE+',0'
- $link.Description='Agent Egress Controller - ISP paths and routing rules'
- $link.Save()
-}"#;
-    let powershell = std::env::var_os("WINDIR")
-        .map(std::path::PathBuf::from)
-        .ok_or("Windows 目录不可用")?
-        .join("System32/WindowsPowerShell/v1.0/powershell.exe");
-    let status = Command::new(powershell)
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .env("AEC_SHORTCUT_EXE", exe)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(0x0800_0000)
-        .status()
-        .map_err(|_| "创建快捷方式失败")?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("创建快捷方式失败：请检查文件权限，或是否已有指向另一份安装的同名快捷方式".into())
-    }
+    aec_core::shell_identity::create_shortcuts(&exe, aec_core::shell_identity::ShortcutScope::All)
 }

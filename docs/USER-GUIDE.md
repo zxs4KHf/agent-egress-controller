@@ -146,6 +146,10 @@ Electron 的 [系统代理模式](https://www.electronjs.org/docs/latest/api/str
 
 从托盘或看板点「创建桌面和开始菜单快捷方式」，在当前用户桌面和开始菜单 Programs 下各建两个入口：`Agent Egress Controller` 打开托盘，`Agent Egress Dashboard` 打开看板。已有托盘时看板请求交给该实例。开始菜单可搜索 Agent Egress。
 
+任务栏分组修复后，控制中心和看板快捷方式共用独立的 `AgentEgress.Controller` 标识，使用自己的盾牌图标，不归到启动它的 ChatGPT/Codex 图标里。任务栏重新打开会转交托盘取得新的本机认证会话；固定项不保存临时令牌。旧版控制中心已关闭、程序文件已更新后，可从同一安装运行 `aec-control.exe --create-shortcuts all` 修复入口；此命令不启动或停止网络服务，也不改分流、自启或凭据。安装包按用户所选桌面/开始菜单组件创建相同标识的入口。
+
+若之前手工固定的 **Agent Egress 旧入口** 仍有缓存，可取消固定该旧入口，再从新版看板窗口重新固定。不需要取消固定 ChatGPT，也不需要重启网络内核或清理整个任务栏。
+
 命令行可用 `aec-tray.exe --enable-autostart`、`--disable-autostart`、`--create-shortcuts`、`--dashboard`。注册或同名快捷方式属于其他安装时拒绝覆盖；在旧安装先关闭自启，核对并移除旧入口，再在新目录重新创建。移动便携目录前也按这个顺序处理。不开文件关联、URL 协议、系统服务或全局环境变量，避免让不必要的系统注册残留。
 
 托盘运行时，同一安装的 `aec-dev` 会拒绝重检、恢复或其他写入命令，避免第二个进程覆盖会话状态。请用托盘的「重新检测」和「恢复上次未完成的会话」；托盘退出后锁自动释放，异常退出也不留下失效的 PID 锁。
