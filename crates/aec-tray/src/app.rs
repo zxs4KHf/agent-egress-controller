@@ -925,6 +925,9 @@ impl Backend {
 }
 
 impl SetupBackend for Backend {
+    fn update_status(&self) -> serde_json::Value {
+        aec_core::update_log::collect(self.data_dir.clone())
+    }
     fn route(&self, form: aec_core::route_switch::Form) -> Result<(), Vec<FieldError>> {
         let (tx, rx) = std::sync::mpsc::channel();
         self.tx

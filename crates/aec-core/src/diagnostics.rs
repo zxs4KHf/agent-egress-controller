@@ -2,7 +2,10 @@
 use serde_json::{json, Value};
 use std::{path::PathBuf, time::Duration};
 
-fn bounded(timeout: Duration, inspect: impl FnOnce() -> Value + Send + 'static) -> Value {
+pub(crate) fn bounded(
+    timeout: Duration,
+    inspect: impl FnOnce() -> Value + Send + 'static,
+) -> Value {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(inspect());

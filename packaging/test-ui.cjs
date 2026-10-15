@@ -76,9 +76,12 @@ async function run() {
       const helpUrl=new URL('/proxy-help?t=preview',url).href;const response=await page.request.get(helpUrl);const updatedHtml=await response.text();assert.ok(updatedHtml.includes('界面热更新验收'),'live server must read the new presentation revision');assert.ok(updatedHtml.includes('/ui/qa-next/theme.css'),'new HTML must pin its own resource revision');
       assert.ok((await page.request.get(new URL('/ui/'+manifest.revision+'/theme.css?t=preview',url).href)).ok(),'old page assets remain available after pointer switch');
       assert.equal(child.exitCode,null,'presentation change must not restart the running server');
-      await page.locator('[data-tab=dashboard]').click();await dashboard.locator('#updatesPanel summary').click();
+      await page.locator('[data-tab=dashboard]').click();await dashboard.locator('#updatesPanel > summary').click();
+      await dashboard.locator('#updatesPanel .compact-details > summary').click();
+      assert.match(await dashboard.locator('#updatesPanel .compact-details').innerText(),/aec_update_status/);
+      assert.match(await dashboard.locator('#updatesPanel .compact-details').innerText(),/update-status/);
       const updateResponse=page.waitForResponse(r=>r.request().method()==='POST'&&new URL(r.url()).pathname==='/update');await dashboard.locator('#updateUi').click();assert.equal((await (await updateResponse).json()).ok,true);
-      await dashboard.locator('#updatesPanel summary').click();
+      await dashboard.locator('#updatesPanel > summary').click();
     }
     await page.locator('[data-tab=dashboard]').click();await dashboard.locator('#siteSearch').fill('');await dashboard.locator('#targetFilter').selectOption('all');
     const screenshotDir=process.env.AEC_UI_SCREENSHOT_DIR||'.scratch/ui-qa';fs.mkdirSync(screenshotDir,{recursive:true});

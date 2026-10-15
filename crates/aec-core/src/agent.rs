@@ -175,6 +175,7 @@ pub fn tools() -> Value {
     );
     let specs = vec![
         ("aec_state", "Read mode, readiness summary, fixed-exit block, paths and rules. Unknown is never pass.", none.clone(), true),
+        ("aec_update_status", "Read persistent update history, transfer bytes, failure stages/codes and recovery guidance. Read-only; never retries or confirms. If tray is unavailable use aec-agent update-status offline.", none.clone(), true),
         ("aec_settings", "Read settings without passwords. Do not publish private hosts, usernames or exit IP.", none.clone(), true),
         ("aec_options", "Read capabilities, dropdown options, HTTP contract and security guidance.", none.clone(), true),
         ("aec_configure", "Patch settings in Daily mode. User enters passwords in panel. Never disable protection or change expected IP without explicit user direction.", schema(settings_properties(), &[]), false),
@@ -205,6 +206,7 @@ pub fn call(backend: &dyn SetupBackend, request: Call) -> Result<Value, String> 
         return Err(invalid());
     }
     match request.name.as_str() {
+        "aec_update_status" => return Ok(backend.update_status()),
         "aec_state" => {
             return serde_json::to_value(backend.dashboard())
                 .map_err(|_| "state unavailable".into())
@@ -536,6 +538,38 @@ mod tests {
             self.0.lock().unwrap().push(f);
             Ok(())
         }
+    }
+
+    #[test]
+    fn update_status_is_read_only_strict_and_available_on_shared_transport() {
+        let fake = Fake(Mutex::new(Vec::new()));
+        let result = call(
+            &fake,
+            Call {
+                name: "aec_update_status".into(),
+                arguments: json!({}),
+            },
+        )
+        .unwrap();
+        assert_eq!(result["status"], "unknown");
+        assert_eq!(result["readOnly"], true);
+        assert!(call(
+            &fake,
+            Call {
+                name: "aec_update_status".into(),
+                arguments: json!({"path":"private-file"})
+            }
+        )
+        .is_err());
+        let specs = tools();
+        let spec = specs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "aec_update_status")
+            .unwrap();
+        assert_eq!(spec["annotations"]["readOnlyHint"], true);
+        assert!(fake.0.lock().unwrap().is_empty());
     }
 
     #[test]

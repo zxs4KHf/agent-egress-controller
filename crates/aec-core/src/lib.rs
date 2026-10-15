@@ -38,6 +38,7 @@ pub mod store;
 pub mod testing;
 pub mod tunnel;
 pub mod ui;
+pub mod update_log;
 pub mod writers;
 
 pub mod brand;

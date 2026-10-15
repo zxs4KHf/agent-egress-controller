@@ -1,4 +1,4 @@
-param([string]$Dist = (Join-Path (Split-Path -Parent $PSScriptRoot) 'dist'))
+param([string]$Dist = (Join-Path (Split-Path -Parent $PSScriptRoot) 'dist'), [string]$BaselineZip = '')
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -37,7 +37,8 @@ Push-Location $repo
 try {
     foreach ($entry in @(
         @{ Version='0.5.0'; Commit='d946400a93022c0dd53468c53398900c2ab25ca0' },
-        @{ Version='0.5.1'; Commit='9011805fc234938628aebe37b757c2f979acfcf7' }
+        @{ Version='0.5.1'; Commit='9011805fc234938628aebe37b757c2f979acfcf7' },
+        @{ Version='0.5.2'; Commit='a7d17c5e6d72950ece2c6386f6a896189cfe9f83' }
     )) {
         $source = git show ($entry.Commit + ':packaging/portable/aec-update.ps1')
         if ($LASTEXITCODE) { throw "Cannot read pinned updater $($entry.Version)" }
@@ -76,6 +77,7 @@ try {
     }
     $cases = @(
         @{ Name='0.5.1-direct'; Source=$sources['0.5.1'] },
+        @{ Name='0.5.2-direct'; Source=$sources['0.5.2'] },
         @{ Name='0.5.0-bootstrap'; Source=(Get-Content -LiteralPath $bootstrap -Raw -Encoding UTF8) }
     )
     foreach ($case in $cases) {
@@ -127,6 +129,40 @@ try {
                     (Get-FileHash $geo).Hash -ne $geoHash) { throw 'Rollback did not restore the old state' }
                 Write-Output "PASS: $($case.Name) $mode - real package integrity, core confirmation/cancel, copy, data preservation, backup, no-op, rollback."
             }
+        }
+    }
+    if ($BaselineZip) {
+        if ((Get-FileHash -LiteralPath $BaselineZip).Hash -ne '70d4103d9e1879e3b1be084bb2243cf55a77e17bd895c76478ed5397ac197fdc') { throw 'Pinned 0.5.2 baseline hash mismatch' }
+        & {
+            . (Get-UpdaterFunctions (Get-Content -LiteralPath $bootstrap -Raw -Encoding UTF8))
+            $root=Join-Path $sandbox 'real-incremental'
+            New-Item -ItemType Directory -Path $root | Out-Null
+            Expand-Archive -LiteralPath $BaselineZip -DestinationPath $root
+            $target=Join-Path $root 'AgentEgressController-0.5.2-portable'
+            Test-PackageIntegrity $target
+            $manifestPath=Join-Path $Dist "aec-incremental-$version.json"
+            Assert-ReleaseHash $manifestPath (Join-Path $Dist "SHA256INCREMENTAL-$version.txt")
+            $feed=Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            Assert-IncrementalManifest $feed $version
+            $plan=Get-IncrementalPlan $feed $target $false
+            if ($plan.Components.id -contains 'core' -or $plan.DownloadBytes -ge (Get-Item -LiteralPath $zip).Length) { throw 'Actual old release did not save download bytes or tried to download unchanged mihomo' }
+            $script:payloadBytes=[long]0
+            $stage=Receive-IncrementalPackage $feed $plan $target (Join-Path $root 'work') {
+                param($component,$destination)
+                Copy-Item -LiteralPath (Join-Path $Dist $component.asset) -Destination $destination
+                $script:payloadBytes += (Get-Item -LiteralPath $destination).Length
+            }
+            if ($script:payloadBytes -ne $plan.DownloadBytes) { throw 'Actual payload accounting mismatch' }
+            Test-PackageIntegrity $stage
+            $installPlan=Get-UpdatePlan $stage $target $false
+            if (-not $installPlan.CoreStopRequired) { throw 'Real binary update omitted stop confirmation' }
+            $backup=Join-Path $root 'backup'
+            [void](Invoke-PlannedUpdate $installPlan { $true } {} { Invoke-InstallPlan $installPlan $stage $target $backup } {})
+            foreach ($file in $feed.files) { Assert-DownloadHash (Join-Path $target $file.path) $file.sha256 }
+            if ((Get-IncrementalPlan $feed $target $false).DownloadBytes -ne 0) { throw 'Real no-op update downloads payload' }
+            Restore-UpdateBackup $target $backup
+            Test-PackageIntegrity $target
+            Write-Output "PASS: public 0.5.2 baseline -> $version incremental payload $script:payloadBytes bytes vs full ZIP $((Get-Item -LiteralPath $zip).Length); unchanged mihomo skipped; all file hashes, no-op and full rollback verified."
         }
     }
     Write-Output 'Release upgrade compatibility passed. No real service or global setting was touched.'

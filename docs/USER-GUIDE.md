@@ -1,4 +1,4 @@
-# 0.5.2 用户交付指南
+# 0.5.3 用户交付指南
 
 ## AI Agent 自动配置
 
@@ -14,9 +14,9 @@ Agent 可帮助管理站点规则、连接第一跳、模式、检查、自启�
 
 ## 下载与首次使用
 
-本次交付版为 0.5.2。安装版包含 per-user 安装向导；安装后在一个桌面窗口中使用出口设置、规则/站点、固定出口路径、Agent/MCP 和代理帮助。系统托盘继续独立显示状态并提供恢复、检测和打开看板入口。便携版保留完整功能。以下命令中的版本号和文件名以实际 Release 资产为准。
+本次交付版为 0.5.3。安装版包含 per-user 安装向导；安装后在一个桌面窗口中使用出口设置、规则/站点、固定出口路径、Agent/MCP 和代理帮助。系统托盘继续独立显示状态并提供恢复、检测和打开看板入口。便携版保留完整功能。以下命令中的版本号和文件名以实际 Release 资产为准。
 
-从 [GitHub Releases](https://github.com/zxs4KHf/agent-egress-controller/releases/latest) 下载 `AgentEgressController-0.5.2-setup.exe` 或 `AgentEgressController-0.5.2-portable.zip`，并核对对应的 SHA256 文件。安装版只安装到当前用户目录，不需要管理员权限；登录自启为可选项且默认关闭。便携版需完整解压到可写目录，保留 `portable.flag`、`bin`、`ui` 目录、应用 exe 和说明文件。桌面控制中心需要 Microsoft Edge WebView2 Runtime；程序不会自动下载，缺失时会提示用户处理。
+从 [GitHub Releases](https://github.com/zxs4KHf/agent-egress-controller/releases/latest) 下载 `AgentEgressController-0.5.3-setup.exe` 或 `AgentEgressController-0.5.3-portable.zip`，并核对对应的 SHA256 文件。安装版只安装到当前用户目录，不需要管理员权限；登录自启为可选项且默认关闭。便携版需完整解压到可写目录，保留 `portable.flag`、`bin`、`ui` 目录、应用 exe 和说明文件。桌面控制中心需要 Microsoft Edge WebView2 Runtime；程序不会自动下载，缺失时会提示用户处理。
 
 双击 aec-tray.exe，在首次打开的本机设置页填出口、端口、协议和账号。端口可逐项附协议，例如 `12324/socks5`、`12323/http`；同一候选池的地址必须相同，备用端口用于拨号切换，不表示多个出口。
 
@@ -116,11 +116,11 @@ Electron 的 [系统代理模式](https://www.electronjs.org/docs/latest/api/str
 
 升级入口在托盘与看板「更新与维护」。0.5.1 起的「仅更新界面」只安装兼容的版本化页面资源，不停止托盘、relay 或内核，也不改变固定 ISP；完成后点控制中心「刷新界面」，确认放弃未保存草稿后加载。0.5.2 的任务栏修复涉及二进制，必须选择「检查完整更新」。0.5.0 原更新器拒绝新资源路径，需先替换一次更新脚本，然后完整升级；下载、校验、操作与限制见 [升级指南](UPDATING.md)。
 
-「检查完整更新」可在稳定的 Agent 模式或日常模式启动。用户先确认下载，更新器核验项目 GitHub Release ZIP 的 SHA256 与包内清单，再按实际文件哈希判断；如果核心程序或更新器脚本改变，会另行显示连接中断提醒。拒绝停服确认不会停止服务或替换文件。确认后只正常关闭本应用服务，核对恢复完成、内核/relay 停止后备份替换，再按原模式重启；就绪仍需重新检测。恢复失败或文件占用时停止安装，绝不强杀程序。
+「检查完整更新」可在稳定的 Agent 模式或日常模式启动。用户先确认下载，更新器核验官方增量清单、组件及逐文件 SHA256（旧更新器仍校验完整 ZIP），再按实际文件哈希判断；如果核心程序或更新器脚本改变，会另行显示连接中断提醒。拒绝停服确认不会停止服务或替换文件。确认后只正常关闭本应用服务，核对恢复完成、内核/relay 停止后备份替换，再按原模式重启；就绪仍需重新检测。恢复失败或文件占用时停止安装，绝不强杀程序。
 
-下载仍是完整便携 ZIP，不是二进制差分包；安装只替换允许且改变的文件，保留 `data\`、用户提供的 GeoSite/GeoIP 和 Windows 凭据。回滚清单及旧文件在安装目录 `.aec-update-backup\`。复制失败自动恢复；纯界面回滚恢复旧活动指针，核心回滚需要先正常退出并确认恢复完成，再按 `rollback.json` 恢复旧文件、删除本次新建文件，不能覆盖或删除用户数据。更新器启动成功不等于更新完成，真实网络是否可用以检查证据为准。
+0.5.3 更新器按组件增量下载，不是字节差分；原 0.5.1/0.5.2 更新器需先按升级指南引导脚本或全量升级一次。下载/校验失败在数据目录 update-logs 留下结构化记录，Agent 可用 aec-agent update-status 离线查询。安装只替换允许且改变的文件，保留 `data\`、用户提供的 GeoSite/GeoIP 和 Windows 凭据。回滚清单及旧文件在安装目录 `.aec-update-backup\`。复制失败自动恢复；纯界面回滚恢复旧活动指针，核心回滚需要先正常退出并确认恢复完成，再按 `rollback.json` 恢复旧文件、删除本次新建文件，不能覆盖或删除用户数据。更新器启动成功不等于更新完成，真实网络是否可用以检查证据为准。
 
-0.5.0 之前的版本没有更新入口，首次升级需要手动下载完整 0.5.2 ZIP 和校验文件。旧便携版用户先正常退出并确认恢复完成，备份整个旧程序目录；把 ZIP 解压到临时新目录，进入其中的 `AgentEgressController-0.5.2-portable` 文件夹，将里面的程序文件复制到旧安装目录并允许覆盖。不要删除或覆盖旧目录的 `data\`、用户放入 `bin\` 的 GeoSite/GeoIP 文件；`portable.flag` 保持存在。完成后从旧目录启动 `aec-tray.exe`。如果改用安装 EXE，它会使用 `%LOCALAPPDATA%\AgentEgressController\` 作为独立数据位置，不会自动迁移旧便携目录的 `data\`。旧模板档案在读取时转换，保存才更新。换 Windows 用户或机器需重新填写密码，`credentialRef` 不能替代跨机器密码。
+0.5.0 之前的版本没有更新入口，首次升级需要手动下载完整 0.5.3 ZIP 和校验文件。旧便携版用户先正常退出并确认恢复完成，备份整个旧程序目录；把 ZIP 解压到临时新目录，进入其中的 `AgentEgressController-0.5.3-portable` 文件夹，将里面的程序文件复制到旧安装目录并允许覆盖。不要删除或覆盖旧目录的 `data\`、用户放入 `bin\` 的 GeoSite/GeoIP 文件；`portable.flag` 保持存在。完成后从旧目录启动 `aec-tray.exe`。如果改用安装 EXE，它会使用 `%LOCALAPPDATA%\AgentEgressController\` 作为独立数据位置，不会自动迁移旧便携目录的 `data\`。旧模板档案在读取时转换，保存才更新。换 Windows 用户或机器需重新填写密码，`credentialRef` 不能替代跨机器密码。
 
 给其他用户交付全新 zip、SHA256SUMS、无私人凭据的路由示例和自己的服务说明。不要交付维护者 data、浏览器 profile、日志、快照、真实出口或带密码 YAML。内核/relay 启动时会使用临时凭据配置，正常退出会清理；崩溃后需先恢复，不能把运行中的 core 目录当作无敏感信息的示例。仓库 `crates/aec-core/tests/fixtures/routing.yaml` 是纯合成示例，不能直接联网。
 

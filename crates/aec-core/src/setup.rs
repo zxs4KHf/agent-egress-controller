@@ -780,6 +780,9 @@ pub trait SetupBackend: Send + Sync {
     fn update(&self, _ui_only: bool) -> Result<(), Vec<FieldError>> {
         Err(vec![err("update", "更新入口不可用")])
     }
+    fn update_status(&self) -> serde_json::Value {
+        serde_json::json!({"status":"unknown","reason":"update_logs_unavailable","readOnly":true})
+    }
     fn dashboard(&self) -> Option<crate::dashboard::View> {
         None
     }
@@ -1922,7 +1925,14 @@ mod tests {
         .starts_with("HTTP/1.1 403"));
         assert!(request("Bearer private-token", None, "text/plain").starts_with("HTTP/1.1 403"));
         assert!(request("Bearer private-token", None, "application/json").contains("\"ok\":true"));
+        let update_query = serde_json::json!({"name":"aec_update_status","arguments":{}});
+        assert_eq!(
+            crate::agent::client(port, "private-token", &update_query).unwrap()["readOnly"],
+            true
+        );
+        assert!(crate::agent::client(port, "wrong", &update_query).is_err());
         std::fs::write(data.join(crate::agent::ACCESS), b"false").unwrap();
+        assert!(crate::agent::client(port, "private-token", &update_query).is_err());
         assert!(
             request("Bearer private-token", None, "application/json").starts_with("HTTP/1.1 403")
         );

@@ -42,6 +42,10 @@ fn run() -> Result<(), String> {
         return Err("unexpected argument".into());
     }
     match command.as_str() {
+        "update-status" => {
+            println!("{}", aec_core::update_log::collect(data));
+            Ok(())
+        }
         "diagnose" => {
             println!("{}", aec_core::diagnostics::collect(data));
             Ok(())
@@ -73,7 +77,7 @@ fn run() -> Result<(), String> {
             writeln!(std::io::stdout(), "{result}").map_err(|_| "stdout unavailable".into())
         }
         _ => Err(
-            "Usage: aec-agent [--data-dir PATH] [mcp|config|call|diagnose]; call reads JSON from stdin; diagnose is read-only, bounded to 10 seconds and never opens a window"
+            "Usage: aec-agent [--data-dir PATH] [mcp|config|call|diagnose|update-status]; call reads JSON from stdin; diagnose/update-status are read-only, bounded to 10 seconds and never open a window"
                 .into(),
         ),
     }
