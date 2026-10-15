@@ -335,7 +335,8 @@ function Write-UpdateEvent([string]$Stage, [string]$Status, [string]$Code='none'
     $path=Join-Path $script:UpdateLogRoot ($script:UpdateLog.id + '.json')
     $pending=$path + '.tmp'
     [IO.File]::WriteAllText($pending, ($script:UpdateLog | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
-    Move-Item -LiteralPath $pending -Destination $path -Force
+    if (Test-Path -LiteralPath $path) { [IO.File]::Replace($pending,$path,$null) }
+    else { [IO.File]::Move($pending,$path) }
 }
 
 function Write-UpdateFailure($Failure) {
