@@ -14,6 +14,8 @@
 
 GitHub Windows 工作流执行 fmt/clippy/test、更新器 SelfTest、Edge 页面测试、NSIS 编译冒烟，以及校验 pinned mihomo 后的全部真实内核测试，再构建便携 ZIP、安装 EXE 与 SHA256 sidecar。具体运行结果以 PR/Actions 记录为准，未通过不得合并 main 或发布候选。
 
+首轮独立 CI 发现真实重载在 Windows TEMP 短路径下返回 HTTP 400。本机将同一 fixture 改用 8.3 路径后稳定复现；原因是只 canonicalize 重载文件名，启动 `-d` 仍为短路径，触发内核的字符串路径安全校验。改用已核实归属的内核启动配置路径，并按 pinned API 把 force 放入 query，不禁用安全检查。参考 [mihomo v1.19.31 配置接口](https://github.com/MetaCubeX/mihomo/blob/v1.19.31/hub/route/configs.go)与[路径校验](https://github.com/MetaCubeX/mihomo/blob/v1.19.31/constant/path.go)。保留真实短路径重载回归，不通过放宽测试或扩大超时绕过。
+
 ## 限制与未完成证明
 
 - Issue #4 外部窗口工具挂起根因未确认；本版增加无窗口有界诊断，不宣称修复 VPN 或窗口自动化组件。

@@ -120,7 +120,7 @@ Electron 的 [系统代理模式](https://www.electronjs.org/docs/latest/api/str
 
 下载仍是完整便携 ZIP，不是二进制差分包；安装只替换允许且改变的文件，保留 `data\`、用户提供的 GeoSite/GeoIP 和 Windows 凭据。回滚清单及旧文件在安装目录 `.aec-update-backup\`。复制失败自动恢复；纯界面回滚恢复旧活动指针，核心回滚需要先正常退出并确认恢复完成，再按 `rollback.json` 恢复旧文件、删除本次新建文件，不能覆盖或删除用户数据。更新器启动成功不等于更新完成，真实网络是否可用以检查证据为准。
 
-0.5.0 之前的版本没有更新入口，首次升级需要手动下载完整 0.5.0 ZIP 和校验文件。旧便携版用户先正常退出并确认恢复完成，备份整个旧程序目录；把 ZIP 解压到临时新目录，进入其中的 `AgentEgressController-0.5.0-portable` 文件夹，将里面的程序文件复制到旧安装目录并允许覆盖。不要删除或覆盖旧目录的 `data\`、用户放入 `bin\` 的 GeoSite/GeoIP 文件；`portable.flag` 保持存在。完成后从旧目录启动 `aec-tray.exe`。如果改用安装 EXE，它会使用 `%LOCALAPPDATA%\AgentEgressController\` 作为独立数据位置，不会自动迁移旧便携目录的 `data\`。旧模板档案在读取时转换，保存才更新。换 Windows 用户或机器需重新填写密码，`credentialRef` 不能替代跨机器密码。
+0.5.0 之前的版本没有更新入口，首次升级需要手动下载完整 0.5.1 ZIP 和校验文件。旧便携版用户先正常退出并确认恢复完成，备份整个旧程序目录；把 ZIP 解压到临时新目录，进入其中的 `AgentEgressController-0.5.1-portable` 文件夹，将里面的程序文件复制到旧安装目录并允许覆盖。不要删除或覆盖旧目录的 `data\`、用户放入 `bin\` 的 GeoSite/GeoIP 文件；`portable.flag` 保持存在。完成后从旧目录启动 `aec-tray.exe`。如果改用安装 EXE，它会使用 `%LOCALAPPDATA%\AgentEgressController\` 作为独立数据位置，不会自动迁移旧便携目录的 `data\`。旧模板档案在读取时转换，保存才更新。换 Windows 用户或机器需重新填写密码，`credentialRef` 不能替代跨机器密码。
 
 给其他用户交付全新 zip、SHA256SUMS、无私人凭据的路由示例和自己的服务说明。不要交付维护者 data、浏览器 profile、日志、快照、真实出口或带密码 YAML。内核/relay 启动时会使用临时凭据配置，正常退出会清理；崩溃后需先恢复，不能把运行中的 core 目录当作无敏感信息的示例。仓库 `crates/aec-core/tests/fixtures/routing.yaml` 是纯合成示例，不能直接联网。
 

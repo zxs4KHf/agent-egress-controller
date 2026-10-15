@@ -138,9 +138,13 @@ impl CoreManager {
         verify()?;
         match result {
             Ok((200 | 204, body)) => Ok(body),
-            _ => Err(CoreError::new(
+            Ok((status, _)) => Err(CoreError::new(
                 "CORE_CONTROL_FAILED",
-                "control request did not complete",
+                format!("control {method} {path} returned HTTP {status}"),
+            )),
+            Err(_) => Err(CoreError::new(
+                "CORE_CONTROL_FAILED",
+                format!("control {method} {path} transport did not complete"),
             )),
         }
     }
@@ -196,13 +200,11 @@ impl CoreManager {
             let _ = write_atomic(&self.config_path(), original.as_bytes());
             return Err(e);
         }
-        let path = self
-            .config_path()
-            .canonicalize()
-            .map_err(io("CFG_INVALID", &self.config_path()))?;
-        let body = serde_json::json!({"path":crate::paths::strip_verbatim(&path),"force":true})
-            .to_string();
-        self.control(evidence, "PUT", "/configs", &body)?;
+        // Reuse this owned process's startup -f path. Canonicalizing only the file
+        // expands Windows 8.3 aliases while mihomo's -d retains the short spelling;
+        // its lexical safe-path check then rejects the same file with HTTP 400.
+        // The pinned API takes force in the query, not in the JSON object.
+        self.control(evidence, "PUT", "/configs?force=true", "{}")?;
         if profile.egress.fixed_exit {
             self.select(evidence, "relay", "REJECT")?;
         }

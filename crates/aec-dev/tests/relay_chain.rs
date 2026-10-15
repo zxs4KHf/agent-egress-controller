@@ -92,6 +92,26 @@ fn fixed_gate_blocks_reload_and_closes_existing_connections() {
         .canonicalize()
         .unwrap();
     let data = std::env::temp_dir().join(format!("aec-fixed-chain-{}", std::process::id()));
+    std::fs::create_dir_all(&data).unwrap();
+    // Windows runners use an 8.3 alias in TEMP. Exercise that spelling locally too,
+    // when available: canonicalizing only the reload filename must not break -d safety.
+    let data = {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetShortPathNameW(input: *const u16, output: *mut u16, length: u32) -> u32;
+        }
+        let input: Vec<u16> = data.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut output = vec![0u16; 32768];
+        let length =
+            unsafe { GetShortPathNameW(input.as_ptr(), output.as_mut_ptr(), output.len() as u32) }
+                as usize;
+        if length > 0 && length < output.len() {
+            PathBuf::from(std::ffi::OsString::from_wide(&output[..length]))
+        } else {
+            data
+        }
+    };
     let mut manager = CoreManager::dev(&root, &data);
     manager.relay_bin = PathBuf::from(env!("CARGO_BIN_EXE_aec-relay"));
     manager.ports = CorePorts {
