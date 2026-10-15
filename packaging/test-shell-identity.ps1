@@ -37,14 +37,19 @@ public static class AecWindowProperties {
 public sealed class AecShellPage : IDisposable {
  readonly System.Net.Sockets.TcpListener listener;
  readonly System.Threading.Thread worker;
+ readonly System.Threading.ManualResetEvent continueAccept;
+ volatile bool stopping;
+ public Exception Failure { get; private set; }
  public readonly System.Threading.ManualResetEvent Loaded = new System.Threading.ManualResetEvent(false);
  public int Port { get { return ((System.Net.IPEndPoint)listener.LocalEndpoint).Port; } }
- public AecShellPage() {
+ public AecShellPage() : this(false) {}
+ public AecShellPage(bool pauseAfterResponse) {
+  continueAccept = new System.Threading.ManualResetEvent(!pauseAfterResponse);
   listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback,0); listener.Start();
   worker = new System.Threading.Thread(Serve); worker.IsBackground=true; worker.Start();
  }
  void Serve() {
-  try { while(true) { using(var client=listener.AcceptTcpClient()) {
+  try { while(!stopping) { using(var client=listener.AcceptTcpClient()) {
    client.ReceiveTimeout=2000; client.SendTimeout=2000;
    using(var stream=client.GetStream()) {
     var request=new byte[4096]; int count=stream.Read(request,0,request.Length);
@@ -52,11 +57,19 @@ public sealed class AecShellPage : IDisposable {
     var html="<!doctype html><title>Shell identity test</title><p>Isolated control-center shell test. No network services or credentials.</p>";
     var body=System.Text.Encoding.UTF8.GetBytes(html);
     var head=System.Text.Encoding.ASCII.GetBytes("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: "+body.Length+"\r\nConnection: close\r\n\r\n");
-    stream.Write(head,0,head.Length); stream.Write(body,0,body.Length); Loaded.Set();
+    stream.Write(head,0,head.Length); stream.Write(body,0,body.Length); Loaded.Set(); continueAccept.WaitOne();
    }
-  } } } catch(System.Net.Sockets.SocketException) {} catch(System.IO.IOException) {} catch(ObjectDisposedException) {}
+  } } } catch(Exception error) {
+   // Stop can race the next AcceptTcpClient, which throws InvalidOperationException rather
+   // than SocketException. Do not let a fixture thread terminate the PowerShell test host.
+   if(!stopping) { Failure=error; Loaded.Set(); }
+  }
  }
- public void Dispose() { listener.Stop(); worker.Join(3000); Loaded.Dispose(); }
+ public void Dispose() {
+  stopping=true; listener.Stop(); continueAccept.Set();
+  if(!worker.Join(5000)) throw new TimeoutException("Loopback fixture did not stop.");
+  Loaded.Dispose(); continueAccept.Dispose();
+ }
 }
 '@
 $owned = $null
@@ -66,12 +79,28 @@ $failure = $null
 try {
     if (-not $ExistingWindow) {
         if ([Diagnostics.Process]::GetProcessesByName('aec-control').Count) { throw 'Close no user windows: a control center already exists; use -ExistingWindow to inspect it.' }
+        # Deterministically stop between requests, not merely while AcceptTcpClient is blocked.
+        # The old fixture threw on its next Accept and terminated the entire PowerShell host.
+        1..10 | ForEach-Object {
+            $race = New-Object AecShellPage -ArgumentList $true
+            try {
+                $request = [Net.HttpWebRequest]::Create(('http://127.0.0.1:'+$race.Port+'/fixture'))
+                $request.Proxy = $null
+                $request.Timeout = 3000
+                $response = $request.GetResponse()
+                $response.Close()
+                if (-not $race.Loaded.WaitOne(3000)) { throw 'Fixture race handshake timed out.' }
+            } finally { $race.Dispose() }
+            if ($race.Failure) { throw $race.Failure }
+        }
+        Write-Output 'PASS: 10 deterministic loopback fixture shutdown races.'
         # Only the presentation process. No tray/core, credentials, system proxy or time-zone writes.
         $page = New-Object AecShellPage
         Write-Output 'Shell test: isolated loopback fixture listening.'
         $owned = Start-Process -FilePath $ControlExe -ArgumentList ('http://127.0.0.1:'+$page.Port+'/app?t=shell-test') -PassThru -WindowStyle Hidden
         Write-Output ('Shell test: presentation process started, PID '+$owned.Id+'.')
         if (-not $page.Loaded.WaitOne(30000)) { throw 'The isolated loopback test page did not load.' }
+        if ($page.Failure) { throw $page.Failure }
         Write-Output 'Shell test: loopback page requested.'
     }
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
@@ -100,8 +129,7 @@ try {
     if ($owned -and -not $owned.HasExited) {
         $owned.Refresh()
         if ($owned.MainModule.FileName -ne $ControlExe) { throw 'Test process identity changed; refusing to close.' }
-        # Keep the exact verified HWND: CloseMainWindow re-selects a window and can target a
-        # shared console/launcher on CI. Never let test cleanup close the invoking shell.
+        # Keep the exact verified HWND instead of re-selecting a main window during cleanup.
         if ($window) {
             [AecWindowProperties]::CloseVerified($window.MainWindowHandle, $owned.Id)
         } else {
