@@ -89,7 +89,7 @@ try {
         New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
         Copy-Item -LiteralPath (Join-Path $repo $file) -Destination $destination
     }
-    foreach ($file in @("USER-GUIDE.md", "UPDATING.md", "AGENT-INTEGRATION.md", "DIAGNOSTICS.md", "RELEASE-0.5.2.md", "RELEASE-0.5.1.md", "RELEASE-0.5.0.md", "RELEASE-0.4.0.md", "RELEASE-0.2.0.md")) {
+    foreach ($file in @("USER-GUIDE.md", "UPDATING.md", "AGENT-INTEGRATION.md", "DIAGNOSTICS.md", "RELEASE-0.5.3.md", "RELEASE-0.5.2.md", "RELEASE-0.5.1.md", "RELEASE-0.5.0.md", "RELEASE-0.4.0.md", "RELEASE-0.2.0.md")) {
         Copy-Item -LiteralPath (Join-Path $repo "docs/$file") -Destination (Join-Path $output "docs/$file")
     }
     # Keep the script ASCII so Windows PowerShell 5.1 also reads it correctly without a BOM.
@@ -146,6 +146,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $output 'aec-update.ps1') -Destination $updaterAsset
     $updaterHash = (Get-FileHash -LiteralPath $updaterAsset -Algorithm SHA256).Hash.ToLowerInvariant()
     "$updaterHash  $updaterName" | Set-Content -LiteralPath (Join-Path $dist "SHA256UPDATER-$version.txt") -Encoding utf8
+    & (Join-Path $repo 'packaging/build-incremental.ps1') -Package $output -Version $version -Output $dist
     $makensis = Get-Command makensis.exe -ErrorAction SilentlyContinue
     if (-not $makensis) {
         $defaultMakensis = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'NSIS\makensis.exe'

@@ -28,6 +28,12 @@ jobs:
       - name: Test portable updater safety and rollback
         shell: powershell
         run: ./packaging/portable/aec-update.ps1 -SelfTest
+      - name: Test incremental HTTP download and offline Agent failure logs
+        shell: powershell
+        run: |
+          cargo build -p aec-dev --bin aec-agent
+          if ($LASTEXITCODE) { throw 'Agent build failed' }
+          ./packaging/test-incremental-update.ps1
       - name: Test actual Windows taskbar identity
         shell: powershell
         run: |
@@ -89,19 +95,24 @@ jobs:
       - name: Test published updater compatibility with real release package
         shell: powershell
         run: |
-          git fetch --no-tags origin d946400a93022c0dd53468c53398900c2ab25ca0 9011805fc234938628aebe37b757c2f979acfcf7
+          git fetch --no-tags origin d946400a93022c0dd53468c53398900c2ab25ca0 9011805fc234938628aebe37b757c2f979acfcf7 a7d17c5e6d72950ece2c6386f6a896189cfe9f83
           if ($LASTEXITCODE) { throw 'Cannot fetch pinned historical updater sources' }
-          ./packaging/test-release-upgrade.ps1
+          $baseline = Join-Path $env:RUNNER_TEMP 'aec-baseline-0.5.2.zip'
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/zxs4KHf/agent-egress-controller/releases/download/v0.5.2/AgentEgressController-0.5.2-portable.zip' -OutFile $baseline
+          ./packaging/test-release-upgrade.ps1 -BaselineZip $baseline
       - name: Upload release candidates
         uses: actions/upload-artifact@v4
         with:
-          name: AgentEgressController-0.5.2-windows
+          name: AgentEgressController-0.5.3-windows
           path: |
-            dist/AgentEgressController-0.5.2-portable.zip
-            dist/AgentEgressController-0.5.2-setup.exe
-            dist/SHA256SUMS-0.5.2.txt
-            dist/SHA256SETUP-0.5.2.txt
-            dist/aec-update-0.5.2.ps1
-            dist/SHA256UPDATER-0.5.2.txt
+            dist/AgentEgressController-0.5.3-portable.zip
+            dist/AgentEgressController-0.5.3-setup.exe
+            dist/SHA256SUMS-0.5.3.txt
+            dist/SHA256SETUP-0.5.3.txt
+            dist/aec-update-0.5.3.ps1
+            dist/SHA256UPDATER-0.5.3.txt
+            dist/aec-incremental-0.5.3.json
+            dist/SHA256INCREMENTAL-0.5.3.txt
+            dist/aec-0.5.3-*.zip
           if-no-files-found: error
           retention-days: 14

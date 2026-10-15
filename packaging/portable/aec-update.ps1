@@ -151,7 +151,7 @@ function Get-UiManifest([string]$PackageRoot) {
 
 function Get-UpdatePlan([string]$PackageRoot, [string]$TargetRoot, [bool]$PresentationOnly) {
     $files = @(Get-PackageFiles $PackageRoot)
-    if (-not ($files.Relative -contains 'aec-tray.exe')) { throw '完整更新包缺少托盘程序' }
+    if (-not $PresentationOnly -and -not ($files.Relative -contains 'aec-tray.exe')) { throw '完整更新包缺少托盘程序' }
     $changed = @($files | Where-Object {
         $destination = Join-Path $TargetRoot $_.Relative
         -not (Test-Path -LiteralPath $destination -PathType Leaf) -or
@@ -219,16 +219,17 @@ function Invoke-UiSwitch([string]$PackageRoot, [string]$TargetRoot, [string]$Bac
 
 function Invoke-PlannedUpdate($Plan, [scriptblock]$ConfirmCore, [scriptblock]$StopCore, [scriptblock]$CopyFiles, [scriptblock]$RestartCore) {
     if ($Plan.CoreStopRequired) {
+        Write-UpdateEvent 'confirm_core' 'awaiting_confirmation'
         if (-not (& $ConfirmCore)) { return 'cancelled' }
         $stopped = $false
         try {
-            & $StopCore
+            Invoke-UpdateStep 'stop_core' $StopCore
             $stopped = $true
-            & $CopyFiles
-        } finally { & $RestartCore $stopped }
+            Invoke-UpdateStep 'install' $CopyFiles
+        } finally { Invoke-UpdateStep 'restart' { & $RestartCore $stopped } }
         return 'core-updated'
     }
-    & $CopyFiles
+    Invoke-UpdateStep 'install' $CopyFiles
     return 'hot-updated'
 }
 
@@ -243,7 +244,8 @@ function Invoke-InstallPlan($Plan, [string]$Package, [string]$Install, [string]$
         Invoke-TransactionalCopy $Package $Install $Backup $selected
         if ($hotUi) { Invoke-UiSwitch $Package $Install $Backup }
     } catch {
-        Restore-UpdateBackup $Install $Backup
+        try { [void](Write-UpdateFailure $_) } catch { }
+        Invoke-UpdateStep 'rollback' { Restore-UpdateBackup $Install $Backup }
         throw
     }
 }
@@ -272,26 +274,26 @@ function Restore-UpdateBackup([string]$Install, [string]$Backup) {
 function Stop-OwnedApplication([string]$Install, [int]$TrayPid) {
     $tray = Join-Path $Install 'aec-tray.exe'
     $process = Get-Process -Id $TrayPid -ErrorAction Stop
-    if ([IO.Path]::GetFullPath($process.Path) -ne [IO.Path]::GetFullPath($tray)) { throw '运行中的托盘身份不匹配，未停止服务' }
+    if ([IO.Path]::GetFullPath($process.Path) -ne [IO.Path]::GetFullPath($tray)) { Stop-Update 'identity_mismatch' }
     Start-Process -FilePath $tray -ArgumentList '--quit' -WindowStyle Hidden | Out-Null
     $deadline = [DateTime]::UtcNow.AddSeconds(120)
     do {
         Start-Sleep -Milliseconds 300
         $running = -not $process.WaitForExit(1)
     } while ($running -and [DateTime]::UtcNow -lt $deadline)
-    if ($running) { throw '托盘未能在 120 秒内正常退出；没有替换任何文件' }
+    if ($running) { Stop-Update 'shutdown_timeout' }
     $data = if ($DataDir) { $DataDir } elseif (Test-Path -LiteralPath (Join-Path $Install 'portable.flag')) { Join-Path $Install 'data' } else { Join-Path $env:LOCALAPPDATA 'AgentEgressController' }
     $state = Get-Content -LiteralPath (Join-Path $data 'state.json') -Raw | ConvertFrom-Json
-    if ($state.mode -ne 'daily' -or @($state.journal).Count -ne 0) { throw '系统恢复尚未完成；未替换程序，请重新启动托盘检查恢复状态' }
-    if (@($state.unacknowledgedRestoreFailures).Count -ne 0) { throw '仍有未确认的恢复失败，未替换程序' }
+    if ($state.mode -ne 'daily' -or @($state.journal).Count -ne 0) { Stop-Update 'restore_incomplete' }
+    if (@($state.unacknowledgedRestoreFailures).Count -ne 0) { Stop-Update 'restore_incomplete' }
     # Never close foreign processes. The tray must have stopped its own network children.
     $owned = @(Get-Process -Name aec-relay,aec-mihomo -ErrorAction SilentlyContinue | Where-Object {
         $_.Path -and [IO.Path]::GetFullPath($_.Path).StartsWith($Install.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)
     })
-    if ($owned.Count) { throw '本应用内核或 relay 尚未正常停止；未替换文件，请从托盘检查恢复状态' }
+    if ($owned.Count) { Stop-Update 'children_running' }
     $controls = @(Get-Process -Name aec-control -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq (Join-Path $Install 'aec-control.exe') })
     foreach ($control in $controls) { [void]$control.CloseMainWindow() }
-    foreach ($control in $controls) { if (-not $control.WaitForExit(10000)) { throw '本应用控制中心未正常关闭；未替换文件' } }
+    foreach ($control in $controls) { if (-not $control.WaitForExit(10000)) { Stop-Update 'control_running' } }
 }
 
 function Show-UpdateMessage([string]$Text, [string]$Title, [bool]$Confirm = $false) {
@@ -301,6 +303,207 @@ function Show-UpdateMessage([string]$Text, [string]$Title, [bool]$Confirm = $fal
     }
     [void][Windows.Forms.MessageBox]::Show($Text, $Title, 'OK', 'Information')
     return $false
+}
+
+# Never persist exception.Message, response bodies, URLs, command lines or settings.
+# Only controlled codes, numeric transport evidence and public release versions enter logs.
+function Initialize-UpdateLog([string]$Data, [string]$Version, [bool]$PresentationOnly) {
+    $script:UpdateFailureRecorded=$false
+    $script:UpdateLogRoot = Join-Path $Data 'update-logs'
+    New-Item -ItemType Directory -Path $script:UpdateLogRoot -Force | Out-Null
+    $script:UpdateLog = [ordered]@{
+        schemaVersion=1; id=[guid]::NewGuid().ToString('N'); currentVersion=''; targetVersion=''
+        uiOnly=$PresentationOnly; transferMode='unknown'; plannedBytes=[long]0; downloadedBytes=[long]0
+        skippedFiles=0; events=@()
+    }
+    if ($Version -match '^\d{1,5}\.\d{1,5}\.\d{1,5}$') { $script:UpdateLog.currentVersion=$Version }
+    Write-UpdateEvent 'initializing' 'running'
+    # Bounded, application-specific history; never delete user data or another extension.
+    Get-ChildItem -LiteralPath $script:UpdateLogRoot -File -Filter '*.json' |
+        Where-Object { $_.BaseName -match '^[a-f0-9]{32}$' } |
+        Sort-Object LastWriteTimeUtc -Descending | Select-Object -Skip 20 |
+        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force }
+}
+
+function Write-UpdateEvent([string]$Stage, [string]$Status, [string]$Code='none', [int]$HttpStatus=0, [int]$NativeCode=0) {
+    if (-not $script:UpdateLog) { return }
+    if ($Stage -notmatch '^[a-z_]{1,40}$' -or $Status -notin @('running','awaiting_confirmation','succeeded','failed','cancelled') -or
+        $Code -notmatch '^[a-z_]{1,40}$') { throw 'Invalid update event' }
+    $script:UpdateStage=$Stage
+    $event=[ordered]@{ time=[DateTime]::UtcNow.ToString('o'); stage=$Stage; status=$Status; code=$Code; httpStatus=$HttpStatus; nativeCode=$NativeCode }
+    $script:UpdateLog.events=@($script:UpdateLog.events | Select-Object -Last 63) + @($event)
+    $path=Join-Path $script:UpdateLogRoot ($script:UpdateLog.id + '.json')
+    $pending=$path + '.tmp'
+    [IO.File]::WriteAllText($pending, ($script:UpdateLog | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath $pending -Destination $path -Force
+}
+
+function Write-UpdateFailure($Failure) {
+    $exception=$Failure.Exception
+    $code='operation_failed'; $http=0; $native=0
+    while ($exception) {
+        $native=$exception.HResult
+        if ($exception.Data.Contains('aecCode')) { $code=[string]$exception.Data['aecCode']; break }
+        if ($exception -is [Net.WebException]) {
+            $code=switch ([string]$exception.Status) {
+                'Timeout' { 'network_timeout' }
+                'NameResolutionFailure' { 'dns_failed' }
+                'ProxyNameResolutionFailure' { 'proxy_failed' }
+                'TrustFailure' { 'tls_failed' }
+                'SecureChannelFailure' { 'tls_failed' }
+                'ProtocolError' { 'http_failed' }
+                default { 'network_failed' }
+            }
+            if ($exception.Response -is [Net.HttpWebResponse]) { $http=[int]$exception.Response.StatusCode }
+            break
+        }
+        if ($exception -is [UnauthorizedAccessException]) { $code='access_denied'; break }
+        if ($exception -is [IO.IOException]) {
+            $code=switch ($native -band 0xffff) { 32 {'file_locked'} 33 {'file_locked'} 112 {'disk_full'} default {'io_failed'} }
+            break
+        }
+        $exception=$exception.InnerException
+    }
+    Write-UpdateEvent $script:UpdateStage 'failed' $code $http $native
+    $script:UpdateFailureRecorded=$true
+    return $code
+}
+
+function Invoke-UpdateStep([string]$Stage, [scriptblock]$Action) {
+    # Diagnostics must fail closed before stopping/installing, but must NEVER prevent recovery.
+    $logFailure=$null
+    try { Write-UpdateEvent $Stage 'running' } catch {
+        if ($Stage -notin @('restart','rollback')) { throw }
+        $logFailure=$_
+    }
+    try { & $Action } catch { try { [void](Write-UpdateFailure $_) } catch { }; throw }
+    if ($logFailure) { throw $logFailure }
+    Write-UpdateEvent $Stage 'succeeded'
+}
+
+function Stop-Update([string]$Code) {
+    $errorObject=[InvalidOperationException]::new('Update validation failed')
+    $errorObject.Data['aecCode']=$Code
+    throw $errorObject
+}
+
+function Get-ReleaseAsset($Release, [string]$Name) {
+    $assets=@($Release.assets | Where-Object { $_.name -ceq $Name })
+    if ($assets.Count -ne 1) { Stop-Update 'asset_missing' }
+    # Only the selected official release, never a URL supplied by a component manifest.
+    $expected='https://github.com/zxs4KHf/agent-egress-controller/releases/download/' + $Release.tag_name + '/' + $Name
+    if ($assets[0].browser_download_url -cne $expected -or $assets[0].size -lt 0 -or $assets[0].size -gt 500MB) { Stop-Update 'asset_invalid' }
+    return $assets[0]
+}
+
+function Receive-UpdateAsset($Asset, [string]$Destination) {
+    # UseBasicParsing also avoids the Windows PowerShell 5.1 legacy IE dependency.
+    Invoke-WebRequest -UseBasicParsing -Uri $Asset.browser_download_url -OutFile $Destination -TimeoutSec 180
+    $actual=(Get-Item -LiteralPath $Destination).Length
+    if ($script:UpdateLog) { $script:UpdateLog.downloadedBytes += $actual }
+    if ($actual -ne $Asset.size) { Stop-Update 'download_size_mismatch' }
+}
+
+function Assert-DownloadHash([string]$Path, [string]$Hash) {
+    if ($Hash -notmatch '^[a-fA-F0-9]{64}$' -or (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -ne $Hash) { Stop-Update 'hash_mismatch' }
+}
+
+function Assert-IncrementalManifest($Manifest, [string]$Version) {
+    if ($Manifest.schemaVersion -ne 1 -or $Manifest.version -cne $Version -or
+        @($Manifest.files).Count -lt 1 -or @($Manifest.files).Count -gt 10000 -or
+        @($Manifest.components).Count -lt 1 -or @($Manifest.components).Count -gt 32) { Stop-Update 'manifest_invalid' }
+    $components=@{}; $paths=@{}; $total=[long]0
+    foreach ($c in $Manifest.components) {
+        if ($c.id -notmatch '^[a-z0-9-]{1,32}$' -or $components.ContainsKey($c.id) -or
+            $c.asset -cne "aec-$Version-$($c.id).zip" -or $c.sha256 -notmatch '^[a-f0-9]{64}$' -or
+            $c.size -isnot [ValueType] -or $c.size -lt 1 -or $c.size -gt 500MB) { Stop-Update 'manifest_invalid' }
+        $components[$c.id]=$c; $total += $c.size
+    }
+    if ($total -gt 500MB) { Stop-Update 'manifest_invalid' }
+    $total=0
+    foreach ($f in $Manifest.files) {
+        $p=[string]$f.path
+        if ($p -cne (Get-SafeRelativePath $p) -or $p.Contains('\') -or $p -match '//|[<>"|?*]|[. ](/|$)' -or
+            $p -match '(?i)(^|/)(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|/|$)' -or
+            -not (Test-PackagePath $p) -or $paths.ContainsKey($p) -or -not $components.ContainsKey($f.component) -or
+            $f.sha256 -notmatch '^[a-f0-9]{64}$' -or $f.size -isnot [ValueType] -or $f.size -lt 0 -or $f.size -gt 250MB) { Stop-Update 'manifest_invalid' }
+        $paths[$p]=$true; $total += $f.size
+    }
+    if ($total -gt 1GB -or -not $paths.ContainsKey('aec-tray.exe') -or -not $paths.ContainsKey('SHA256SUMS.txt')) { Stop-Update 'manifest_invalid' }
+    foreach ($c in $Manifest.components) {
+        if (@($Manifest.files | Where-Object { $_.component -eq $c.id }).Count -eq 0) { Stop-Update 'manifest_invalid' }
+    }
+}
+
+function Get-IncrementalPlan($Manifest, [string]$Target, [bool]$PresentationOnly) {
+    Assert-IncrementalManifest $Manifest $Manifest.version
+    $selected=@($Manifest.files | Where-Object { -not $PresentationOnly -or $_.path.StartsWith('ui/') })
+    if ($PresentationOnly -and -not ($selected.path -contains 'ui/active.json')) { Stop-Update 'manifest_invalid' }
+    $changed=@(); $unchanged=@(); $needed=@{}
+    foreach ($f in $selected) {
+        Assert-TargetPath $Target $f.path
+        $local=Join-Path $Target $f.path
+        if ((Test-Path -LiteralPath $local -PathType Leaf) -and (Get-Item -LiteralPath $local).Length -eq $f.size -and
+            (Get-FileHash -LiteralPath $local -Algorithm SHA256).Hash -eq $f.sha256) { $unchanged += $f }
+        else { $changed += $f; $needed[$f.component]=$true }
+    }
+    $bundles=@($Manifest.components | Where-Object { $needed.ContainsKey($_.id) })
+    $bytes=[long]0; foreach ($b in $bundles) { $bytes += $b.size }
+    [pscustomobject]@{ Files=$selected; Changed=$changed; Unchanged=$unchanged; Components=$bundles; DownloadBytes=$bytes; UiOnly=$PresentationOnly }
+}
+
+function Expand-VerifiedComponent([string]$ArchivePath, $Component, $Files, [string]$Destination) {
+    Assert-DownloadHash $ArchivePath $Component.sha256
+    if ((Get-Item -LiteralPath $ArchivePath).Length -ne $Component.size) { Stop-Update 'download_size_mismatch' }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive=[IO.Compression.ZipFile]::OpenRead($ArchivePath)
+    try {
+        $expected=@{}; foreach ($f in $Files) { $expected[$f.path]=$f }
+        if ($archive.Entries.Count -ne $expected.Count) { Stop-Update 'component_invalid' }
+        $seen=@{}
+        foreach ($entry in $archive.Entries) {
+            $p=$entry.FullName
+            if (-not $expected.ContainsKey($p) -or $seen.ContainsKey($p) -or $entry.Length -ne $expected[$p].size -or
+                (($entry.ExternalAttributes -shr 16) -band 0xf000) -eq 0xa000) { Stop-Update 'component_invalid' }
+            $seen[$p]=$true
+            Assert-TargetPath $Destination $p
+            $output=Join-Path $Destination $p
+            New-Item -ItemType Directory -Path (Split-Path -Parent $output) -Force | Out-Null
+            [IO.Compression.ZipFileExtensions]::ExtractToFile($entry,$output,$false)
+            Assert-DownloadHash $output $expected[$p].sha256
+        }
+    } finally { $archive.Dispose() }
+}
+
+function Receive-IncrementalPackage($Manifest, $Plan, [string]$Target, [string]$Work, [scriptblock]$Download) {
+    $stage=Join-Path $Work 'package'
+    New-Item -ItemType Directory -Path $stage -Force | Out-Null
+    foreach ($c in $Plan.Components) {
+        Write-UpdateEvent 'download_components' 'running'
+        $archive=Join-Path $Work $c.asset
+        & $Download $c $archive
+        Write-UpdateEvent 'verify_components' 'running'
+        $expanded=Join-Path $Work $c.id
+        New-Item -ItemType Directory -Path $expanded | Out-Null
+        Expand-VerifiedComponent $archive $c @($Manifest.files | Where-Object { $_.component -eq $c.id }) $expanded
+        foreach ($f in @($Plan.Files | Where-Object { $_.component -eq $c.id })) {
+            $destination=Join-Path $stage $f.path
+            New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+            [IO.File]::Copy((Join-Path $expanded $f.path),$destination,$false)
+        }
+    }
+    # Reconstruct a verified stage using unchanged local bytes, never trust version strings.
+    foreach ($f in $Plan.Files) {
+        $destination=Join-Path $stage $f.path
+        if (-not (Test-Path -LiteralPath $destination)) {
+            Assert-TargetPath $Target $f.path
+            New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+            [IO.File]::Copy((Join-Path $Target $f.path),$destination,$false)
+        }
+        Assert-DownloadHash $destination $f.sha256
+    }
+    if ($Plan.UiOnly) { [void](Get-UiManifest $stage) } else { Test-PackageIntegrity $stage }
+    return $stage
 }
 
 function Invoke-SelfTest {
@@ -427,42 +630,86 @@ if ($SelfTest) {
 }
 
 try {
-    if (-not $CurrentPid -or -not $CurrentVersion) { throw '请从托盘菜单启动更新检查' }
+    $install = [IO.Path]::GetFullPath($PSScriptRoot)
+    $data = if ($DataDir) { $DataDir } elseif (Test-Path -LiteralPath (Join-Path $install 'portable.flag')) { Join-Path $install 'data' } else { Join-Path $env:LOCALAPPDATA 'AgentEgressController' }
+    Initialize-UpdateLog $data $CurrentVersion $UiOnly.IsPresent
+    if (-not $CurrentPid -or $CurrentVersion -notmatch '^\d{1,5}\.\d{1,5}\.\d{1,5}$') { Stop-Update 'invalid_invocation' }
     $updateMutex = New-Object Threading.Mutex($false, 'Local\AgentEgressControllerUpdater')
     $ownsUpdateMutex = $updateMutex.WaitOne(0)
-    if (-not $ownsUpdateMutex) { throw '另一项更新检查正在进行，请先完成或关闭该窗口' }
+    if (-not $ownsUpdateMutex) { Stop-Update 'update_busy' }
+    Write-UpdateEvent 'discover' 'running'
     $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/zxs4KHf/agent-egress-controller/releases/latest' -Headers @{
         'User-Agent' = 'Agent-Egress-Controller-Updater'
         'Accept' = 'application/vnd.github+json'
     } -TimeoutSec 30
     $version = [string]$release.tag_name -replace '^v', ''
-    if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Release 版本格式不受支持' }
+    if ($version -notmatch '^\d{1,5}\.\d{1,5}\.\d{1,5}$') { Stop-Update 'unsupported_version' }
+    $script:UpdateLog.targetVersion=$version
     if ([version]$version -le [version]$CurrentVersion -and -not $UiOnly) {
+        Write-UpdateEvent 'complete' 'succeeded' 'already_current'
         Show-UpdateMessage "当前已是最新版本 v$CurrentVersion。" 'Agent Egress 更新'
         exit 0
     }
     $zipName = "AgentEgressController-$version-portable.zip"
     $sumName = "SHA256SUMS-$version.txt"
-    $zipAsset = @($release.assets | Where-Object { $_.name -eq $zipName }) | Select-Object -First 1
-    $sumAsset = @($release.assets | Where-Object { $_.name -eq $sumName }) | Select-Object -First 1
-    if (-not $zipAsset -or -not $sumAsset) { throw 'Release 缺少便携包或 SHA256 校验文件' }
+    $zipAsset = Get-ReleaseAsset $release $zipName
+    $sumAsset = Get-ReleaseAsset $release $sumName
     if ([version]$version -lt [version]$CurrentVersion) { throw '不允许从旧 Release 更新界面' }
     $kind = if ($UiOnly) { '仅界面资源（不停止网络服务）' } else { '完整更新（如核心改变，安装前会再次询问停服）' }
-    $body = "Release v$version（核心当前 v$CurrentVersion）。$kind。将下载完整便携包、核验 SHA256 后比较实际改动，保留用户数据。现在下载？"
-    if (-not (Show-UpdateMessage $body 'Agent Egress 更新' $true)) { exit 0 }
     $temp = Join-Path ([IO.Path]::GetTempPath()) ("aec-update-" + [guid]::NewGuid().ToString('N'))
     $download = Join-Path $temp $zipName
     $sums = Join-Path $temp $sumName
     $stage = Join-Path $temp 'expanded'
     New-Item -ItemType Directory -Path $temp, $stage | Out-Null
     try {
-        Invoke-WebRequest -Uri $zipAsset.browser_download_url -OutFile $download -TimeoutSec 180
-        Invoke-WebRequest -Uri $sumAsset.browser_download_url -OutFile $sums -TimeoutSec 30
+        $manifestName="aec-incremental-$version.json"
+        $incremental=@($release.assets | Where-Object { $_.name -ceq $manifestName }).Count -gt 0
+        if ($incremental) {
+            Write-UpdateEvent 'download_manifest' 'running'
+            $manifestAsset=Get-ReleaseAsset $release $manifestName
+            $manifestSumAsset=Get-ReleaseAsset $release "SHA256INCREMENTAL-$version.txt"
+            if ($manifestAsset.size -gt 2MB -or $manifestSumAsset.size -gt 4KB) { Stop-Update 'manifest_invalid' }
+            $manifestFile=Join-Path $temp $manifestName
+            $manifestSums=Join-Path $temp 'manifest-sums.txt'
+            Receive-UpdateAsset $manifestAsset $manifestFile
+            Receive-UpdateAsset $manifestSumAsset $manifestSums
+            Write-UpdateEvent 'verify_manifest' 'running'
+            $match=[regex]::Match((Get-Content -LiteralPath $manifestSums -Raw), '(?im)^([a-f0-9]{64})\s+\*?' + [regex]::Escape($manifestName) + '\s*$')
+            if (-not $match.Success) { Stop-Update 'manifest_invalid' }
+            Assert-DownloadHash $manifestFile $match.Groups[1].Value
+            $manifest=Get-Content -LiteralPath $manifestFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            Assert-IncrementalManifest $manifest $version
+            Write-UpdateEvent 'plan' 'running'
+            $incrementalPlan=Get-IncrementalPlan $manifest $install $UiOnly.IsPresent
+            $script:UpdateLog.transferMode='incremental'
+            $script:UpdateLog.plannedBytes=$incrementalPlan.DownloadBytes
+            $script:UpdateLog.skippedFiles=$incrementalPlan.Unchanged.Count
+            $mb=[Math]::Round($incrementalPlan.DownloadBytes/1MB,2)
+            $fullMb=[Math]::Round($zipAsset.size/1MB,2)
+            Write-UpdateEvent 'confirm_download' 'awaiting_confirmation'
+            $body="Release v$version。$kind。按哈希仅下载 $($incrementalPlan.Components.Count) 个变化组件，约 $mb MB（完整包 $fullMb MB）；跳过 $($incrementalPlan.Unchanged.Count) 个未变化文件。小型校验清单已读取。保留用户数据。现在下载？"
+            if (-not (Show-UpdateMessage $body 'Agent Egress 增量更新' $true)) { Write-UpdateEvent 'confirm_download' 'cancelled'; exit 0 }
+            $package=Receive-IncrementalPackage $manifest $incrementalPlan $install $temp {
+                param($component,$destination)
+                $asset=Get-ReleaseAsset $release $component.asset
+                if ($asset.size -ne $component.size) { Stop-Update 'download_size_mismatch' }
+                Receive-UpdateAsset $asset $destination
+            }
+        } else {
+        $script:UpdateLog.transferMode='full'
+        $script:UpdateLog.plannedBytes=[long]$zipAsset.size
+        Write-UpdateEvent 'confirm_download' 'awaiting_confirmation' 'full_fallback'
+        $body="Release v$version 未提供增量清单。$kind。需要下载完整便携包（约 $([Math]::Round($zipAsset.size/1MB,2)) MB），核验 SHA256 并保留用户数据。是否继续？"
+        if (-not (Show-UpdateMessage $body 'Agent Egress 更新' $true)) { Write-UpdateEvent 'confirm_download' 'cancelled'; exit 0 }
+        Write-UpdateEvent 'download_full' 'running'
+        Receive-UpdateAsset $zipAsset $download
+        Receive-UpdateAsset $sumAsset $sums
+        Write-UpdateEvent 'verify_full' 'running'
         $sumText = Get-Content -LiteralPath $sums -Raw
         $sumMatch = [regex]::Match($sumText, '(?im)^([a-f0-9]{64})\s+\*?' + [regex]::Escape($zipName) + '\s*$')
-        if (-not $sumMatch.Success) { throw '校验文件中没有对应 ZIP 的 SHA256' }
+        if (-not $sumMatch.Success) { Stop-Update 'manifest_invalid' }
         $actualHash = (Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash.ToLowerInvariant()
-        if ($actualHash -ne $sumMatch.Groups[1].Value.ToLowerInvariant()) { throw 'SHA256 校验失败，未安装更新' }
+        if ($actualHash -ne $sumMatch.Groups[1].Value.ToLowerInvariant()) { Stop-Update 'hash_mismatch' }
         if ((Get-Item -LiteralPath $download).Length -gt 500MB) { throw '更新包超过大小限制' }
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         $archive = [IO.Compression.ZipFile]::OpenRead($download)
@@ -476,16 +723,18 @@ try {
         Expand-Archive -LiteralPath $download -DestinationPath $stage -Force
         $roots = @(Get-ChildItem -LiteralPath $stage -Directory)
         if ($roots.Count -ne 1) { throw '更新包目录结构无效' }
-        $install = [IO.Path]::GetFullPath($PSScriptRoot)
         $expectedDir = "AgentEgressController-$version-portable"
         if ($roots[0].Name -ne $expectedDir) { throw '更新包目录版本与 Release 标签不一致' }
         $package = $roots[0].FullName
-        $tray = Join-Path $install 'aec-tray.exe'
-        if (-not (Test-Path -LiteralPath $tray -PathType Leaf)) { throw '当前目录不像 Agent Egress 便携安装目录' }
         Test-PackageIntegrity $package
+        }
+        $tray = Join-Path $install 'aec-tray.exe'
+        if (-not (Test-Path -LiteralPath $tray -PathType Leaf)) { Stop-Update 'install_missing' }
         [void](Prepare-PackageForTarget $package $install)
+        Write-UpdateEvent 'plan_install' 'running'
         $plan = Get-UpdatePlan $package $install $UiOnly.IsPresent
         if ($plan.Files.Count -eq 0) {
+            Write-UpdateEvent 'complete' 'succeeded' 'already_current'
             Show-UpdateMessage '所选更新内容已经一致，无需安装。' 'Agent Egress 更新'
             exit 0
         }
@@ -510,17 +759,20 @@ try {
                 Start-Sleep -Seconds 2
                 if ($started.HasExited) { throw '新版托盘启动后立即退出' }
             } catch {
-                if (Test-Path -LiteralPath (Join-Path $backup 'rollback.json')) { Restore-UpdateBackup $install $backup }
+                if (Test-Path -LiteralPath (Join-Path $backup 'rollback.json')) { Invoke-UpdateStep 'rollback' { Restore-UpdateBackup $install $backup } }
                 Start-Process @options | Out-Null
-                throw '新程序未启动，已恢复旧程序并尝试启动；请检查托盘和恢复状态'
+                Stop-Update 'restart_failed'
             }
         }
         $result = Invoke-PlannedUpdate $plan $confirm $stop $copy $restart
         if ($result -eq 'cancelled') {
+            Write-UpdateEvent 'confirm_core' 'cancelled'
             Show-UpdateMessage '已取消核心更新，服务和程序文件保持原样。' 'Agent Egress 更新'
         } elseif ($result -eq 'hot-updated') {
+            Write-UpdateEvent 'complete' 'succeeded' 'hot_updated'
             Show-UpdateMessage "界面/文档已在线更新，网络服务未停止。请在控制中心点击刷新界面，未保存草稿会先询问。核心程序版本没有变化。`n回滚备份：$backup" 'Agent Egress 更新'
         } else {
+            Write-UpdateEvent 'complete' 'succeeded' 'core_updated'
             Show-UpdateMessage "程序已更新到 v$version，并已启动托盘。是否就绪以重新检测结果为准。`n回滚备份：$backup" 'Agent Egress 更新'
         }
     } catch {
@@ -529,7 +781,17 @@ try {
         Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
     }
 } catch {
-    if (-not $SelfTest) { Show-UpdateMessage $_.Exception.Message 'Agent Egress 更新失败' }
+    $failure=$_
+    try {
+        if (-not $script:UpdateFailureRecorded) { [void](Write-UpdateFailure $failure) }
+        $lastFailure=@($script:UpdateLog.events | Where-Object { $_.status -eq 'failed' }) | Select-Object -Last 1
+        $code=$lastFailure.code
+        if (-not $script:UpdateLog) { throw 'Log initialization failed' }
+        Write-UpdateEvent $lastFailure.stage 'failed' $code $lastFailure.httpStatus $lastFailure.nativeCode
+        Show-UpdateMessage "更新失败（$code）。已保留阶段、错误码与下载记录，关闭窗口不会丢失。`n日志：$script:UpdateLogRoot`nAgent 可运行：aec-agent.exe update-status`n没有完成更新不代表已恢复网络，请检查托盘状态。" 'Agent Egress 更新失败'
+    } catch {
+        Show-UpdateMessage '更新已中止，无法写入更新日志。请检查数据目录权限和磁盘空间。不要反复确认停服；先由 Agent 检查本机状态。' 'Agent Egress 更新失败'
+    }
     exit 1
 } finally {
     if ($ownsUpdateMutex) { $updateMutex.ReleaseMutex() }
