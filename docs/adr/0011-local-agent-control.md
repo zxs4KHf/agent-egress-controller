@@ -10,7 +10,7 @@
 ## 决策
 
 1. 托盘提供 loopback-only、可从看板显式启用/关闭的本机 HTTP/JSON 控制接口。
-2. 发布 aec-agent.exe 作为 MCP stdio adapter 和通用 JSON host bridge。MCP 和 HTTP 共用工具名、严格 JSON schema、枚举及安全语义；所有更改最终进入现有托盘串行 Worker。
+2. 发布 aec-agent.exe 作为 MCP stdio adapter 和通用 JSON host bridge。MCP 和 HTTP 共用工具名、严格 JSON schema、枚举及安全语义；网络更改最终进入现有托盘串行 Worker。访问权限即时撤销和固定更新器启动的例外见 ADR-0012，它们不能绕过网络状态机或本机停服确认。
 3. MCP 初始化按官方 JSON-RPC stdio 生命周期运行。HTTP 使用临时 Bearer token；仅随机 credential reference 写入发现文件，token 写当前用户 Windows Credential Manager。每次托盘启动轮换 token，退出时清发现文件与 token。
 4. 只暴露状态、表单配置、规则、路径、模式、自启和快捷方式等有限操作。不提供通用 shell、文件、URL、注册表、任意进程或裸 profile 写接口。密码始终从用户本机设置页输入。
 5. 认证成功表示本机同用户进程获准访问，不能被解释为 MCP 客户端本身获得系统级隔离。接口拒绝浏览器 Origin、CORS 与非 loopback Host；不接受未知字段。Agent 输出可能含本机出口、站点和路由信息，因此不应自动上传。

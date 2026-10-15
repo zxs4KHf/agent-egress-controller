@@ -6,7 +6,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -776,6 +776,10 @@ pub trait SetupBackend: Send + Sync {
     fn shortcuts(&self) -> Result<(), Vec<FieldError>> {
         Err(vec![err("shortcuts", "入口管理不可用")])
     }
+    /// Launch the bounded updater; only its physical user confirmation may stop services.
+    fn update(&self, _ui_only: bool) -> Result<(), Vec<FieldError>> {
+        Err(vec![err("update", "更新入口不可用")])
+    }
     fn dashboard(&self) -> Option<crate::dashboard::View> {
         None
     }
@@ -785,6 +789,9 @@ pub trait SetupBackend: Send + Sync {
     fn path(&self, _path: String) -> Result<(), Vec<FieldError>> {
         Err(vec![err("path", "看板不可用")])
     }
+    fn route(&self, _form: crate::route_switch::Form) -> Result<(), Vec<FieldError>> {
+        Err(vec![err("route", "快捷路由切换不可用")])
+    }
 }
 
 pub struct SetupServer {
@@ -792,6 +799,13 @@ pub struct SetupServer {
     token: String,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+}
+
+struct ClientLease(Arc<AtomicUsize>);
+impl Drop for ClientLease {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 fn respond(s: &mut TcpStream, status: &str, ctype: &str, body: &str) {
@@ -827,7 +841,8 @@ pub fn page(token: &str, view: &SetupView) -> String {
             })
         })
         .collect();
-    PAGE.replace("__TOKEN__", token)
+    crate::ui::template("setup.html", PAGE)
+        .replace("__TOKEN__", token)
         .replace(
             "__VIEW__",
             &js(serde_json::to_value(view).expect("serializes")),
@@ -937,6 +952,18 @@ fn handle(
             "text/html; charset=utf-8",
             &crate::agent::page(token, &backend.agent_info()),
         ),
+        ("GET", "/agent-info") if token_ok => respond(
+            &mut s,
+            "200 OK",
+            "application/json; charset=utf-8",
+            &backend.agent_info().to_string(),
+        ),
+        ("GET", asset) if token_ok && asset.starts_with("/ui/") => {
+            match crate::ui::asset(&asset[4..]) {
+                Some((ctype, body)) => respond(&mut s, "200 OK", ctype, &body),
+                None => respond(&mut s, "404 Not Found", "text/plain", "asset unavailable"),
+            }
+        }
         ("GET", "/dashboard" | "/state") if token_ok => match backend.dashboard() {
             Some(view) => {
                 let (ctype, body) = if path == "/state" {
@@ -973,7 +1000,8 @@ fn handle(
         ),
         (
             "POST",
-            "/save" | "/rules" | "/path" | "/startup" | "/shortcuts" | "/action" | "/agent-access",
+            "/save" | "/rules" | "/path" | "/startup" | "/shortcuts" | "/action" | "/agent-access"
+            | "/update" | "/route",
         ) if token_ok => {
             if header(&head, "origin") != Some(format!("http://{me}").as_str()) {
                 return respond(&mut s, "403 Forbidden", "text/plain", "origin rejected");
@@ -1004,8 +1032,16 @@ fn handle(
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
             struct EmptyForm {}
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase", deny_unknown_fields)]
+            struct UpdateForm {
+                ui_only: bool,
+            }
             let malformed = || vec![err("form", "表单格式不对")];
             let result = match path {
+                "/update" => serde_json::from_slice::<UpdateForm>(body)
+                    .map_err(|_| malformed())
+                    .and_then(|form| backend.update(form.ui_only)),
                 "/agent-access" => serde_json::from_slice::<StartupForm>(body)
                     .map_err(|_| malformed())
                     .and_then(|form| backend.agent_access(form.enabled)),
@@ -1021,6 +1057,9 @@ fn handle(
                 "/rules" => serde_json::from_slice(body)
                     .map_err(|_| malformed())
                     .and_then(|form| backend.rules(form)),
+                "/route" => serde_json::from_slice(body)
+                    .map_err(|_| malformed())
+                    .and_then(|form| backend.route(form)),
                 "/path" => serde_json::from_slice::<PathForm>(body)
                     .map_err(|_| malformed())
                     .and_then(|form| backend.path(form.path)),
@@ -1043,7 +1082,8 @@ fn handle(
         (
             _,
             "/app" | "/setup" | "/proxy-help" | "/save" | "/dashboard" | "/state" | "/rules"
-            | "/path" | "/startup" | "/shortcuts" | "/agent" | "/agent-access" | "/action",
+            | "/path" | "/startup" | "/shortcuts" | "/agent" | "/agent-access" | "/action"
+            | "/agent-info" | "/update" | "/route",
         ) => respond(&mut s, "403 Forbidden", "text/plain", "token rejected"),
         _ => respond(&mut s, "404 Not Found", "text/plain", "not found"),
     }
@@ -1090,13 +1130,33 @@ impl SetupServer {
         let port = listener.local_addr()?.port();
         listener.set_nonblocking(true)?;
         let stop = Arc::new(AtomicBool::new(false));
-        let (stop2, token2) = (stop.clone(), token.clone());
+        let (stop2, token2) = (stop.clone(), Arc::new(token.clone()));
+        let agent = Arc::new(agent);
+        let clients = Arc::new(AtomicUsize::new(0));
         let thread = std::thread::spawn(move || {
             while !stop2.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((s, _)) => {
                         let _ = s.set_nonblocking(false);
-                        handle(s, port, &token2, backend.as_ref(), agent.as_ref());
+                        let _ = s.set_write_timeout(Some(Duration::from_secs(3)));
+                        if clients.fetch_add(1, Ordering::Relaxed) >= 32 {
+                            clients.fetch_sub(1, Ordering::Relaxed);
+                            let mut s = s;
+                            respond(
+                                &mut s,
+                                "503 Service Unavailable",
+                                "text/plain",
+                                "too many local requests",
+                            );
+                            continue;
+                        }
+                        let lease = ClientLease(clients.clone());
+                        let (token, backend, agent) =
+                            (token2.clone(), backend.clone(), agent.clone());
+                        std::thread::spawn(move || {
+                            let _lease = lease;
+                            handle(s, port, &token, backend.as_ref(), agent.as_ref().as_ref());
+                        });
                     }
                     Err(_) => std::thread::sleep(Duration::from_millis(50)),
                 }
@@ -1132,9 +1192,15 @@ fn control_page(port: u16, token: &str, query: &str) -> String {
             "help": format!("http://127.0.0.1:{port}/proxy-help?t={token}")
         },
         "stateUrl": format!("http://127.0.0.1:{port}/state?t={token}"),
+        "agentInfoUrl": format!("http://127.0.0.1:{port}/agent-info?t={token}"),
         "tab": if tabs.contains(&tab) { tab } else { "setup" }
     });
-    include_str!("control.html").replace("__CONFIG__", &config.to_string().replace("</", "<\\/"))
+    crate::ui::template(
+        "control.html",
+        include_str!("../../../ui/revisions/fluent-1/control.html"),
+    )
+    .replace("__TOKEN__", token)
+    .replace("__CONFIG__", &config.to_string().replace("</", "<\\/"))
 }
 
 impl Drop for SetupServer {
@@ -1147,216 +1213,12 @@ impl Drop for SetupServer {
 }
 
 fn proxy_help_page(token: &str) -> String {
-    PROXY_HELP_PAGE.replace("__TOKEN__", token)
+    crate::ui::template("help.html", PROXY_HELP_PAGE).replace("__TOKEN__", token)
 }
 
-const PROXY_HELP_PAGE: &str = r##"<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>代理共存与固定出口</title>
-<style>
-:root{--bg:#f6f7f5;--panel:#fff;--fg:#1d2420;--muted:#58645e;--line:#d8ddd9;--accent:#246648;--warn:#fff2d4}
-@media(prefers-color-scheme:dark){:root{--bg:#141816;--panel:#1d2320;--fg:#e6ebe8;--muted:#a0aaa5;--line:#333b37;--accent:#72c49a;--warn:#39301e}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 system-ui,"Microsoft YaHei UI",sans-serif}
-main{max-width:760px;margin:0 auto;padding:24px 16px 48px}h1{font-size:23px;margin:0 0 6px}h2{font-size:17px;margin:0 0 8px}p{margin:8px 0}section{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px;margin-top:14px}.muted{color:var(--muted)}.warn{background:var(--warn);padding:12px 14px;border-radius:6px;margin-top:14px}ol{padding-left:24px}li{padding:3px 0}a{color:var(--accent)}
-</style></head><body><main>
-<h1>代理共存与固定出口</h1>
-<p class="muted">系统级分流需要有一个明确的系统代理所有者。这里解释冲突提示的原因、推荐配置和目前未支持的替代方式。</p>
-<div class="warn"><b>检测到其他程序改写 Windows 系统代理。</b>当前值不会被 AEC 自动覆盖。G6 已失败、Agent 就绪已撤销；绕过 AEC 的系统流量不受固定出口保护，请先按下面步骤处理冲突。</div>
-<section><h2>推荐：AEC 接管系统代理，另一客户端只提供上游</h2>
-<ol><li>打开 Clash、mihomo 或其他代理客户端设置，关闭「系统代理 / Set as system proxy」。</li>
-<li>同时关闭该客户端的 VPN、TUN、透明代理或全局接管模式。只保留本地内核运行。</li>
-<li>在客户端内照常选择或切换节点。切换节点不需要重新打开「系统代理」。</li>
-<li>在 AEC 设置的「分流 → 本机代理」填写该客户端的本地监听地址和端口（例如 <code>127.0.0.1:7890</code>），作为普通流量上游。受保护 AI 域名继续按 AEC 固定 ISP 规则走。</li>
-<li>保持 AEC 的「接管 Windows 系统代理」开启。回到托盘，退出 Agent 模式，再重新进入；确认 G6 通过。</li></ol>
-<p>原因：Windows 的系统代理只有一个全局值。AEC 接管时会把它指向 AEC 自己的入口；若另一客户端开启同名开关，它会把该值改成自己的端口，系统请求便绕过 AEC 的分流。两个程序反复写回只会互相覆盖，因此 AEC 保留外部改动并要求用户处理，不会静默抢回。</p>
-<p>VPN/TUN/透明代理可能接管整个网络接口，连 AEC 到 ISP 代理的连接也可能被再次转发，导致出口 IP 改变或验证失败。它们无法作为“只切普通流量节点”的开关使用。</p>
-</section>
-<section><h2>高级替代：让代理客户端继续持有系统代理</h2>
-<p>理论上可由兼容的 Clash/Mihomo 配置把受保护域名规则转发到 AEC 本地入口，再由 AEC 连接固定 ISP；普通域名仍由该客户端按节点处理。这样用户可以继续打开它的系统代理开关。</p>
-<p>这需要客户端规则、端口和 AEC 路由三者精确配合，避免循环代理；还要处理客户端配置覆盖、规则优先级和节点变化。当前 AEC 不生成或维护这类外部客户端配置，桌面连接归属检测也不能把经 Clash 转发的流量当作 Claude 直连 AEC 的证据。因此它目前是未支持的集成方向，不应仅按通用配置片段启用或据此宣称固定出口已验证。</p>
-</section>
-<p><a href="/setup?t=__TOKEN__">返回出口与分流设置</a></p>
-</main></body></html>"##;
+const PROXY_HELP_PAGE: &str = include_str!("../../../ui/revisions/fluent-1/help.html");
 
-const PAGE: &str = r##"<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>出口与分流设置</title>
-<style>
-:root{--bg:#f6f7f5;--card:#fff;--fg:#1d2420;--muted:#5d6862;--line:#d8ddd9;--accent:#28664b;--err:#b3261e;--okbg:#e5f2ea;--errbg:#fbeaea;--soft:#eef2ef}
-@media (prefers-color-scheme:dark){:root{--bg:#141816;--card:#1d2320;--fg:#e6ebe8;--muted:#9aa5a0;--line:#333b37;--accent:#5fb98d;--err:#f2867e;--okbg:#1f3329;--errbg:#3a2120;--soft:#242b27}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 system-ui,"Microsoft YaHei UI",sans-serif}
-main{max-width:680px;margin:0 auto;padding:24px 16px 48px}
-h1{font-size:22px;margin:0 0 4px}p.lead{color:var(--muted);margin:0 0 20px}
-section,details{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin-bottom:16px}
-h2{font-size:16px;margin:0 0 12px}summary{font-weight:600;cursor:pointer}
-label{display:block;font-weight:600;margin:12px 0 4px}label:first-of-type{margin-top:0}
-.hint{color:var(--muted);font-size:13px;font-weight:400;margin-top:3px}
-input[type=text],input[type=password],input[type=number],select,textarea{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);font:inherit}
-textarea{min-height:84px;resize:vertical;font-family:ui-monospace,Consolas,monospace;font-size:13px}
-.row{display:flex;gap:12px}.row>div{flex:1;min-width:0}.row>.narrow{flex:0 0 140px}
-.check{display:flex;gap:10px;align-items:flex-start;font-weight:400;margin-top:12px}.check input{margin-top:4px}
-.radio{display:flex;gap:10px;align-items:flex-start;font-weight:400;margin:8px 0}.radio input{margin-top:4px}
-.box{background:var(--soft);border-radius:8px;padding:10px 12px;margin-top:10px;font-size:13px;color:var(--muted)}
-.sub{border-left:3px solid var(--line);padding-left:12px;margin-top:8px}
-.fe{color:var(--err);font-size:13px;margin-top:3px}
-button{background:var(--accent);color:#fff;border:0;border-radius:6px;padding:10px 22px;font:inherit;font-weight:600;cursor:pointer}
-button.link{background:none;color:var(--accent);padding:0;font-weight:400;font-size:13px;text-decoration:underline}
-button:disabled{opacity:.5;cursor:default}
-#msg{margin-top:14px;padding:10px 12px;border-radius:6px;display:none}
-#msg.ok{display:block;background:var(--okbg)}#msg.bad{display:block;background:var(--errbg);color:var(--err)}
-[hidden]{display:none!important}
-@media (max-width:480px){.row{flex-direction:column;gap:0}.row>.narrow{flex:none}}
-</style></head><body><main>
-<h1>出口与分流设置</h1>
-<p class="lead">填你自己的出口代理，再选哪些流量走它。默认只有从托盘打开的浏览器和 CLI 会走这个出口；打开「系统级分流」后，整台电脑跟随系统代理的程序也会进入下面的规则。</p>
-<form id="f" autocomplete="off">
-
-<section><h2>出口代理</h2>
-<div class="row"><div><label for="host">地址</label><input id="host" type="text" placeholder="例如 203.0.113.10 或 proxy.example.com"><div class="fe" data-for="host"></div></div>
-<div class="narrow"><label for="proto">协议</label><select id="proto"><option value="socks5">SOCKS5</option><option value="http">HTTP</option></select></div></div>
-<label for="ports">端口</label><input id="ports" type="text" placeholder="例如 12324, 12323/http">
-<div class="hint">多个端口用逗号分隔，必须是同一个出口（同一台机器）；某个端口协议不同，就写成 <code>12323/http</code>。连不上一个会自动换下一个。</div><div class="fe" data-for="ports"></div>
-<div class="row"><div><label for="username">用户名</label><input id="username" type="text" placeholder="没有就留空"><div class="fe" data-for="username"></div></div>
-<div><label for="password">密码</label><input id="password" type="password" placeholder=""><div class="fe" data-for="password"></div></div></div>
-<div class="hint">密码保存在 Windows 凭据管理器，档案只保存引用；页面不会回显已保存的密码。</div>
-<label for="expectedIp">出口 IP（可选）</label><input id="expectedIp" type="text" placeholder="填了就严格比对，不一致算检测不通过">
-<div class="fe" data-for="expectedIp"></div>
-</section>
-
-<section><h2>加密隧道（可选）</h2>
-<label class="check"><input id="tunnelEnabled" type="checkbox"><span>经加密隧道连接出口
-<div class="hint">在国内直连某些出口（例如 IPRoyal 的 ISP / 静态住宅代理）会被重置、时通时断时打开。每个连接先走隧道，不通再按下面的设置直连；两条路均连接配置的出口，最终 IP 由检测确认。</div></span></label>
-<div id="tunnelBox" class="sub">
-<label for="tunnelPreset">隧道渠道</label><select id="tunnelPreset"></select><div class="fe" data-for="tunnelPreset"></div>
-<div id="presetBox" class="box"></div>
-<div id="customBox">
-<label for="tunnelServers">隧道服务器（Shadowsocks）</label><textarea id="tunnelServers" placeholder="每行一个，地址:端口&#10;例如 ss.example.com:8388"></textarea><div class="fe" data-for="tunnelServers"></div>
-<div class="row"><div><label for="tunnelCipher">加密方式</label><select id="tunnelCipher"></select><div class="fe" data-for="tunnelCipher"></div></div>
-<div><label for="tunnelPassword">隧道密码</label><input id="tunnelPassword" type="password"><div class="fe" data-for="tunnelPassword"></div></div></div>
-</div>
-<label class="check"><input id="tunnelDirectFallback" type="checkbox"><span>隧道不通时直连出口
-<div class="hint">建议打开。两条路时好时坏会轮换，留着直连这条路断线最少。</div></span></label>
-</div>
-</section>
-
-<section><h2>分流</h2>
-<label class="radio"><input type="radio" name="routingMode" value="custom"><span><b>保留现有路由数据</b>
-<div class="hint">不改动已导入的出站、分组、规则和顺序。下面两个选项会重新套用预设并替换现有路由表。</div></span></label>
-<label class="radio"><input type="radio" name="routingMode" value="all"><span><b>全部走出口</b>
-<div class="hint">进入规则的所有网站都走出口。简单，但出口流量最多。</div></span></label>
-<label class="radio"><input type="radio" name="routingMode" value="split"><span><b>分流</b>
-<div class="hint">只有下面列出的站点走出口；其他网站交给你自己的本机代理（比如 Clash 的端口），本机代理没开就直连。</div></span></label>
-<div class="fe" data-for="routingMode"></div>
-<div id="splitBox" class="sub">
-<div class="row"><div><label for="localProxy">本机代理（可选）</label><input id="localProxy" type="text" placeholder="例如 127.0.0.1:7890，没有就留空"><div class="fe" data-for="localProxy"></div></div>
-<div class="narrow"><label for="localProxyProto">协议</label><select id="localProxyProto"><option value="socks5">SOCKS5</option><option value="http">HTTP</option></select></div></div>
-<div class="hint">留空：其他网站直连。本机代理不可用时可回退到直连；每 15 秒进行一次健康检查，恢复可用后重新选择。若使用 Clash 等客户端的端口作为上游，请关闭该客户端的「系统代理」和 VPN/TUN/全局接管开关；内核保持运行即可，节点仍可在客户端内切换。</div>
-<label for="extraDomains">也走出口的其他域名</label><textarea id="extraDomains" placeholder="每行一个，例如 openai.com"></textarea>
-<div class="hint">按后缀匹配，<code>openai.com</code> 也包括 <code>api.openai.com</code>。想让某个站点改走本机代理（比如 ChatGPT），就把它从这里和下面的「检测站点」里都删掉。 <button type="button" class="link" id="suggest">填入常用 AI 域名</button></div>
-<div class="fe" data-for="extraDomains"></div>
-</div>
-<label class="check"><input id="domesticDirect" type="checkbox"><span>国内网站直连
-<div class="hint">需要自行把可信的 GeoSite.dat、GeoIP.dat 放到 bin 目录；程序不会下载。没有这些文件时请关闭此项。</div></span></label>
-<label for="targets">检测站点</label><textarea id="targets"></textarea>
-<div class="hint">每行一个，每次逐项检测（G2）。预设会为这些站点生成出口规则；导入表保持原规则。要能读到 <code>/cdn-cgi/trace</code> 才能比对出口。</div>
-<div class="fe" data-for="targets"></div>
-</section>
-
-<section><h2>系统级分流</h2>
-<label for="coreMixedPort">本机代理入口端口</label><input id="coreMixedPort" type="number" min="0" max="65535" placeholder="默认 17893"><div class="fe" data-for="coreMixedPort"></div>
-<div class="hint">留空或 0 使用默认端口。接替已有代理时，填写客户端当前使用的入口端口；不会改写用户级代理环境变量。保存后下次进入生效。若本机程序依赖这个端口，先核对，避免断网。</div>
-<label class="check"><input id="systemProxy" type="checkbox"><span>进入 Agent 模式时接管 Windows 系统代理，退出时恢复原样
-<div class="hint">Windows 只有一个系统代理设置。本程序接管后会把它指向自己的入口端口；不要同时打开 Clash 等客户端的「系统代理」、VPN/TUN 或全局代理开关。可以保留对方内核运行，在上方「本机代理」填它的本地端口作为普通流量上游，并照常切换节点。检测到其他程序改写时，本程序不会抢写，会撤销就绪并提示关闭冲突开关后退出、重新进入。默认关闭，真实写入需要接管门放行。</div></span></label>
-</section>
-
-<section><h2>时区与语言</h2>
-<div class="row"><div><label for="timezone">目标时区</label><select id="timezone"></select><div class="fe" data-for="timezone"></div></div>
-<div><label for="language">浏览器语言</label><select id="language"></select><div class="fe" data-for="language"></div></div></div>
-<label class="check"><input id="takeoverEnabled" type="checkbox"><span>进入 Agent 模式时把系统时区改成目标时区，退出时改回原样
-<div class="hint">不勾选就不修改系统时区。仍会核对系统与浏览器时区；目标不一致或缺少证据时无法就绪。</div></span></label>
-</section>
-
-<details><summary>高级：转发层</summary>
-<div class="hint" style="margin-top:8px">转发层替你连出口：一个端口或一条路不通，就换下一个，出口 IP 不变。</div>
-<div class="row"><div><label for="maxInflight">同时建立的连接数</label><input id="maxInflight" type="number" min="1" max="64"><div class="fe" data-for="maxInflight"></div>
-<div class="hint">只限制「正在建立」的连接，已经连上的不占名额。Claude、ChatGPT 客户端会一次新建很多连接，太小会排队失败。</div></div>
-<div><label for="connectTimeoutMs">每一步等待（毫秒）</label><input id="connectTimeoutMs" type="number" min="100" max="4900"><div class="fe" data-for="connectTimeoutMs"></div>
-<div class="hint">直连出口时每一步最多等多久；隧道自己会多等一些。</div></div></div>
-<label for="dialBudgetMs">一个连接的总时长（毫秒）</label><input id="dialBudgetMs" type="number" min="500" max="4999"><div class="fe" data-for="dialBudgetMs"></div>
-<div class="hint">在这段时间里把所有路轮流试一遍。必须小于 5000：内核等一个连接最多 5 秒。</div>
-</details>
-
-<button id="save" type="submit">保存</button>
-<div id="msg"></div>
-<div class="fe" data-for="form"></div><div id="other" class="fe"></div>
-</form></main>
-<script>
-const T="__TOKEN__",V=__VIEW__,TZ=__TZ__,LANG=__LANG__,PRESETS=__PRESETS__,CIPHERS=__CIPHERS__,SUGGESTED=__SUGGESTED__;
-const $=id=>document.getElementById(id);
-const opt=(sel,v,t)=>{const o=document.createElement("option");o.value=v;o.textContent=t;$(sel).append(o)};
-for(const [k,l] of TZ)opt("timezone",k,l);
-for(const [k,l] of LANG)opt("language",k,l+"  "+k);
-for(const p of PRESETS)opt("tunnelPreset",p.key,p.label);
-opt("tunnelPreset","custom","自定义 Shadowsocks 隧道");
-for(const c of CIPHERS)opt("tunnelCipher",c,c);
-for(const k of ["host","ports","username","expectedIp","tunnelServers","localProxy","targets","extraDomains","coreMixedPort"])$(k).value=V[k]||"";
-for(const k of ["maxInflight","connectTimeoutMs","dialBudgetMs"])$(k).value=V[k];
-$("proto").value=V.proto;$("timezone").value=V.timezone;$("language").value=V.language;
-$("tunnelPreset").value=V.tunnelPreset;$("tunnelCipher").value=V.tunnelCipher;$("localProxyProto").value=V.localProxyProto;
-for(const k of ["takeoverEnabled","tunnelEnabled","tunnelDirectFallback","domesticDirect","systemProxy"])$(k).checked=V[k];
-document.querySelector('input[name=routingMode][value="'+V.routingMode+'"]').checked=true;
-$("password").placeholder=V.passwordStored?"已保存，不改就留空":"没有就留空";
-function tunnelPwHint(){$("tunnelPassword").placeholder=V.tunnelPasswordStored&&V.tunnelPreset==="custom"?"已保存，不改就留空":""}
-tunnelPwHint();
-function sync(){
- $("tunnelBox").hidden=!$("tunnelEnabled").checked;
- const pre=PRESETS.find(p=>p.key===$("tunnelPreset").value);
- $("customBox").hidden=!!pre;$("presetBox").hidden=!pre;
- if(pre){$("presetBox").textContent="";const b=$("presetBox");
-  const line=t=>{const d=document.createElement("div");d.textContent=t;b.append(d)};
-  line("来源："+pre.source+"；文档核对日期："+pre.checked+"（节点连通性需在你的网络检测）。");
-  line("服务器："+pre.servers.join("、")+"，加密 "+pre.cipher+"，密码按官方公开值自动填写。");
-  line(pre.note)}
- $("splitBox").hidden=document.querySelector("input[name=routingMode]:checked").value!=="split";
-}
-for(const id of ["tunnelEnabled","tunnelPreset"])$(id).addEventListener("change",sync);
-document.querySelectorAll("input[name=routingMode]").forEach(r=>r.addEventListener("change",()=>{sync();
- if(r.value==="split"&&r.checked&&!$("extraDomains").value.trim())$("extraDomains").value=SUGGESTED.join("\n")}));
-$("suggest").addEventListener("click",()=>{const have=$("extraDomains").value.split(/\s+/).filter(Boolean);
- $("extraDomains").value=[...new Set(have.concat(SUGGESTED))].join("\n")});
-sync();
-if(V.locked){$("save").disabled=true;show("bad","现在处于 Agent 模式。先从托盘「退出 Agent 模式」，再修改设置。")}
-function show(c,t){const m=$("msg");m.className=c;m.textContent=t}
-$("f").addEventListener("submit",async e=>{e.preventDefault();
- document.querySelectorAll(".fe").forEach(x=>x.textContent="");$("msg").className="";
- const num=id=>parseInt($(id).value,10)||0;
- const form={host:$("host").value,proto:$("proto").value,ports:$("ports").value,username:$("username").value,
-  coreMixedPort:$("coreMixedPort").value,
-  password:$("password").value||null,timezone:$("timezone").value,language:$("language").value,
-  expectedIp:$("expectedIp").value,takeoverEnabled:$("takeoverEnabled").checked,
-  tunnelEnabled:$("tunnelEnabled").checked,tunnelPreset:$("tunnelPreset").value,tunnelServers:$("tunnelServers").value,
-  tunnelCipher:$("tunnelCipher").value,tunnelPassword:$("tunnelPassword").value||null,tunnelDirectFallback:$("tunnelDirectFallback").checked,
-  routingMode:document.querySelector("input[name=routingMode]:checked").value,localProxy:$("localProxy").value,
-  localProxyProto:$("localProxyProto").value,domesticDirect:$("domesticDirect").checked,
-  targets:$("targets").value,extraDomains:$("extraDomains").value,systemProxy:$("systemProxy").checked,
-  maxInflight:num("maxInflight"),connectTimeoutMs:num("connectTimeoutMs"),dialBudgetMs:num("dialBudgetMs")};
- $("save").disabled=true;
- try{const r=await fetch("/save?t="+T,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(form)});
-  const j=await r.json();
-  if(j.ok){$("password").value="";$("password").placeholder=form.username?"已保存，不改就留空":"没有就留空";
-   $("tunnelPassword").value="";V.tunnelPreset=form.tunnelPreset;V.tunnelPasswordStored=form.tunnelEnabled||V.tunnelPasswordStored;tunnelPwHint();
-   show("ok","已保存。回到托盘点「进入 Agent 模式」；已经在 Agent 模式里的，要退出再进入才生效。这个页面可以关掉了。")}
-  else{let other=[];for(const x of j.errors){const el=document.querySelector('.fe[data-for="'+x.path+'"]');
-    if(el)el.textContent=x.message;else other.push(x.path+"："+x.message)}
-   if(j.errors.some(x=>["maxInflight","connectTimeoutMs","dialBudgetMs"].includes(x.path)))document.querySelector("details").open=true;
-   $("other").textContent=other.join("；");show("bad","有几处需要改，见标红的说明。")}
- }catch(err){show("bad","保存失败："+err+"。托盘程序可能已经退出。")}
- finally{$("save").disabled=V.locked}
-});
-</script></body></html>
-"##;
+const PAGE: &str = include_str!("../../../ui/revisions/fluent-1/setup.html");
 
 #[cfg(test)]
 mod tests {
@@ -1775,6 +1637,146 @@ mod tests {
     }
 
     #[test]
+    fn slow_mutation_does_not_block_page_navigation_or_status_reads() {
+        struct Slow {
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl SetupBackend for Slow {
+            fn view(&self) -> SetupView {
+                view(&ProfileSet::default(), &input(None))
+            }
+            fn save(&self, _form: ExitForm) -> Result<(), Vec<FieldError>> {
+                unreachable!()
+            }
+            fn dashboard(&self) -> Option<crate::dashboard::View> {
+                Some(crate::dashboard::view(
+                    &ProfileSet::default(),
+                    "daily",
+                    true,
+                    false,
+                    None,
+                ))
+            }
+            fn path(&self, _path: String) -> Result<(), Vec<FieldError>> {
+                self.entered.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+                Ok(())
+            }
+        }
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = SetupServer::start(
+            0,
+            "tok".into(),
+            Arc::new(Slow {
+                entered: entered_tx,
+                release: std::sync::Mutex::new(release_rx),
+            }),
+        )
+        .unwrap();
+        let port = server.port();
+        let mutation = std::thread::spawn(move || {
+            let body = r#"{"path":"tunnel-2"}"#;
+            send(port, &format!("POST /path?t=tok HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\nContent-Length: {}\r\n\r\n{body}", body.len()))
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut reader = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_millis(700)))
+            .unwrap();
+        write!(
+            reader,
+            "GET /state?t=tok HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        let _ = reader.read_to_string(&mut response);
+        release_tx.send(()).unwrap();
+        assert!(mutation.join().unwrap().contains("\"ok\":true"));
+        assert!(
+            response.contains("200 OK") && response.contains("\"busy\":true"),
+            "read requests were blocked behind the mutation: {response}"
+        );
+    }
+
+    #[test]
+    fn agent_toggle_and_update_require_authentication_and_strict_arguments() {
+        struct Controls(std::sync::Mutex<(bool, Vec<bool>)>);
+        impl SetupBackend for Controls {
+            fn view(&self) -> SetupView {
+                view(&ProfileSet::default(), &input(None))
+            }
+            fn save(&self, _form: ExitForm) -> Result<(), Vec<FieldError>> {
+                unreachable!()
+            }
+            fn agent_info(&self) -> serde_json::Value {
+                serde_json::json!({"enabled":self.0.lock().unwrap().0})
+            }
+            fn agent_access(&self, enabled: bool) -> Result<(), Vec<FieldError>> {
+                self.0.lock().unwrap().0 = enabled;
+                Ok(())
+            }
+            fn update(&self, ui_only: bool) -> Result<(), Vec<FieldError>> {
+                self.0.lock().unwrap().1.push(ui_only);
+                Ok(())
+            }
+        }
+        let backend = Arc::new(Controls(std::sync::Mutex::new((false, Vec::new()))));
+        let server = SetupServer::start(0, "tok".into(), backend.clone()).unwrap();
+        let port = server.port();
+        let post = |path: &str, token: &str, origin: &str, body: &str| {
+            send(port,&format!("POST /{path}?t={token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: {origin}\r\nContent-Length: {}\r\n\r\n{body}",body.len()))
+        };
+        let origin = format!("http://127.0.0.1:{port}");
+        for enabled in [true, false, true, false] {
+            assert!(post(
+                "agent-access",
+                "tok",
+                &origin,
+                &format!("{{\"enabled\":{enabled}}}")
+            )
+            .contains("\"ok\":true"));
+            assert!(send(
+                port,
+                &format!("GET /agent-info?t=tok HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n")
+            )
+            .contains(&format!("\"enabled\":{enabled}")));
+        }
+        assert!(post("update", "bad", &origin, r#"{"uiOnly":false}"#).contains("403 Forbidden"));
+        assert!(post(
+            "update",
+            "tok",
+            "http://foreign.example",
+            r#"{"uiOnly":false}"#
+        )
+        .contains("403 Forbidden"));
+        assert!(post(
+            "update",
+            "tok",
+            &origin,
+            r#"{"uiOnly":false,"confirmCore":true}"#
+        )
+        .contains("\"ok\":false"));
+        assert!(send(
+            port,
+            &format!("GET /agent-info?t=bad HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n")
+        )
+        .contains("403 Forbidden"));
+        assert!(backend.0.lock().unwrap().1.is_empty());
+        for ui_only in [true, false] {
+            assert!(post(
+                "update",
+                "tok",
+                &origin,
+                &format!("{{\"uiOnly\":{ui_only}}}")
+            )
+            .contains("\"ok\":true"));
+        }
+        assert_eq!(backend.0.lock().unwrap().1, vec![true, false]);
+    }
+
+    #[test]
     fn startup_routes_dispatch_only_valid_authenticated_changes() {
         struct Entrances(std::sync::Mutex<(bool, usize)>);
         impl SetupBackend for Entrances {
@@ -1875,7 +1877,7 @@ mod tests {
                     .starts_with("HTTP/1.1 200")
             );
         }
-        for path in ["rules", "path", "startup", "shortcuts"] {
+        for path in ["rules", "route", "path", "startup", "shortcuts"] {
             let body = r#"{"path":"direct","password":"must-not-echo"}"#;
             let post = |token: &str, origin: &str| {
                 send(port,&format!("POST /{path}?t={token} HTTP/1.1\r\n{h}Origin: {origin}\r\nContent-Length: {}\r\n\r\n{body}",body.len()))

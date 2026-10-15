@@ -4,8 +4,9 @@ version = 4
 
 [[package]]
 name = "aec-control"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
+ "aec-core",
  "tao",
  "windows-sys 0.59.0",
  "wry",
@@ -13,7 +14,7 @@ dependencies = [
 
 [[package]]
 name = "aec-core"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -23,7 +24,7 @@ dependencies = [
 
 [[package]]
 name = "aec-dev"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "aec-core",
  "serde",
@@ -33,7 +34,7 @@ dependencies = [
 
 [[package]]
 name = "aec-tray"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "aec-core",
  "serde_json",

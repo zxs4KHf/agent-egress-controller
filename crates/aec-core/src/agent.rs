@@ -179,9 +179,11 @@ pub fn tools() -> Value {
         ("aec_options", "Read capabilities, dropdown options, HTTP contract and security guidance.", none.clone(), true),
         ("aec_configure", "Patch settings in Daily mode. User enters passwords in panel. Never disable protection or change expected IP without explicit user direction.", schema(settings_properties(), &[]), false),
         ("aec_rules", "Replace ordered rules and protected sites. Removing a site removes its protection; confirm the user's intended scope.", schema(json!({"sites":{"type":"array","items":{"type":"string"},"maxItems":128},"rules":{"type":"array","items":rule,"maxItems":512},"finalTarget":{"type":"string"}}), &["sites","rules","finalTarget"]), false),
+        ("aec_route", "Select a listed route group member. Non-fixed members REMOVE fixed protection only for the group's explicit domain-suffix rules; fixed members restore it. Requires user intent for that domain scope. Connections are interrupted; inspect returned protection/readiness.", schema(json!({"group":{"type":"string"},"member":{"type":"string"}}), &["group","member"]), false),
         ("aec_path", "Choose a path listed by aec_state; disconnect, verify the SAME configured ISP IP, then release. Failure stays blocked.", schema(json!({"path":{"type":"string"}}), &["path"]), false),
         ("aec_startup", "Enable or disable this installation's login startup.", schema(json!({"enabled":{"type":"boolean"}}), &["enabled"]), false),
         ("aec_shortcuts", "Create desktop and Start menu shortcuts for this installation.", none.clone(), false),
+        ("aec_update", "Launch the official Release updater. User must approve download and any core-service interruption in a local dialog. No argument can bypass confirmation. uiOnly never replaces networking binaries.", schema(json!({"uiOnly":{"type":"boolean"}}), &["uiOnly"]), false),
         ("aec_enter", "Enter Agent mode using existing takeover gates; returns final state, not a guarantee of readiness.", none.clone(), false),
         ("aec_exit", "Exit and restore snapshotted globals; connections may stop. Inspect returned state for recovery failures.", none.clone(), false),
         ("aec_recheck", "Run checks and return state; failure or unknown never becomes ready.", none, false),
@@ -221,6 +223,9 @@ pub fn call(backend: &dyn SetupBackend, request: Call) -> Result<Value, String> 
         "aec_rules" => backend
             .rules(serde_json::from_value(a).map_err(|_| invalid())?)
             .map_err(fields)?,
+        "aec_route" => backend
+            .route(serde_json::from_value(a).map_err(|_| invalid())?)
+            .map_err(fields)?,
         "aec_path" => backend
             .path(
                 obj.get("path")
@@ -237,6 +242,12 @@ pub fn call(backend: &dyn SetupBackend, request: Call) -> Result<Value, String> 
             )
             .map_err(fields)?,
         "aec_shortcuts" => backend.shortcuts().map_err(fields)?,
+        "aec_update" => {
+            backend
+                .update(obj["uiOnly"].as_bool().ok_or_else(invalid)?)
+                .map_err(fields)?;
+            return Ok(json!({"launched":true,"completed":false,"requiresUserConfirmation":true}));
+        }
         "aec_enter" | "aec_exit" | "aec_recheck" => backend
             .action(request.name.trim_start_matches("aec_"))
             .map_err(fields)?,
@@ -488,9 +499,12 @@ pub fn serve_mcp(
 }
 
 pub fn page(token: &str, info: &Value) -> String {
-    include_str!("agent.html")
-        .replace("__TOKEN__", token)
-        .replace("__INFO__", &info.to_string().replace("</", "<\\/"))
+    crate::ui::template(
+        "agent.html",
+        include_str!("../../../ui/revisions/fluent-1/agent.html"),
+    )
+    .replace("__TOKEN__", token)
+    .replace("__INFO__", &info.to_string().replace("</", "<\\/"))
 }
 
 pub fn config(data: &Path, exe: &Path) -> Value {
@@ -525,6 +539,52 @@ mod tests {
     }
 
     #[test]
+    fn update_tool_cannot_bypass_user_confirmation_or_claim_completion() {
+        struct Updater(std::sync::Mutex<Vec<bool>>);
+        impl SetupBackend for Updater {
+            fn view(&self) -> SetupView {
+                panic!("not used")
+            }
+            fn save(&self, _form: ExitForm) -> Result<(), Vec<crate::profile::FieldError>> {
+                panic!("not used")
+            }
+            fn update(&self, ui_only: bool) -> Result<(), Vec<crate::profile::FieldError>> {
+                self.0.lock().unwrap().push(ui_only);
+                Ok(())
+            }
+        }
+        let updater = Updater(std::sync::Mutex::new(Vec::new()));
+        for arguments in [
+            json!({}),
+            json!({"uiOnly":true,"confirmCore":true}),
+            json!({"uiOnly":"false"}),
+        ] {
+            assert!(call(
+                &updater,
+                Call {
+                    name: "aec_update".into(),
+                    arguments
+                }
+            )
+            .is_err());
+        }
+        assert!(updater.0.lock().unwrap().is_empty());
+        let result = call(
+            &updater,
+            Call {
+                name: "aec_update".into(),
+                arguments: json!({"uiOnly":true}),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            json!({"launched":true,"completed":false,"requiresUserConfirmation":true})
+        );
+        assert_eq!(*updater.0.lock().unwrap(), vec![true]);
+    }
+
+    #[test]
     fn schemas_are_strict_and_passwords_are_not_agent_fields() {
         let fake = Fake(Mutex::new(Vec::new()));
         for args in [
@@ -550,6 +610,46 @@ mod tests {
         let tools = tools();
         assert!(!tools.to_string().contains("password\""));
         assert!(fake.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn route_tool_uses_the_shared_backend_and_rejects_unlisted_arguments() {
+        struct Routes(Mutex<Vec<crate::route_switch::Form>>);
+        impl SetupBackend for Routes {
+            fn view(&self) -> SetupView {
+                Fake(Mutex::new(Vec::new())).view()
+            }
+            fn save(&self, _: ExitForm) -> Result<(), Vec<FieldError>> {
+                unreachable!()
+            }
+            fn route(&self, form: crate::route_switch::Form) -> Result<(), Vec<FieldError>> {
+                self.0.lock().unwrap().push(form);
+                Ok(())
+            }
+        }
+        let backend = Routes(Mutex::new(Vec::new()));
+        for extra in [
+            json!({"group":"GPT","member":"ordinary","force":true}),
+            json!({"group":"GPT","member":"ordinary","expectedIp":"198.51.100.2"}),
+        ] {
+            assert!(call(
+                &backend,
+                Call {
+                    name: "aec_route".into(),
+                    arguments: extra
+                }
+            )
+            .is_err());
+        }
+        call(
+            &backend,
+            Call {
+                name: "aec_route".into(),
+                arguments: json!({"group":"GPT","member":"ordinary"}),
+            },
+        )
+        .unwrap();
+        assert_eq!(backend.0.lock().unwrap().len(), 1);
     }
 
     #[test]

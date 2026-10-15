@@ -33,6 +33,8 @@ MCP 使用官方 2025-11-25 JSON-RPC 生命周期与 newline-delimited stdio tra
 | aec_configure | 在日常模式 patch 设置；密码只能在本机设置页输入 | 是 |
 | aec_rules | 替换受保护网站和有序分流规则 | 是 |
 | aec_path | 选路径，断开连接并核对相同的 ISP 出口后才放行 | 是 |
+| aec_route | 选择既有组成员；仅按用户明确意图解除或恢复该组域名的固定保护 | 是 |
+| aec_update | 打开界面/完整更新器，下载及核心停服需用户本机确认 | 是 |
 | aec_enter / aec_exit / aec_recheck | 进入、恢复或重新检查 | 是 |
 | aec_startup / aec_shortcuts | 管理登录自启和快捷方式 | 是 |
 
@@ -79,13 +81,20 @@ Content-Length: <UTF-8 body bytes>
 
 ## 本机命令行
 
+`aec_update` 的参数严格为 `{"uiOnly":true}`（只更新兼容界面资源）或 `{"uiOnly":false}`（检查完整更新）。返回 `launched:true, completed:false, requiresUserConfirmation:true` 只表示本机更新器已打开；下载需用户确认，核心替换还需独立停服确认。接口不提供 `force`、`confirmCore` 或绕过确认的参数。取消不能被报告为成功安装。更新后读取实际服务状态，不能将更新等同于就绪。
+
 发布包附带 aec-agent.exe：
 
 - aec-agent.exe config 输出当前可执行文件和数据目录的 MCP 配置，不包含 token。不同客户端可能要将 server object 嵌入不同位置。
 - aec-agent.exe call 从 stdin 读取一个 JSON {"name":...,"arguments":...} 请求，输出单个 JSON 响应。不要通过命令行参数或环境变量传 token、密码。
+- aec-agent.exe --data-dir <目录> diagnose 最长十秒，只读、不打开窗口、不发外网请求；无实时证据为 unknown，不推导就绪。它不要求开启 Agent API；未开启时只能返回有限的已保存状态。见 [诊断指南](DIAGNOSTICS.md)。
 - MCP host 启动 aec-agent.exe --data-dir <本安装数据目录> mcp，stdin/stdout 专用于 MCP JSON-RPC；错误仅写 stderr。
 
-## 官方协议参考
+## 快捷路由调用
+
+快捷切换调用 `{"name":"aec_route","arguments":{"group":"用户既有组名","member":"该组既有成员"}}`。先从 `aec_state.switches` 读取合法选择及 `fixed` 标记；不能臆造出站或替换期望 IP。非固定选择会解除组的显式后缀域名保护，必须已获得用户对此范围的明确指示；不同于仍保持同一 IP 的 `aec_path`。保存成功后再次读取 `aec_state`，超时先读状态而非重复写。规则指向单出站时须先由用户确认改成组引用，不能用组切换成功冒充所有规则已经改道。
+
+## 官方协议链接
 
 - [MCP lifecycle, 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle)
 - [MCP stdio transport, 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)

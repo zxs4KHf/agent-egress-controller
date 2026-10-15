@@ -170,7 +170,7 @@ mixed-port 可覆盖：设置页「本机代理入口端口」保存到 `setting
 
 `aec-dev profile import <yaml>` 只导入路由并迁移凭据，不采用源文件的 DNS、TUN 或监听端口。支持常规块列表规则注释；拒绝未知出站/组字段、provider、UDP 和不支持规则，避免静默改变语义。导入前保存原档案副本，凭据与档案保存失败会清理此次新增凭据。`profile verify` 只读比对出站字段、组及完整规则序列，不存凭据。
 
-托盘列出 `switchable: true` 的 select 组，调用本应用控制口 `PUT /proxies/<group>`。切换前撤销就绪，成功保存 `selected` 并重检，重启内核后恢复选择；现有连接不被强制断开。运行期选择改变后不能沿用旧报告声称就绪。
+托盘列出 `switchable: true` 的 select 组，与看板和 `aec_route` 共用串行切换操作。切换前撤销就绪，保存 `selected` 并重载内核、断开现有连接，重新检测；启动恢复选择。固定模式下非固定成员只解除直接指向该组的显式 DOMAIN-SUFFIX 范围的保护，固定成员恢复保护后验证才放行。其他域名、预期 ISP IP 与第一跳不变；前置规则覆盖或更大父域保护拒绝快捷更改。不猜测 Geo/IP/关键词或精确域名规则的保护范围。重新加入的站点默认 trace=false，独立 ISP 探测保持精确验证；至少保留一个检测站点，档案保持旧版可读。
 
 **DailyProfile**
 
@@ -365,7 +365,7 @@ UI 提供单项复制和「复制全部问题」。只写剪贴板，不调用�
 
 `egress.fixedExit` 和 `connectionPath` 兼容旧档案，默认不启用保护；启用要求精确预期 IP。路径为 direct、tunnel-auto 或 tunnel-N，第一跳 DIRECT 只直接连接 ISP 代理。固定模式无自动直连回退。内部 relay select 默认 REJECT，只有独立 probe 强制走 ISP 并核对精确 IP 后放行；probe 监听默认 17327，第一跳监听 17326。
 
-切换/重载前撤销就绪、阻断并关闭受保护 relay 连接，失败维持阻断。周期检测约 30 秒，未知或不匹配重新阻断；连接表无法读取时不能宣称成功阻断。已经阻断时，后续巡检取得精确匹配证据，才重选已保存的同一第一跳，重新探测精确出口并放行，再刷新完整检测报告。若当前第一跳已精确验证但硬门槛报告仍未通过，再次完整检测而不重选或关闭健康连接。重开或探测失败继续阻断；恢复不修改系统代理或保存的出口身份。完整检测耗时不计入下一次巡检间隔，未通过硬门槛仍显示未验证。保护仅涵盖经本应用路由的保护域名，并不保证整机或供应商两次巡检之间永不换 IP。固定模式的普通组切换菜单被禁用，使用看板第一跳切换。
+切换/重载前撤销就绪、阻断并关闭受保护 relay 连接，失败维持阻断。周期检测约 30 秒，未知或不匹配重新阻断；连接表无法读取时不能宣称成功阻断。已经阻断时，后续巡检取得精确匹配证据，才重选已保存的同一第一跳，重新探测精确出口并放行，再刷新完整检测报告。若当前第一跳已精确验证但硬门槛报告仍未通过，再次完整检测而不重选或关闭健康连接。重开或探测失败继续阻断；恢复不修改系统代理或保存的出口身份。完整检测耗时不计入下一次巡检间隔，未通过硬门槛仍显示未验证。保护仅涵盖经本应用路由的保护域名，并不保证整机或供应商两次巡检之间永不换 IP。0.5.1 恢复组快捷切换，明确标注固定/非固定；只有用户主动选择的域名范围可以解除保护，普通出口在固定验证失败时可独立工作。
 
 固定出口 tunnel 候选按配置顺序尝试，可选 `directFallback` 在其后增加连接同一 ISP 出口代理的候选；它不是另一个 ISP。所有候选仍必须通过独立 trace 精确匹配后才能放行。每次尝试受自身 step timeout 和总 dial budget 限制，耗尽时后续候选可能没有机会；配置需给多个候选留出预算。不会因固定出口验证失败而将受保护域名直接送往任意 `DIRECT` 路由规则。
 
@@ -407,8 +407,8 @@ legacy `tcp-relay.py` 的语义逐条编号，Rust 实现和测试按编号对�
 | S4 | 预算内最多 `maxRounds` 轮，剩余不足 0.15 秒就停，失败切到下一个候选 | `s4_fails_over_and_records_every_attempt`、`s4_stops_at_the_budget_and_after_the_rounds` |
 | S5 | 冷却只影响排序，不排除候选；全部在冷却时按最早到期排 | `s5_cooling_is_ordering_not_exclusion` |
 | S6 | 每一步的超时都压在剩余预算内 | `s6_a_silent_upstream_cannot_outlast_the_budget` |
-| S7 | HTTP 上游先匿名，失败后才带 Basic 凭据 | `s7_http_upstream_is_tried_anonymously_first` |
-| S8 | SOCKS5 上游先只报 0x00，失败后才只报 0x02 | `s8_socks5_upstream_offers_one_method_at_a_time` |
+| S7 | 配置凭据时 HTTP 上游优先带 Basic，失败后保留匿名白名单回退；无凭据只匿名 | `s7_http_upstream_uses_configured_credentials_first`、`http_credentials_survive_silent_anonymous_provider`、`credentialed_upstreams_retain_anonymous_allowlist_fallback` |
+| S8 | SOCKS5 每次只报一种方法；有凭据先 0x02，失败后 0x00；无凭据只 0x00 | `s8_socks5_upstream_offers_one_method_at_a_time`、`socks_credentials_survive_silent_anonymous_provider`、`credentialed_upstreams_retain_anonymous_allowlist_fallback` |
 | S9 | 全部失败如实回 0x01，不伪造响应 | `s9_s11_s12_all_candidates_failing_is_reported_truthfully` |
 | S10 | 双向转发，不继承握手超时；任一方向结束就关闭两边 | `s4_s10_fails_over_to_a_working_candidate_and_relays_bytes`、`s10_delayed_first_response_survives_upstream_handshake_timeout`、`s10_streaming_gap_survives_upstream_step_timeout`、`s10_client_idle_survives_inbound_handshake_timeout`、`s10_direct_dial_caller_can_wait_for_response_after_handshake`、`s10_tunnelled_transfer_survives_handshake_timeout` |
 | S11 | 失败日志带上候选、错误、耗时和握手阶段；同类消息 2 秒内合并计数，第一条一定写入 | `s9_s11_s12_…`、`s2_…` |
@@ -468,10 +468,19 @@ legacy `tcp-relay.py` 的语义逐条编号，Rust 实现和测试按编号对�
 
 ### 4.18 用户主动更新（0.5）
 
-- 用户从托盘菜单显式选择「检查并安装更新」；不在后台轮询、不静默下载。仅日常模式允许检查，安装前明确告知托盘退出和连接短暂中断。
+- 用户从托盘、看板或 Agent 限权更新工具显式启动更新器；不在后台轮询、不静默下载。稳定的日常/Agent 模式允许检查，操作中或恢复未完成时拒绝启动。
 - 更新器读取项目 GitHub 最新稳定 Release，下载完整便携 ZIP 与 SHA256 sidecar 并校验。0.5 不提供二进制差分包，因此网络下载量仍是完整发布包大小；更新目标是原位替换应用文件并保留配置。
 - 仅覆盖显式白名单文件。严禁覆盖 `data\` 和用户自带 GeoSite/GeoIP 数据；Credential Manager 凭据不在文件更新范围。旧文件先备份至 `.aec-update-backup\`，复制失败时恢复原文件；托盘通过正常关闭路径退出，不强杀进程。
 - 新包需具有预期结构、版本目录和托盘程序，ZIP 路径越界、未知文件、超限文件或 SHA 不匹配都拒绝安装。
+- 0.5.1 核验包内 SHA 清单，按文件哈希区分界面/文档和核心变更。程序、relay、内核、更新器变更在下载核验后另行显示停服确认；拒绝不能停止或写入。正常退出后必须核对日常状态、恢复日志为空且本应用内核/relay 已停止，失败即中止。
+- 兼容独立界面资源采用不可变修订版及原子活动指针，可在服务持续运行时切换并回滚。仅界面更新不得替换二进制；旧 0.5.0 必须完整升级一次。刷新只重载界面，丢弃草稿前提示，不自动刷新。后端接口/占位符契约改变需提升资源协议并完整升级。
+- 本机页面最大 32 个并发请求，慢修改不能阻塞导航；网络修改仍由串行 Worker 执行。Agent 访问标志即时原子更新，关闭拒绝新请求，已接受请求可继续完成。Agent 更新工具只启动固定更新器，不能绕过物理确认或声称已经安装。
+- 控制中心受保护站点可折叠、搜索、限高滚动；规则支持出站类型、匹配类型、搜索和分页，保存包含所有页并保持全局顺序。来源、服务器列表、检测目标折叠，主要操作与 Agent 接入优先。原生托盘/窗口/EXE 与页面共用盾牌路径图标。
+- 资源协议为 2；页面固定引用自身修订版 CSS/JS/图标，旧资源保留供已打开页面使用。停止核心失败仍提供恢复入口，不复制文件或强杀；程序文件回滚不覆盖用户档案。
+
+### 4.19 无窗口诊断
+
+`aec-agent diagnose` 最长等待十秒，超时返回 unknown。只读当前档案、保存状态与已启用的本机状态接口；不创建目录、不开窗口、不变更代理/时区、不访问外网或调用窗口自动化。输出仅允许名单字段，不含地址、路径、密码、令牌或原始错误。保存状态不能代替实时证据，实时状态也不等于各网站已可用；networkReadiness 一律 unknown。CLI 退出时结束诊断进程，不残留正在等待的后台诊断服务。
 
 ## 6. 不在范围内
 

@@ -74,7 +74,7 @@ pub fn shell_open(target: &str) {
     };
 }
 
-/// A filled, anti-aliased circle in `rgb` with a white ring, as a 32x32 icon with alpha.
+/// The shield/routes product mark in the current mode colour, with premultiplied alpha.
 pub fn dot_icon(rgb: (u8, u8, u8)) -> HICON {
     const N: i32 = 32;
     unsafe {
@@ -104,21 +104,13 @@ pub fn dot_icon(rgb: (u8, u8, u8)) -> HICON {
         let color = CreateDIBSection(hdc, &bi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
         ReleaseDC(null_mut(), hdc);
         let px = std::slice::from_raw_parts_mut(bits as *mut u32, (N * N) as usize);
-        let c = (N as f32 - 1.0) / 2.0;
-        let (outer, inner) = (14.5f32, 11.5f32);
-        for y in 0..N {
-            for x in 0..N {
-                let d = ((x as f32 - c).powi(2) + (y as f32 - c).powi(2)).sqrt();
-                let a = (outer + 0.5 - d).clamp(0.0, 1.0);
-                // Inside the ring: the state colour; the ring itself: white, for dark taskbars.
-                let t = (inner + 0.5 - d).clamp(0.0, 1.0);
-                let mix = |col: u8| (col as f32 * t + 255.0 * (1.0 - t)) as u32;
-                let (r, g, b) = (mix(rgb.0), mix(rgb.1), mix(rgb.2));
-                // Premultiplied BGRA.
-                let pm = |v: u32| (v as f32 * a) as u32;
-                px[(y * N + x) as usize] =
-                    ((a * 255.0) as u32) << 24 | pm(r) << 16 | pm(g) << 8 | pm(b);
-            }
+        for (pixel, rgba) in px
+            .iter_mut()
+            .zip(aec_core::brand::rgba(N as usize, rgb).as_chunks::<4>().0)
+        {
+            let alpha = u32::from(rgba[3]);
+            let pm = |c: u8| u32::from(c) * alpha / 255;
+            *pixel = alpha << 24 | pm(rgba[0]) << 16 | pm(rgba[1]) << 8 | pm(rgba[2]);
         }
         let mask = CreateBitmap(N, N, 1, 1, null());
         let info = ICONINFO {

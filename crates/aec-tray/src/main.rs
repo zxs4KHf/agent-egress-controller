@@ -12,6 +12,8 @@ mod app;
 mod startup;
 mod text;
 #[cfg(windows)]
+mod update;
+#[cfg(windows)]
 mod win;
 
 #[cfg(not(windows))]
@@ -82,6 +84,7 @@ mod tray {
     const ID_SHORTCUTS: usize = 12;
     const ID_PROXY_HELP: usize = 13;
     const ID_UPDATE: usize = 14;
+    const ID_UPDATE_UI: usize = 15;
     const ID_ENTRY_BASE: usize = 100;
     const ID_SWITCH_BASE: usize = 10000;
     const TIMER_REFRESH: usize = 1;
@@ -329,12 +332,19 @@ mod tray {
                         for (i, (_, label)) in s.entries.iter().enumerate() {
                             add(on(idle), ID_ENTRY_BASE + i, label);
                         }
-                        for (i, (group, member, selected)) in s.switches.iter().enumerate() {
+                        for (i, (group, member, selected, fixed)) in s.switches.iter().enumerate() {
                             let flags = on(idle) | if *selected { MF_CHECKED } else { 0 };
                             add(
                                 flags,
                                 ID_SWITCH_BASE + i,
-                                &format!("路由：{group} → {member}"),
+                                &format!(
+                                    "路由：{group} → {member}（{}）",
+                                    if *fixed {
+                                        "固定 ISP"
+                                    } else {
+                                        "非固定出口"
+                                    }
+                                ),
                             );
                         }
                         AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
@@ -355,11 +365,8 @@ mod tray {
                 add(MF_STRING, ID_SETTINGS, "设置出口和分流…");
                 add(MF_STRING, ID_DASHBOARD, "打开看板（连接路径与规则）");
                 add(MF_STRING, ID_PROXY_HELP, "代理冲突说明");
-                add(
-                    on(idle && s.mode == Mode::Daily),
-                    ID_UPDATE,
-                    "检查并安装更新…",
-                );
+                add(on(idle), ID_UPDATE, "检查并安装更新…");
+                add(on(idle), ID_UPDATE_UI, "仅更新界面（不停服务）…");
                 add(
                     MF_STRING
                         | if crate::startup::enabled() {
@@ -401,33 +408,14 @@ mod tray {
                 ID_SETTINGS => return self.open_page(false),
                 ID_DASHBOARD => return self.open_page(true),
                 ID_PROXY_HELP => return self.open_proxy_help(),
-                ID_UPDATE if s.mode == Mode::Daily && s.busy.is_none() => {
-                    let install_dir = std::env::current_exe()
-                        .ok()
-                        .and_then(|path| path.parent().map(std::path::Path::to_path_buf));
-                    let Some(script) = install_dir.map(|dir| dir.join("aec-update.ps1")) else {
-                        return Effect::Warn("无法定位便携程序目录".into());
-                    };
-                    if !script.is_file() {
-                        return Effect::Warn("更新器文件不存在，请重新下载完整便携包".into());
-                    }
-                    let result = std::process::Command::new("powershell.exe")
-                        .args([
-                            "-NoProfile",
-                            "-WindowStyle",
-                            "Hidden",
-                            "-ExecutionPolicy",
-                            "Bypass",
-                            "-File",
-                        ])
-                        .arg(script)
-                        .arg("-CurrentPid")
-                        .arg(std::process::id().to_string())
-                        .arg("-CurrentVersion")
-                        .arg(env!("CARGO_PKG_VERSION"))
-                        .spawn();
-                    if let Err(e) = result {
-                        return Effect::Warn(format!("启动更新检查失败：{e}"));
+                ID_UPDATE | ID_UPDATE_UI => {
+                    if let Err(error) = crate::update::launch(
+                        id == ID_UPDATE_UI,
+                        s.mode,
+                        s.busy.is_some(),
+                        &self.layout.data_dir,
+                    ) {
+                        return Effect::Warn(error);
                     }
                 }
                 ID_STARTUP => {
@@ -441,7 +429,7 @@ mod tray {
                 ID_DATA => return Effect::Open(self.layout.data_dir.to_string_lossy().into()),
                 ID_QUIT => self.quit(),
                 n if n >= ID_SWITCH_BASE => {
-                    if let Some((group, member, _)) = s.switches.get(n - ID_SWITCH_BASE) {
+                    if let Some((group, member, _, _)) = s.switches.get(n - ID_SWITCH_BASE) {
                         self.send(Cmd::Switch {
                             group: group.clone(),
                             member: member.clone(),

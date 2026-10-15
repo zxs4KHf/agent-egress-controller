@@ -362,7 +362,8 @@ fn base64(input: &[u8]) -> String {
     out
 }
 
-/// S7: anonymous CONNECT first (an IP allow-list may admit us); credentials only on a retry.
+/// S7: configured credentials first; retry anonymously for IP-allowlisted providers.
+/// Silent anonymous rejection must not consume the credentialed attempt's dial budget.
 fn connect_http(
     up: &Upstream,
     host: &str,
@@ -371,9 +372,9 @@ fn connect_http(
     deadline: Instant,
 ) -> io::Result<TcpStream> {
     let mut last = None;
-    for with_auth in [false, true] {
+    for with_auth in [true, false] {
         if with_auth && up.user.is_none() {
-            break;
+            continue;
         }
         let attempt = (|| {
             let mut s = connect_tcp(up, timeout, deadline)?;
@@ -427,8 +428,8 @@ fn connect_http(
     Err(last.expect("at least one attempt"))
 }
 
-/// S8: offer only "no authentication" first; offer only username/password on the retry. Offering
-/// both at once made the real upstream pick the credential path and refuse it (legacy finding).
+/// S8: offer one method at a time. Prefer configured credentials and retain anonymous fallback;
+/// offering both together prevents a retry when a provider picks an unusable method.
 fn connect_socks5(
     up: &Upstream,
     host: &str,
@@ -437,9 +438,9 @@ fn connect_socks5(
     deadline: Instant,
 ) -> io::Result<TcpStream> {
     let mut last = None;
-    for (method, with_auth) in [(0x00u8, false), (0x02u8, true)] {
+    for (method, with_auth) in [(0x02u8, true), (0x00u8, false)] {
         if with_auth && up.user.is_none() {
-            break;
+            continue;
         }
         let attempt = (|| {
             let mut s = connect_tcp(up, timeout, deadline)?;

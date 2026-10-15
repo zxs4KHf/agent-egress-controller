@@ -13,6 +13,7 @@ pub struct RulesForm {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct View {
+    pub switches: Vec<RouteChoice>,
     pub autostart: bool,
     pub mode: String,
     pub busy: bool,
@@ -24,6 +25,15 @@ pub struct View {
     pub form: RulesForm,
     pub suggested: Vec<String>,
     pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteChoice {
+    pub group: String,
+    pub member: String,
+    pub selected: bool,
+    pub fixed: bool,
 }
 
 pub fn view(
@@ -48,6 +58,20 @@ pub fn view(
     targets.extend(p.routing.groups.iter().map(|g| g.name.clone()));
     targets.extend(p.routing.outbounds.iter().map(|o| o.name.clone()));
     View {
+        switches: p
+            .routing
+            .groups
+            .iter()
+            .filter(|g| g.switchable)
+            .flat_map(|g| {
+                g.members.iter().map(|m| RouteChoice {
+                    group: g.name.clone(),
+                    member: m.clone(),
+                    selected: g.selected.as_ref().or(g.members.first()) == Some(m),
+                    fixed: crate::route_switch::fixed_member(&p.routing, m),
+                })
+            })
+            .collect(),
         autostart: false,
         mode: mode.into(),
         busy,
@@ -115,14 +139,17 @@ pub fn apply(set: &mut ProfileSet, form: RulesForm) -> Result<(), Vec<FieldError
 }
 
 pub fn page(token: &str, view: &View) -> String {
-    include_str!("dashboard.html")
-        .replace("__TOKEN__", token)
-        .replace(
-            "__VIEW__",
-            &serde_json::to_string(view)
-                .expect("serializes")
-                .replace("</", "<\\/"),
-        )
+    crate::ui::template(
+        "dashboard.html",
+        include_str!("../../../ui/revisions/fluent-1/dashboard.html"),
+    )
+    .replace("__TOKEN__", token)
+    .replace(
+        "__VIEW__",
+        &serde_json::to_string(view)
+            .expect("serializes")
+            .replace("</", "<\\/"),
+    )
 }
 
 #[cfg(test)]

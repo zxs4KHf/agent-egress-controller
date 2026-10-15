@@ -11,6 +11,7 @@ name = "aec-control"
 path = "src/main.rs"
 
 [target.'cfg(windows)'.dependencies]
+aec-core = { path = "../aec-core" }
 tao = "0.30"
 wry = "0.47"
 windows-sys.workspace = true

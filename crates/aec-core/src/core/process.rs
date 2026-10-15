@@ -443,10 +443,13 @@ fn relay_connection_ids(report: &str) -> Result<Vec<String>, CoreError> {
         )
     };
     let parsed: serde_json::Value = serde_json::from_str(report).map_err(|_| invalid())?;
-    let list = parsed
-        .get("connections")
-        .and_then(|c| c.as_array())
-        .ok_or_else(invalid)?;
+    // The pinned mihomo serializes its empty Go slice as null on a fresh idle core.
+    // Require the field to exist: a missing or malformed report is still unavailable evidence.
+    let list = match parsed.get("connections") {
+        Some(serde_json::Value::Null) => return Ok(Vec::new()),
+        Some(serde_json::Value::Array(list)) => list,
+        _ => return Err(invalid()),
+    };
     let mut ids = Vec::new();
     for connection in list {
         let chains = connection
@@ -1061,6 +1064,49 @@ mod tests {
     }
 
     #[test]
+    fn idle_mihomo_connection_report_has_no_connections_to_close() {
+        assert!(relay_connection_ids(
+            r#"{"downloadTotal":0,"uploadTotal":0,"connections":null,"memory":0}"#
+        )
+        .unwrap()
+        .is_empty());
+        for invalid in [r#"{}"#, r#"{"connections":false}"#, r#"{"connections":{}}"#] {
+            assert!(relay_connection_ids(invalid).is_err());
+        }
+    }
+
+    #[test]
+    #[ignore = "needs runtime/bin/aec-mihomo.exe; isolated local core ports"]
+    fn fresh_idle_core_allows_fixed_exit_connection_cleanup() {
+        let (mut m, root) = temp_manager("idle-cleanup");
+        m.ports = CorePorts {
+            mixed: 33893,
+            controller: 33909,
+            dns: 33553,
+            relay: 33325,
+            tunnel: 33326,
+        };
+        let result = std::panic::catch_unwind(|| {
+            m.up(&WindowsHost, |p, s| {
+                Ok(config::direct_test(p, s, "agent-egress"))
+            })
+            .unwrap();
+            let report = m.connections(&WindowsHost).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&report).unwrap();
+            assert!(
+                parsed["connections"].is_null(),
+                "fresh core report: {report}"
+            );
+            m.close_relay_connections(&WindowsHost).unwrap();
+        });
+        let _ = m.down(&WindowsHost);
+        let _ = fs::remove_dir_all(root);
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
+
+    #[test]
     fn only_relay_connections_are_named_for_closing() {
         let report = r#"{"connections":[
             {"id":"a1","chains":["aec-relay-transport","relay"]},
@@ -1289,7 +1335,23 @@ mod tests {
                 response.push(b[0]);
             }
             assert!(String::from_utf8(response).unwrap().contains("200"));
-            let (_peer, _) = destination.accept().unwrap();
+            // mihomo CONNECT is lazy: send a byte to trigger the upstream connection.
+            client.write_all(b"x").unwrap();
+            destination.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let (_peer, _) = loop {
+                match destination.accept() {
+                    Ok(peer) => break peer,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "local CONNECT did not dial destination within 5 seconds"
+                        );
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(error) => panic!("local destination accept failed: {error}"),
+                }
+            };
             let records =
                 crate::desktop::parse_connections(&m.connections(&WindowsHost).unwrap()).unwrap();
             let local = client.local_addr().unwrap();

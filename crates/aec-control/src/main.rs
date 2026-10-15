@@ -76,6 +76,9 @@ fn main() {
 
     let event_loop = EventLoop::new();
     let window = match WindowBuilder::new()
+        .with_window_icon(
+            tao::window::Icon::from_rgba(aec_core::brand::rgba(64, (15, 118, 110)), 64, 64).ok(),
+        )
         .with_title("Agent Egress Controller")
         .with_inner_size(LogicalSize::new(1100.0, 780.0))
         .with_min_inner_size(LogicalSize::new(860.0, 600.0))

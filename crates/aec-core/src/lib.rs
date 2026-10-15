@@ -15,6 +15,7 @@ pub mod credentials;
 pub mod crypto;
 pub mod dashboard;
 pub mod desktop;
+pub mod diagnostics;
 pub mod entries;
 pub mod fixed;
 pub mod http;
@@ -29,13 +30,16 @@ pub mod profile;
 pub mod prompts;
 pub mod providers;
 pub mod relay;
+pub mod route_switch;
 pub mod setup;
 pub mod snapshot;
 pub mod status;
 pub mod store;
 pub mod testing;
 pub mod tunnel;
+pub mod ui;
 pub mod writers;
 
+pub mod brand;
 #[cfg(windows)]
 pub mod windows;

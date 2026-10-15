@@ -203,6 +203,68 @@ fn fixed_gate_blocks_reload_and_closes_existing_connections() {
             .select(&WindowsHost, "relay", aec_core::fixed::TRANSPORT)
             .unwrap();
         assert!(request(manager.ports.mixed).contains("relay-chain-ok"));
+        // A user-authorized group switch removes only its own protection. Verify the actual
+        // rendered configuration and core selection, including switching back while blocked.
+        let mut set = ProfileSet::default();
+        set.agent[0] = p.clone();
+        set.agent[0].targets.push(aec_core::profile::Target {
+            domain: "other-protected.test".into(),
+            trace: false,
+        });
+        set.agent[0].routing.outbounds.push(serde_json::from_value(serde_json::json!({"name":"ordinary","kind":"socks5","server":"127.0.0.1","port":socks5_upstream()})).unwrap());
+        set.agent[0].routing.groups.push(serde_json::from_value(serde_json::json!({"name":"Service","type":"select","members":["relay","ordinary"],"switchable":true})).unwrap());
+        set.agent[0].routing.rules.push(
+            serde_json::from_value(
+                serde_json::json!({"kind":"domain_suffix","value":HOST,"target":"Service"}),
+            )
+            .unwrap(),
+        );
+        let ordinary = aec_core::route_switch::plan(
+            &set,
+            &aec_core::route_switch::Form {
+                group: "Service".into(),
+                member: "ordinary".into(),
+            },
+        )
+        .unwrap();
+        manager
+            .reload(
+                &WindowsHost,
+                &ordinary.profiles.agent[0],
+                &config::NoCredentials,
+            )
+            .unwrap();
+        assert!(
+            request(manager.ports.mixed).contains("relay-chain-ok"),
+            "ordinary route must work while fixed relay is blocked"
+        );
+        assert!(ordinary.profiles.agent[0]
+            .targets
+            .iter()
+            .any(|t| t.domain == "other-protected.test"));
+        let fixed = aec_core::route_switch::plan(
+            &ordinary.profiles,
+            &aec_core::route_switch::Form {
+                group: "Service".into(),
+                member: "relay".into(),
+            },
+        )
+        .unwrap();
+        manager
+            .reload(
+                &WindowsHost,
+                &fixed.profiles.agent[0],
+                &config::NoCredentials,
+            )
+            .unwrap();
+        assert!(
+            !request(manager.ports.mixed).contains("relay-chain-ok"),
+            "return to ISP stays blocked until verified"
+        );
+        manager
+            .select(&WindowsHost, "relay", aec_core::fixed::TRANSPORT)
+            .unwrap();
+        assert!(request(manager.ports.mixed).contains("relay-chain-ok"));
     });
     let cleanup = manager.down(&WindowsHost);
     if cleanup.is_ok() {
