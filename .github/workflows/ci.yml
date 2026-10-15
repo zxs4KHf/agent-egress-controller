@@ -86,14 +86,22 @@ jobs:
       - name: Build portable package and installer
         shell: powershell
         run: ./packaging/build-portable.ps1
+      - name: Test published updater compatibility with real release package
+        shell: powershell
+        run: |
+          git fetch --no-tags origin d946400a93022c0dd53468c53398900c2ab25ca0 9011805fc234938628aebe37b757c2f979acfcf7
+          if ($LASTEXITCODE) { throw 'Cannot fetch pinned historical updater sources' }
+          ./packaging/test-release-upgrade.ps1
       - name: Upload release candidates
         uses: actions/upload-artifact@v4
         with:
-          name: AgentEgressController-0.5.1-windows
+          name: AgentEgressController-0.5.2-windows
           path: |
-            dist/AgentEgressController-0.5.1-portable.zip
-            dist/AgentEgressController-0.5.1-setup.exe
-            dist/SHA256SUMS-0.5.1.txt
-            dist/SHA256SETUP-0.5.1.txt
+            dist/AgentEgressController-0.5.2-portable.zip
+            dist/AgentEgressController-0.5.2-setup.exe
+            dist/SHA256SUMS-0.5.2.txt
+            dist/SHA256SETUP-0.5.2.txt
+            dist/aec-update-0.5.2.ps1
+            dist/SHA256UPDATER-0.5.2.txt
           if-no-files-found: error
           retention-days: 14

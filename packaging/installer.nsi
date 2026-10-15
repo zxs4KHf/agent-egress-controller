@@ -3,10 +3,10 @@ Unicode true
 !include "LogicLib.nsh"
 
 !ifndef PackageDir
-  !define PackageDir "dist\AgentEgressController-0.5.1-portable"
+  !define PackageDir "dist\AgentEgressController-0.5.2-portable"
 !endif
 !ifndef ProductVersion
-  !define ProductVersion "0.5.1"
+  !define ProductVersion "0.5.2"
 !endif
 !ifndef InstallerOut
   !define InstallerOut "dist\AgentEgressController-${ProductVersion}-setup.exe"

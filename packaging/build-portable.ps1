@@ -89,7 +89,7 @@ try {
         New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
         Copy-Item -LiteralPath (Join-Path $repo $file) -Destination $destination
     }
-    foreach ($file in @("USER-GUIDE.md", "AGENT-INTEGRATION.md", "DIAGNOSTICS.md", "RELEASE-0.5.1.md", "RELEASE-0.5.0.md", "RELEASE-0.4.0.md", "RELEASE-0.2.0.md")) {
+    foreach ($file in @("USER-GUIDE.md", "UPDATING.md", "AGENT-INTEGRATION.md", "DIAGNOSTICS.md", "RELEASE-0.5.2.md", "RELEASE-0.5.1.md", "RELEASE-0.5.0.md", "RELEASE-0.4.0.md", "RELEASE-0.2.0.md")) {
         Copy-Item -LiteralPath (Join-Path $repo "docs/$file") -Destination (Join-Path $output "docs/$file")
     }
     # Keep the script ASCII so Windows PowerShell 5.1 also reads it correctly without a BOM.
@@ -138,6 +138,14 @@ try {
     $zipHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
     $zipSums = Join-Path $dist "SHA256SUMS-$version.txt"
     "$zipHash  $name.zip" | Set-Content -LiteralPath $zipSums -Encoding utf8
+    # v0.5.0 rejects newer UI/icon paths before it can replace its own updater.
+    # Publish the identical updater separately for a one-time, user-led bootstrap.
+    $updaterName = "aec-update-$version.ps1"
+    $updaterAsset = Join-Path $dist $updaterName
+    if (Test-Path -LiteralPath $updaterAsset) { throw 'Updater release asset already exists' }
+    Copy-Item -LiteralPath (Join-Path $output 'aec-update.ps1') -Destination $updaterAsset
+    $updaterHash = (Get-FileHash -LiteralPath $updaterAsset -Algorithm SHA256).Hash.ToLowerInvariant()
+    "$updaterHash  $updaterName" | Set-Content -LiteralPath (Join-Path $dist "SHA256UPDATER-$version.txt") -Encoding utf8
     $makensis = Get-Command makensis.exe -ErrorAction SilentlyContinue
     if (-not $makensis) {
         $defaultMakensis = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'NSIS\makensis.exe'
