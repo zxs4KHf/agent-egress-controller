@@ -2,10 +2,10 @@ Unicode true
 !include "MUI2.nsh"
 
 !ifndef PackageDir
-  !define PackageDir "dist\AgentEgressController-0.5.0-portable"
+  !define PackageDir "dist\AgentEgressController-0.5.1-portable"
 !endif
 !ifndef ProductVersion
-  !define ProductVersion "0.5.0"
+  !define ProductVersion "0.5.1"
 !endif
 !ifndef InstallerOut
   !define InstallerOut "dist\AgentEgressController-${ProductVersion}-setup.exe"
@@ -23,6 +23,10 @@ Function .onInit
 FunctionEnd
 
 !define MUI_ABORTWARNING
+!if /FileExists "${PackageDir}\app.ico"
+  !define MUI_ICON "${PackageDir}\app.ico"
+  !define MUI_UNICON "${PackageDir}\app.ico"
+!endif
 !define MUI_WELCOMEPAGE_TITLE "Agent Egress Controller 安装向导"
 !define MUI_WELCOMEPAGE_TEXT "本程序安装在当前 Windows 用户目录，不需要管理员权限。安装后仍由 Agent Egress 托盘和看板管理出口、规则与本机 Agent 接口。设置与凭据会保留在当前用户数据目录和 Windows 凭据管理器。$\r$\n$\r$\n更新只替换程序文件；卸载不会删除用户数据或凭据。"
 !define MUI_FINISHPAGE_RUN "$INSTDIR\aec-tray.exe"

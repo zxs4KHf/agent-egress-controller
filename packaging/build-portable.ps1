@@ -60,8 +60,24 @@ try {
     foreach ($exe in @("aec-tray.exe", "aec-dev.exe", "aec-relay.exe", "aec-agent.exe", "aec-control.exe")) {
         Copy-Item -LiteralPath (Join-Path $repo "target/release/$exe") -Destination (Join-Path $output $exe)
     }
+    $brandIcon = Get-ChildItem -Path (Join-Path $repo 'target/release/build/aec-tray-*/out/app.ico') -File | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+    if (-not $brandIcon) { throw 'Compiled product icon missing' }
+    Copy-Item -LiteralPath $brandIcon.FullName -Destination (Join-Path $output 'app.ico')
     Copy-Item -LiteralPath $core -Destination (Join-Path $output "bin/aec-mihomo.exe")
     Copy-Item -LiteralPath (Join-Path $repo "packaging/portable/aec-update.ps1") -Destination (Join-Path $output "aec-update.ps1")
+    # Immutable presentation revisions let an updater atomically switch only the active pointer.
+    $uiManifest = Get-Content -LiteralPath (Join-Path $repo 'ui/active.json') -Raw | ConvertFrom-Json
+    if ($uiManifest.schemaVersion -ne 2 -or $uiManifest.revision -notmatch '^[a-zA-Z0-9-]{1,80}$') { throw 'Invalid UI manifest' }
+    $uiSource = Join-Path $repo ('ui/revisions/' + $uiManifest.revision)
+    $uiFiles = @('setup.html','help.html','control.html','dashboard.html','agent.html','theme.css','app.js','icon.svg')
+    $fingerprint = ($uiFiles | ForEach-Object { $_ + ':' + (Get-FileHash -LiteralPath (Join-Path $uiSource $_) -Algorithm SHA256).Hash }) -join "`n"
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { $digest = ([BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($fingerprint)))).Replace('-','').ToLowerInvariant() } finally { $hasher.Dispose() }
+    $revision = 'r-' + $digest
+    $uiDestination = Join-Path $output ('ui/revisions/' + $revision)
+    New-Item -ItemType Directory -Path $uiDestination -Force | Out-Null
+    foreach ($file in $uiFiles) { Copy-Item -LiteralPath (Join-Path $uiSource $file) -Destination (Join-Path $uiDestination $file) }
+    [IO.File]::WriteAllText((Join-Path $output 'ui/active.json'), ('{"schemaVersion":2,"revision":"' + $revision + '"}'))
     foreach ($file in @("README.md", "LICENSE", "THIRD-PARTY-NOTICES.md", "CHANGELOG.md", "CONTEXT.md", "CONTRIBUTING.md", "AGENTS.md", "SECURITY.md")) {
         Copy-Item -LiteralPath (Join-Path $repo $file) -Destination (Join-Path $output $file)
     }
@@ -73,7 +89,7 @@ try {
         New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
         Copy-Item -LiteralPath (Join-Path $repo $file) -Destination $destination
     }
-    foreach ($file in @("USER-GUIDE.md", "AGENT-INTEGRATION.md", "RELEASE-0.5.0.md", "RELEASE-0.4.0.md", "RELEASE-0.2.0.md")) {
+    foreach ($file in @("USER-GUIDE.md", "AGENT-INTEGRATION.md", "DIAGNOSTICS.md", "RELEASE-0.5.1.md", "RELEASE-0.5.0.md", "RELEASE-0.4.0.md", "RELEASE-0.2.0.md")) {
         Copy-Item -LiteralPath (Join-Path $repo "docs/$file") -Destination (Join-Path $output "docs/$file")
     }
     # Keep the script ASCII so Windows PowerShell 5.1 also reads it correctly without a BOM.

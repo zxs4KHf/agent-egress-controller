@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>代理共存与固定出口</title>
+<link rel="stylesheet" href="/ui/theme.css?t=__TOKEN__"><script src="/ui/app.js?t=__TOKEN__"></script></head><body><main>
+<div class="eyebrow">PROXY COEXISTENCE</div><h1>代理共存与固定出口</h1><div class="breadcrumbs"><a href="/dashboard?t=__TOKEN__" data-nav="dashboard" data-icon="back">返回看板</a><a href="/setup?t=__TOKEN__" data-nav="setup" data-icon="settings">出口与分流设置</a></div>
+<p class="muted">系统级分流需要有一个明确的系统代理所有者。这里解释冲突提示的原因、推荐配置和目前未支持的替代方式。</p>
+<div class="callout warning"><b>如果出现系统代理冲突</b><p>AEC 会保留外部改动并撤销就绪。经过其他代理的系统流量可能绕过固定出口，请按下面步骤处理，并以看板当前检测结果为准。</p></div>
+<section><h2>推荐：AEC 接管系统代理，另一客户端只提供上游</h2>
+<ol><li>打开 Clash、mihomo 或其他代理客户端设置，关闭「系统代理 / Set as system proxy」。</li>
+<li>同时关闭该客户端的 VPN、TUN、透明代理或全局接管模式。只保留本地内核运行。</li>
+<li>在客户端内照常选择或切换节点。切换节点不需要重新打开「系统代理」。</li>
+<li>在 AEC 设置的「分流 → 本机代理」填写该客户端的本地监听地址和端口（例如 <code>127.0.0.1:7890</code>），作为普通流量上游。受保护 AI 域名继续按 AEC 固定 ISP 规则走。</li>
+<li>保持 AEC 的「接管 Windows 系统代理」开启。回到托盘，退出 Agent 模式，再重新进入；确认 G6 通过。</li></ol>
+<p>原因：Windows 的系统代理只有一个全局值。AEC 接管时会把它指向 AEC 自己的入口；若另一客户端开启同名开关，它会把该值改成自己的端口，系统请求便绕过 AEC 的分流。两个程序反复写回只会互相覆盖，因此 AEC 保留外部改动并要求用户处理，不会静默抢回。</p>
+<p>VPN/TUN/透明代理可能接管整个网络接口，连 AEC 到 ISP 代理的连接也可能被再次转发，导致出口 IP 改变或验证失败。它们无法作为“只切普通流量节点”的开关使用。</p>
+</section>
+<details class="panel"><summary>高级替代：由其他客户端持有系统代理</summary>
+<p>理论上可由兼容的 Clash/Mihomo 配置把受保护域名规则转发到 AEC 本地入口，再由 AEC 连接固定 ISP；普通域名仍由该客户端按节点处理。这样用户可以继续打开它的系统代理开关。</p>
+<p>这需要客户端规则、端口和 AEC 路由三者精确配合，避免循环代理；还要处理客户端配置覆盖、规则优先级和节点变化。当前 AEC 不生成或维护这类外部客户端配置，桌面连接归属检测也不能把经 Clash 转发的流量当作 Claude 直连 AEC 的证据。因此它目前是未支持的集成方向，不应仅按通用配置片段启用或据此宣称固定出口已验证。</p>
+</details>
+<p><a href="/setup?t=__TOKEN__" data-nav="setup">返回出口与分流设置</a></p>
+</main></body></html>

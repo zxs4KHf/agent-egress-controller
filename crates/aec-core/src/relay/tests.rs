@@ -737,7 +737,7 @@ fn a_working_tunnel_behind_a_dead_one_is_still_tried() {
 }
 
 #[test]
-fn s7_http_upstream_is_tried_anonymously_first() {
+fn s7_http_upstream_uses_configured_credentials_first() {
     let echo = echo_server();
     let (tx, rx) = mpsc::channel();
     let http = http_upstream(tx);
@@ -747,15 +747,190 @@ fn s7_http_upstream_is_tried_anonymously_first() {
     assert_eq!(code, 0);
     assert_eq!(roundtrip(&mut s), b"ping through the relay");
     let first = rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    let second = rx.recv_timeout(Duration::from_secs(2)).unwrap();
     assert!(
-        !first.contains("Proxy-Authorization"),
-        "first attempt is anonymous: {first}"
+        first.contains("Proxy-Authorization: Basic "),
+        "configured credentials must be used without an anonymous timeout"
     );
+}
+
+// An authenticated provider can silently discard anonymous handshakes instead of returning
+// 407/0xff. Waiting for that silence must not spend the only usable authentication budget.
+fn assert_authenticated_provider_survives_silent_anonymous(proto: UpstreamProto) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let candidate = with_auth(up(listener.local_addr().unwrap().port(), proto));
+    listener.set_nonblocking(true).unwrap();
+    let worker = std::thread::spawn(move || {
+        let until = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < until {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            stream.set_nonblocking(false)?;
+            stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+            let authenticated = match proto {
+                UpstreamProto::Http => {
+                    let mut head = Vec::new();
+                    while !head.ends_with(b"\r\n\r\n") {
+                        let mut byte = [0];
+                        stream.read_exact(&mut byte)?;
+                        head.push(byte[0]);
+                    }
+                    String::from_utf8_lossy(&head).contains("Proxy-Authorization: Basic ")
+                }
+                UpstreamProto::Socks5 => {
+                    let mut greeting = [0; 3];
+                    stream.read_exact(&mut greeting)?;
+                    if greeting == [5, 1, 2] {
+                        stream.write_all(&[5, 2])?;
+                        let mut auth = [0; 2];
+                        stream.read_exact(&mut auth)?;
+                        let mut user = vec![0; usize::from(auth[1])];
+                        stream.read_exact(&mut user)?;
+                        let mut size = [0];
+                        stream.read_exact(&mut size)?;
+                        let mut pass = vec![0; usize::from(size[0])];
+                        stream.read_exact(&mut pass)?;
+                        assert_eq!(user, b"user1");
+                        assert_eq!(pass, b"s3cret-pass");
+                        stream.write_all(&[1, 0])?;
+                        let mut request = [0; 5];
+                        stream.read_exact(&mut request)?;
+                        let mut target = vec![0; usize::from(request[4]) + 2];
+                        stream.read_exact(&mut target)?;
+                        true
+                    } else {
+                        assert_eq!(greeting, [5, 1, 0]);
+                        false
+                    }
+                }
+            };
+            if !authenticated {
+                std::thread::sleep(Duration::from_millis(700));
+                continue;
+            }
+            match proto {
+                UpstreamProto::Http => {
+                    stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")?
+                }
+                UpstreamProto::Socks5 => stream.write_all(&REPLY_OK)?,
+            }
+            let mut request = [0; 4];
+            stream.read_exact(&mut request)?;
+            assert_eq!(&request, b"ping");
+            stream.write_all(b"pong")?;
+            return Ok(());
+        }
+        Ok(())
+    });
+    let result = dial_upstream(
+        &candidate,
+        "example.org",
+        443,
+        Duration::from_millis(800),
+        Instant::now() + Duration::from_millis(500),
+    );
+    let success = match result {
+        Ok(mut stream) => {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            stream.write_all(b"ping").unwrap();
+            let mut response = [0; 4];
+            stream.read_exact(&mut response).unwrap();
+            response == *b"pong"
+        }
+        Err(_) => false,
+    };
+    worker.join().unwrap().unwrap();
     assert!(
-        second.contains("Proxy-Authorization: Basic "),
-        "credentials only on the retry: {second}"
+        success,
+        "silent anonymous handshake spent the credentialed connection's budget"
     );
+}
+
+#[test]
+fn http_credentials_survive_silent_anonymous_provider() {
+    assert_authenticated_provider_survives_silent_anonymous(UpstreamProto::Http);
+}
+
+#[test]
+fn socks_credentials_survive_silent_anonymous_provider() {
+    assert_authenticated_provider_survives_silent_anonymous(UpstreamProto::Socks5);
+}
+
+#[test]
+fn credentialed_upstreams_retain_anonymous_allowlist_fallback() {
+    for proto in [UpstreamProto::Http, UpstreamProto::Socks5] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let candidate = with_auth(up(listener.local_addr().unwrap().port(), proto));
+        let worker = std::thread::spawn(move || -> io::Result<()> {
+            for authenticated in [true, false] {
+                let (mut stream, _) = listener.accept()?;
+                stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                match proto {
+                    UpstreamProto::Http => {
+                        let mut head = Vec::new();
+                        while !head.ends_with(b"\r\n\r\n") {
+                            let mut byte = [0];
+                            stream.read_exact(&mut byte)?;
+                            head.push(byte[0]);
+                        }
+                        assert_eq!(
+                            String::from_utf8_lossy(&head).contains("Proxy-Authorization:"),
+                            authenticated
+                        );
+                        if authenticated {
+                            stream
+                                .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")?;
+                            continue;
+                        }
+                        stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")?;
+                    }
+                    UpstreamProto::Socks5 => {
+                        let mut greeting = [0; 3];
+                        stream.read_exact(&mut greeting)?;
+                        assert_eq!(greeting, [5, 1, if authenticated { 2 } else { 0 }]);
+                        if authenticated {
+                            stream.write_all(&[5, 0xff])?;
+                            continue;
+                        }
+                        stream.write_all(&[5, 0])?;
+                        let mut request = [0; 5];
+                        stream.read_exact(&mut request)?;
+                        let mut target = vec![0; usize::from(request[4]) + 2];
+                        stream.read_exact(&mut target)?;
+                        stream.write_all(&REPLY_OK)?;
+                    }
+                }
+                let mut request = [0; 4];
+                stream.read_exact(&mut request)?;
+                assert_eq!(&request, b"ping");
+                stream.write_all(b"pong")?;
+            }
+            Ok(())
+        });
+        let mut stream = dial_upstream(
+            &candidate,
+            "example.org",
+            443,
+            Duration::from_millis(500),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream.write_all(b"ping").unwrap();
+        let mut response = [0; 4];
+        stream.read_exact(&mut response).unwrap();
+        assert_eq!(&response, b"pong");
+        worker.join().unwrap().unwrap();
+    }
 }
 
 #[test]
@@ -770,13 +945,8 @@ fn s8_socks5_upstream_offers_one_method_at_a_time() {
     assert_eq!(roundtrip(&mut s), b"ping through the relay");
     assert_eq!(
         rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-        vec![0x00],
-        "first only 'no authentication'"
-    );
-    assert_eq!(
-        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
         vec![0x02],
-        "then only username/password"
+        "first only username/password; never offer both methods together"
     );
 }
 

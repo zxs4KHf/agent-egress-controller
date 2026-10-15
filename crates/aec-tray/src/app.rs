@@ -147,7 +147,6 @@ impl Layout {
 
 pub enum Cmd {
     Configure(serde_json::Value, Sender<Result<(), Vec<FieldError>>>),
-    AgentAccess(bool, Sender<Result<(), Vec<FieldError>>>),
     AgentAction(String, Sender<Result<(), Vec<FieldError>>>),
     Startup(bool, Sender<Result<(), Vec<FieldError>>>),
     Shortcuts(Sender<Result<(), Vec<FieldError>>>),
@@ -157,6 +156,10 @@ pub enum Cmd {
         Sender<Result<(), Vec<FieldError>>>,
     ),
     Path(String, Sender<Result<(), Vec<FieldError>>>),
+    Route(
+        aec_core::route_switch::Form,
+        Sender<Result<(), Vec<FieldError>>>,
+    ),
     Enter,
     Open(String),
     Switch {
@@ -194,7 +197,7 @@ pub struct Shared {
     /// (entry id, menu label)
     pub entries: Vec<(String, String)>,
     /// (group, member, selected); menu IDs are allocated from a separate range.
-    pub switches: Vec<(String, String, bool)>,
+    pub switches: Vec<(String, String, bool, bool)>,
     pub has_report: bool,
     pub note: Option<Note>,
     pub summary: Option<String>,
@@ -293,6 +296,7 @@ impl Worker {
                             g.name.clone(),
                             member.clone(),
                             g.selected.as_ref().or_else(|| g.members.first()) == Some(member),
+                            aec_core::route_switch::fixed_member(&p.routing, member),
                         )
                     })
                 })
@@ -323,14 +327,13 @@ impl Worker {
                 continue;
             }
             let label = match &cmd {
-                Cmd::AgentAccess(..) => "正在保存 Agent 接入…",
                 Cmd::AgentAction(..) => "正在执行 Agent 操作…",
                 Cmd::Startup(..) | Cmd::Shortcuts(..) => "正在保存启动入口…",
                 Cmd::Save(..) | Cmd::Rules(..) | Cmd::Configure(..) => "正在保存设置…",
                 Cmd::Path(..) => "正在核对固定出口…",
                 Cmd::Enter => "正在进入 Agent 模式…",
                 Cmd::Open(_) => "正在打开并检测…",
-                Cmd::Switch { .. } => "正在切换路由并重新检测…",
+                Cmd::Switch { .. } | Cmd::Route(..) => "正在切换路由并重新检测…",
                 Cmd::Recheck => "正在重新检测…",
                 Cmd::Exit | Cmd::Restore(_) | Cmd::Shutdown(_) => "正在退出并恢复…",
                 Cmd::Ack => "正在处理…",
@@ -376,6 +379,10 @@ impl Worker {
     fn handle(&mut self, cmd: Cmd) -> bool {
         let data_dir = self.layout.data_dir.clone();
         match cmd {
+            Cmd::Route(form, done) => {
+                let result = self.change_route(form).map_err(field_error);
+                let _ = done.send(result);
+            }
             Cmd::Configure(patch, done) => {
                 // Merge in the serial worker, after earlier panel/API saves have completed.
                 let form = aec_core::agent::patch_settings(
@@ -383,18 +390,6 @@ impl Worker {
                     patch,
                 );
                 let result = form.and_then(|form| self.save_settings(form));
-                let _ = done.send(result);
-            }
-            Cmd::AgentAccess(enabled, done) => {
-                let result = std::fs::write(
-                    data_dir.join(aec_core::agent::ACCESS),
-                    if enabled {
-                        b"true".as_slice()
-                    } else {
-                        b"false".as_slice()
-                    },
-                )
-                .map_err(|_| field_error("Agent 接入选项保存失败".into()));
                 let _ = done.send(result);
             }
             Cmd::AgentAction(action, done) => {
@@ -626,63 +621,76 @@ impl Worker {
     }
 
     fn switch_route(&mut self, group: &str, member: &str) {
-        if agent_profile(&self.layout.data_dir).egress.fixed_exit {
-            self.note(
-                "请使用看板管理规则",
-                "固定出口模式的变更需要阻断、断开旧连接和重新核对出口。",
-                true,
-            );
-            return;
+        if let Err(e) = self.change_route(aec_core::route_switch::Form {
+            group: group.into(),
+            member: member.into(),
+        }) {
+            self.note("路由切换未完成", &e, true);
         }
-        let result = (|| -> Result<(), String> {
-            let store = ProfileStore::new(&self.layout.data_dir);
-            let mut set = store.load().map_err(|e| e.to_string())?;
-            let g = set.agent[0]
-                .routing
-                .groups
-                .iter_mut()
-                .find(|g| g.name == group && g.switchable)
-                .ok_or("路由组不可切换")?;
-            if !g.members.iter().any(|m| m == member) {
-                return Err("所选出站不属于这个组".into());
-            }
-            let previous = g
-                .selected
-                .clone()
-                .or_else(|| g.members.first().cloned())
-                .ok_or("路由组为空")?;
-            g.selected = Some(member.into());
+    }
+
+    fn change_route(&mut self, form: aec_core::route_switch::Form) -> Result<(), String> {
+        if !self.active() && self.controller.state().mode != Mode::Daily {
+            return Err("当前正在恢复或切换模式，请完成后重试".into());
+        }
+        let store = ProfileStore::new(&self.layout.data_dir);
+        let previous = store.load().map_err(|e| e.to_string())?;
+        let plan = aec_core::route_switch::plan(&previous, &form)?;
+        let p = &plan.profiles.agent[0];
+        if self.active() {
             self.controller
                 .invalidate_routing_checks()
                 .map_err(|e| e.to_string())?;
-            let core = &self.controller.platform().core;
-            core.select(&aec_core::windows::WindowsHost, group, member)
-                .map_err(|e| e.to_string())?;
-            if let Err(e) = store.save(&set) {
-                let rollback = core.select(&aec_core::windows::WindowsHost, group, &previous);
+            if p.egress.fixed_exit {
+                self.block()?;
+            }
+        }
+        store.save(&plan.profiles).map_err(|e| e.to_string())?;
+        if self.active() {
+            if let Err(e) = self.controller.platform().core.reload(
+                &aec_core::windows::WindowsHost,
+                p,
+                &WindowsCredentials,
+            ) {
+                let restored = store.save(&previous).is_ok();
                 return Err(format!(
-                    "选择保存失败：{e}；回退{}",
-                    if rollback.is_ok() {
-                        "成功"
-                    } else {
-                        "失败，请退出 Agent 模式"
-                    }
+                    "规则重载失败：{e}；旧档案回存{}，请重新检测或恢复会话",
+                    if restored { "成功" } else { "失败" }
                 ));
             }
-            self.controller
-                .recheck(&set.agent[0])
-                .map_err(|e| e.to_string())?;
-            Ok(())
-        })();
-        self.write_report();
-        match result {
-            Ok(()) => self.note(
-                "路由已切换",
-                "新连接使用所选出站；已重新检测，请查看检测结果。现有连接保留原路由。",
-                false,
-            ),
-            Err(e) => self.note("路由切换未完成", &e, true),
+            if p.egress.fixed_exit {
+                if let Err(e) = self.open_fixed(p) {
+                    self.note(
+                        "路由已保存，固定 ISP 尚未验证",
+                        "普通出口规则已生效；受保护站点继续阻断，等待同一 ISP 验证。",
+                        true,
+                    );
+                    if plan.fixed {
+                        return Err(e);
+                    }
+                    return Ok(());
+                }
+            } else {
+                self.controller.recheck(p).map_err(|e| e.to_string())?;
+            }
         }
+        self.write_report();
+        self.note(
+            "路由已切换",
+            &format!(
+                "{} → {}；涉及 {} 个域名。{}",
+                form.group,
+                form.member,
+                plan.domains.len(),
+                if plan.fixed {
+                    "固定 ISP 保护已启用；是否就绪请查看检测结果。"
+                } else {
+                    "这些域名使用所选出口，其公网 IP 可随上游节点改变。"
+                }
+            ),
+            false,
+        );
+        Ok(())
     }
 
     fn exit(&mut self) {
@@ -917,6 +925,19 @@ impl Backend {
 }
 
 impl SetupBackend for Backend {
+    fn route(&self, form: aec_core::route_switch::Form) -> Result<(), Vec<FieldError>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(Cmd::Route(form, tx))
+            .map_err(|_| field_error("托盘服务已退出".into()))?;
+        rx.recv()
+            .map_err(|_| field_error("托盘服务已退出".into()))?
+    }
+    fn update(&self, ui_only: bool) -> Result<(), Vec<FieldError>> {
+        let state = self.shared.lock().expect("lock").clone();
+        crate::update::launch(ui_only, state.mode, state.busy.is_some(), &self.data_dir)
+            .map_err(field_error)
+    }
     fn configure(&self, patch: serde_json::Value) -> Result<(), Vec<FieldError>> {
         let (tx, rx) = std::sync::mpsc::channel();
         self.tx
@@ -937,12 +958,14 @@ impl SetupBackend for Backend {
             .map_err(|_| field_error("托盘服务已退出".into()))?
     }
     fn agent_access(&self, enabled: bool) -> Result<(), Vec<FieldError>> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.tx
-            .send(Cmd::AgentAccess(enabled, tx))
-            .map_err(|_| field_error("托盘服务已退出".into()))?;
-        rx.recv()
-            .map_err(|_| field_error("托盘服务已退出".into()))?
+        // Revoking access must not wait behind a minutes-long network check. This flag cannot
+        // change routing or global state. Serialize its atomic writes using the shared state lock.
+        let _guard = self.shared.lock().expect("lock");
+        aec_core::store::write_atomic(
+            &self.data_dir.join(aec_core::agent::ACCESS),
+            if enabled { b"true" } else { b"false" },
+        )
+        .map_err(|_| field_error("Agent 接入选项保存失败".into()))
     }
     fn agent_info(&self) -> serde_json::Value {
         let exe = std::env::current_exe()

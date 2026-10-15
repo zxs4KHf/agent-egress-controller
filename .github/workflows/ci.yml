@@ -10,7 +10,7 @@ permissions:
 jobs:
   test:
     # The product is Windows-only (tray, Credential Manager, time zone, process control).
-    # Tests that need a real mihomo binary are #[ignore]d and run locally before a release.
+    # Real-core tests run after the pinned executable has been verified below.
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -28,6 +28,20 @@ jobs:
       - name: Test portable updater safety and rollback
         shell: powershell
         run: ./packaging/portable/aec-update.ps1 -SelfTest
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test desktop presentation in installed Edge
+        shell: powershell
+        run: |
+          cargo build -p aec-core --example ui_preview --locked
+          if ($LASTEXITCODE) { throw 'UI preview build failed' }
+          $deps = Join-Path $env:RUNNER_TEMP 'aec-ui-dependencies'
+          npm install --prefix $deps --no-audit --no-fund playwright@1.58.2
+          if ($LASTEXITCODE) { throw 'Playwright install failed' }
+          $env:AEC_NODE_MODULES = Join-Path $deps 'node_modules'
+          node packaging/test-ui.cjs
+          if ($LASTEXITCODE) { throw 'UI interaction tests failed' }
       - name: Install NSIS for installer smoke test
         run: choco install nsis --yes --no-progress
       - name: Test interactive installer compilation
@@ -51,17 +65,19 @@ jobs:
           if ((Get-FileHash $exe -Algorithm SHA256).Hash.ToLowerInvariant() -ne $exeHash) { throw 'mihomo executable SHA256 mismatch' }
           New-Item -ItemType Directory -Path runtime/bin -Force | Out-Null
           Copy-Item -LiteralPath $exe -Destination runtime/bin/aec-mihomo.exe
+      - name: Test pinned core and loopback relay chain
+        run: cargo test -- --include-ignored
       - name: Build portable package and installer
         shell: powershell
         run: ./packaging/build-portable.ps1
       - name: Upload release candidates
         uses: actions/upload-artifact@v4
         with:
-          name: AgentEgressController-0.5.0-windows
+          name: AgentEgressController-0.5.1-windows
           path: |
-            dist/AgentEgressController-0.5.0-portable.zip
-            dist/AgentEgressController-0.5.0-setup.exe
-            dist/SHA256SUMS-0.5.0.txt
-            dist/SHA256SETUP-0.5.0.txt
+            dist/AgentEgressController-0.5.1-portable.zip
+            dist/AgentEgressController-0.5.1-setup.exe
+            dist/SHA256SUMS-0.5.1.txt
+            dist/SHA256SETUP-0.5.1.txt
           if-no-files-found: error
           retention-days: 14

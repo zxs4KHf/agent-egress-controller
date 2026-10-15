@@ -92,6 +92,26 @@ fn fixed_gate_blocks_reload_and_closes_existing_connections() {
         .canonicalize()
         .unwrap();
     let data = std::env::temp_dir().join(format!("aec-fixed-chain-{}", std::process::id()));
+    std::fs::create_dir_all(&data).unwrap();
+    // Windows runners use an 8.3 alias in TEMP. Exercise that spelling locally too,
+    // when available: canonicalizing only the reload filename must not break -d safety.
+    let data = {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetShortPathNameW(input: *const u16, output: *mut u16, length: u32) -> u32;
+        }
+        let input: Vec<u16> = data.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut output = vec![0u16; 32768];
+        let length =
+            unsafe { GetShortPathNameW(input.as_ptr(), output.as_mut_ptr(), output.len() as u32) }
+                as usize;
+        if length > 0 && length < output.len() {
+            PathBuf::from(std::ffi::OsString::from_wide(&output[..length]))
+        } else {
+            data
+        }
+    };
     let mut manager = CoreManager::dev(&root, &data);
     manager.relay_bin = PathBuf::from(env!("CARGO_BIN_EXE_aec-relay"));
     manager.ports = CorePorts {
@@ -198,6 +218,68 @@ fn fixed_gate_blocks_reload_and_closes_existing_connections() {
         assert!(
             request(32327).contains("relay-chain-ok"),
             "probe must still work after reload"
+        );
+        manager
+            .select(&WindowsHost, "relay", aec_core::fixed::TRANSPORT)
+            .unwrap();
+        assert!(request(manager.ports.mixed).contains("relay-chain-ok"));
+        // A user-authorized group switch removes only its own protection. Verify the actual
+        // rendered configuration and core selection, including switching back while blocked.
+        let mut set = ProfileSet::default();
+        set.agent[0] = p.clone();
+        set.agent[0].targets.push(aec_core::profile::Target {
+            domain: "other-protected.test".into(),
+            trace: false,
+        });
+        set.agent[0].routing.outbounds.push(serde_json::from_value(serde_json::json!({"name":"ordinary","kind":"socks5","server":"127.0.0.1","port":socks5_upstream()})).unwrap());
+        set.agent[0].routing.groups.push(serde_json::from_value(serde_json::json!({"name":"Service","type":"select","members":["relay","ordinary"],"switchable":true})).unwrap());
+        set.agent[0].routing.rules.push(
+            serde_json::from_value(
+                serde_json::json!({"kind":"domain_suffix","value":HOST,"target":"Service"}),
+            )
+            .unwrap(),
+        );
+        let ordinary = aec_core::route_switch::plan(
+            &set,
+            &aec_core::route_switch::Form {
+                group: "Service".into(),
+                member: "ordinary".into(),
+            },
+        )
+        .unwrap();
+        manager
+            .reload(
+                &WindowsHost,
+                &ordinary.profiles.agent[0],
+                &config::NoCredentials,
+            )
+            .unwrap();
+        assert!(
+            request(manager.ports.mixed).contains("relay-chain-ok"),
+            "ordinary route must work while fixed relay is blocked"
+        );
+        assert!(ordinary.profiles.agent[0]
+            .targets
+            .iter()
+            .any(|t| t.domain == "other-protected.test"));
+        let fixed = aec_core::route_switch::plan(
+            &ordinary.profiles,
+            &aec_core::route_switch::Form {
+                group: "Service".into(),
+                member: "relay".into(),
+            },
+        )
+        .unwrap();
+        manager
+            .reload(
+                &WindowsHost,
+                &fixed.profiles.agent[0],
+                &config::NoCredentials,
+            )
+            .unwrap();
+        assert!(
+            !request(manager.ports.mixed).contains("relay-chain-ok"),
+            "return to ISP stays blocked until verified"
         );
         manager
             .select(&WindowsHost, "relay", aec_core::fixed::TRANSPORT)
