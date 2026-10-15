@@ -28,6 +28,12 @@ jobs:
       - name: Test portable updater safety and rollback
         shell: powershell
         run: ./packaging/portable/aec-update.ps1 -SelfTest
+      - name: Test actual Windows taskbar identity
+        shell: powershell
+        run: |
+          cargo build -p aec-control --locked
+          if ($LASTEXITCODE) { throw 'Control center build failed' }
+          ./packaging/test-shell-identity.ps1 -ControlExe ./target/debug/aec-control.exe
       - uses: actions/setup-node@v4
         with:
           node-version: '22'

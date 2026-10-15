@@ -19,6 +19,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "windows",
  "windows-sys 0.59.0",
 ]
 

@@ -1,5 +1,6 @@
 Unicode true
 !include "MUI2.nsh"
+!include "LogicLib.nsh"
 
 !ifndef PackageDir
   !define PackageDir "dist\AgentEgressController-0.5.1-portable"
@@ -64,14 +65,18 @@ SectionEnd
 
 Section "开始菜单入口" SEC_STARTMENU
   CreateDirectory "$SMPROGRAMS\Agent Egress"
-  CreateShortcut "$SMPROGRAMS\Agent Egress\Agent Egress Controller.lnk" "$INSTDIR\aec-tray.exe"
-  CreateShortcut "$SMPROGRAMS\Agent Egress\Agent Egress Dashboard.lnk" "$INSTDIR\aec-tray.exe" "--dashboard"
+  ExecWait '"$INSTDIR\aec-control.exe" --create-shortcuts start-menu' $0
+  ${If} $0 != 0
+    MessageBox MB_OK|MB_ICONWARNING "创建开始菜单入口失败：同名快捷方式可能属于另一份安装。请从安装目录启动托盘并检查入口。"
+  ${EndIf}
   CreateShortcut "$SMPROGRAMS\Agent Egress\卸载 Agent Egress.lnk" "$INSTDIR\uninstall.exe"
 SectionEnd
 
 Section "桌面快捷方式" SEC_DESKTOP
-  CreateShortcut "$DESKTOP\Agent Egress Controller.lnk" "$INSTDIR\aec-tray.exe"
-  CreateShortcut "$DESKTOP\Agent Egress Dashboard.lnk" "$INSTDIR\aec-tray.exe" "--dashboard"
+  ExecWait '"$INSTDIR\aec-control.exe" --create-shortcuts desktop' $0
+  ${If} $0 != 0
+    MessageBox MB_OK|MB_ICONWARNING "创建桌面入口失败：同名快捷方式可能属于另一份安装。请从安装目录启动托盘并检查入口。"
+  ${EndIf}
 SectionEnd
 
 Section /o "登录时自动启动" SEC_AUTOSTART

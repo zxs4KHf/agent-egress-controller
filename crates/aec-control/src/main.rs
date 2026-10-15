@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), windows_subsystem = "windows")]
+
 fn valid_app_url(url: &str) -> bool {
     if url.len() > 1024 || !url.starts_with("http://127.0.0.1:") {
         return false;
@@ -26,6 +28,7 @@ fn main() {
     use tao::dpi::LogicalSize;
     use tao::event::{Event, WindowEvent};
     use tao::event_loop::{ControlFlow, EventLoop};
+    use tao::platform::windows::WindowExtWindows;
     use tao::window::WindowBuilder;
     use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
     use windows_sys::Win32::System::Threading::CreateMutexW;
@@ -36,6 +39,26 @@ fn main() {
     use wry::{WebContext, WebViewBuilder};
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Maintenance entry point changes only owned shortcuts, never starts the network worker.
+    if args.first().is_some_and(|arg| arg == "--create-shortcuts") {
+        use aec_core::shell_identity::{create_shortcuts, ShortcutScope};
+        let scope = match args.get(1).map(String::as_str) {
+            None | Some("all") => ShortcutScope::All,
+            Some("desktop") => ShortcutScope::Desktop,
+            Some("start-menu") => ShortcutScope::StartMenu,
+            _ => std::process::exit(2),
+        };
+        if args.len() > 2 {
+            std::process::exit(2);
+        }
+        let result = std::env::current_exe()
+            .map_err(|e| e.to_string())
+            .and_then(|exe| create_shortcuts(&exe.with_file_name("aec-tray.exe"), scope));
+        if result.is_err() {
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.first().is_some_and(|arg| arg == "--quit") {
         let title = wide("Agent Egress Controller");
         let hwnd = unsafe { FindWindowW(null(), title.as_ptr()) };
@@ -45,6 +68,10 @@ fn main() {
         return;
     }
     let url = args.first().cloned().unwrap_or_default();
+    if let Err(error) = aec_core::shell_identity::initialize_control_process() {
+        show_error(&error);
+        return;
+    }
     if !valid_app_url(&url) {
         show_error("入口地址无效。请从 Agent Egress 托盘打开看板。");
         return;
@@ -76,6 +103,7 @@ fn main() {
 
     let event_loop = EventLoop::new();
     let window = match WindowBuilder::new()
+        .with_visible(false)
         .with_window_icon(
             tao::window::Icon::from_rgba(aec_core::brand::rgba(64, (15, 118, 110)), 64, 64).ok(),
         )
@@ -90,6 +118,13 @@ fn main() {
             return;
         }
     };
+    let identity = std::env::current_exe()
+        .map_err(|e| e.to_string())
+        .and_then(|exe| aec_core::shell_identity::configure_control_window(window.hwnd(), &exe));
+    if let Err(error) = identity {
+        show_error(&error);
+        return;
+    }
     let webview_data = std::env::var_os("LOCALAPPDATA")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
@@ -117,6 +152,8 @@ fn main() {
         }
     };
 
+    // Do not expose a half-initialized window (or accept close before WebView2 is ready).
+    window.set_visible(true);
     event_loop.run(move |event, _, control_flow| {
         let _keep_webview_alive = &webview;
         *control_flow = ControlFlow::Wait;
