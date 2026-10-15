@@ -57,8 +57,11 @@ try {
         if ([Diagnostics.Process]::GetProcessesByName('aec-control').Count) { throw 'Close no user windows: a control center already exists; use -ExistingWindow to inspect it.' }
         # Only the presentation process. No tray/core, credentials, system proxy or time-zone writes.
         $page = New-Object AecShellPage
+        Write-Output 'Shell test: isolated loopback fixture listening.'
         $owned = Start-Process -FilePath $ControlExe -ArgumentList ('http://127.0.0.1:'+$page.Port+'/app?t=shell-test') -PassThru -WindowStyle Hidden
+        Write-Output ('Shell test: presentation process started, PID '+$owned.Id+'.')
         if (-not $page.Loaded.WaitOne(30000)) { throw 'The isolated loopback test page did not load.' }
+        Write-Output 'Shell test: loopback page requested.'
     }
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
     do {
@@ -72,6 +75,7 @@ try {
     $window = $matches[0]
     if ($owned -and $window.Id -ne $owned.Id) { throw 'The observed window is not the test-owned process.' }
     $appId = [AecWindowProperties]::Read($window.MainWindowHandle,5)
+    Write-Output 'Shell test: reading native application window properties.'
     if ($appId -ne 'AgentEgress.Controller') { throw 'Taskbar identity regression: window has no independent AgentEgress.Controller ID.' }
     $launch = [AecWindowProperties]::Read($window.MainWindowHandle,2)
     $expected = '"' + (Join-Path (Split-Path $ControlExe) 'aec-tray.exe') + '" --dashboard'

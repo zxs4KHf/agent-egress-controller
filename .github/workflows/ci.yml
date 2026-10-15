@@ -34,6 +34,13 @@ jobs:
           cargo build -p aec-control --locked
           if ($LASTEXITCODE) { throw 'Control center build failed' }
           ./packaging/test-shell-identity.ps1 -ControlExe ./target/debug/aec-control.exe
+      - name: Diagnose native shell test failure
+        if: failure()
+        shell: powershell
+        run: |
+          Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=(Get-Date).AddMinutes(-5); Id=1000,1026} -ErrorAction SilentlyContinue |
+            Where-Object { $_.Message -match 'powershell|aec-control' } |
+            Select-Object TimeCreated, Id, Message | Format-List
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
