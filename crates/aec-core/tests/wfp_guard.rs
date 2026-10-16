@@ -87,6 +87,19 @@ fn wfp_persistent_rules_block_bypass_and_ipv6_even_after_engine_exit() {
         probe(allowed.local_addr().unwrap()),
         "The selected IPv4 proxy remains reachable"
     );
+    if probe(other.local_addr().unwrap()) {
+        let apps = [fixture.to_string_lossy().into_owned()];
+        engine.test_matching(port, &apps, false, false).unwrap();
+        let app_only_blocks = !probe(other.local_addr().unwrap());
+        eprintln!("[DEBUG-wfp-0616] app_only_blocks={app_only_blocks}");
+        engine.test_matching(port, &apps, false, true).unwrap();
+        let high_priority_blocks = !probe(other.local_addr().unwrap());
+        eprintln!("[DEBUG-wfp-0616] app_only_high_priority_blocks={high_priority_blocks}");
+        engine.test_matching(port, &apps, true, false).unwrap();
+        let user_high_priority_blocks = !probe(other.local_addr().unwrap());
+        eprintln!("[DEBUG-wfp-0616] app_and_user_high_priority_blocks={user_high_priority_blocks}");
+        panic!("Original user-scoped bypass policy failed; diagnostic probes do not constitute a passing test");
+    }
     assert!(
         !probe(other.local_addr().unwrap()),
         "Another loopback proxy must be blocked"

@@ -1,0 +1,25 @@
+name: isolated-guard-diagnostics
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - crates/aec-core/src/guard_windows.rs
+      - crates/aec-core/tests/wfp_guard.rs
+      - .github/workflows/guard-diagnostics.yml
+permissions:
+  contents: read
+jobs:
+  native-guard:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Probe only a disposable executable
+        shell: powershell
+        run: |
+          cargo build -p aec-core --example guard_probe --locked
+          if ($LASTEXITCODE) { throw 'Probe build failed' }
+          cargo test -p aec-core --test wfp_guard -- --include-ignored --nocapture
+          if ($LASTEXITCODE) { throw 'Application blocking not verified; not releasable' }
