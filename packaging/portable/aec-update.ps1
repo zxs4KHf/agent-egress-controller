@@ -5,7 +5,8 @@
     [switch]$UiOnly,
     [switch]$ResumeAgent,
     [switch]$OpenDashboard,
-    [switch]$SelfTest
+    [switch]$SelfTest,
+    [switch]$IndependentLaunch
 )
 
 $ErrorActionPreference = "Stop"
@@ -282,6 +283,11 @@ function Stop-OwnedApplication([string]$Install, [int]$TrayPid) {
         $running = -not $process.WaitForExit(1)
     } while ($running -and [DateTime]::UtcNow -lt $deadline)
     if ($running) { Stop-Update 'shutdown_timeout' }
+    # A packaged launcher can remain as a wait-only parent for old updater compatibility.
+    # It exits naturally with its independent child; never force-kill it or copy a locked EXE.
+    foreach ($bootstrap in @(Get-Process -Name aec-tray -ErrorAction SilentlyContinue | Where-Object {$_.Path -eq $tray})) {
+        if(-not $bootstrap.WaitForExit(10000)){Stop-Update 'shutdown_timeout'}
+    }
     $data = if ($DataDir) { $DataDir } elseif (Test-Path -LiteralPath (Join-Path $Install 'portable.flag')) { Join-Path $Install 'data' } else { Join-Path $env:LOCALAPPDATA 'AgentEgressController' }
     $state = Get-Content -LiteralPath (Join-Path $data 'state.json') -Raw | ConvertFrom-Json
     if ($state.mode -ne 'daily' -or @($state.journal).Count -ne 0) { Stop-Update 'restore_incomplete' }
@@ -296,13 +302,122 @@ function Stop-OwnedApplication([string]$Install, [int]$TrayPid) {
     foreach ($control in $controls) { if (-not $control.WaitForExit(10000)) { Stop-Update 'control_running' } }
 }
 
+function Initialize-UpdaterNative {
+    if ('AecUpdaterNative' -as [type]) { return }
+    Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+    Add-Type -ReferencedAssemblies System.Windows.Forms,System.Drawing -TypeDefinition @'
+using System;
+using System.Drawing;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class AecUpdaterNative {
+ [StructLayout(LayoutKind.Sequential)] struct SI { public uint cb; public IntPtr reserved,desktop,title; public uint x,y,w,h,xc,yc,fill,flags; public ushort show,reserved2; public IntPtr reservedPtr,input,output,error; }
+ [StructLayout(LayoutKind.Sequential)] struct SIX {public SI si; public IntPtr attributes;}
+ [StructLayout(LayoutKind.Sequential)] struct PI {public IntPtr process,thread; public uint pid,tid;}
+ [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+ [DllImport("kernel32.dll",CharSet=CharSet.Unicode)] static extern int GetPackageFullName(IntPtr process,ref uint size,StringBuilder name);
+ [DllImport("kernel32.dll",CharSet=CharSet.Unicode)] static extern IntPtr GetCommandLineW();
+ [DllImport("kernel32.dll",SetLastError=true)] static extern bool InitializeProcThreadAttributeList(IntPtr list,int count,int flags,ref IntPtr size);
+ [DllImport("kernel32.dll",SetLastError=true)] static extern bool UpdateProcThreadAttribute(IntPtr list,uint flags,IntPtr attribute,ref uint value,IntPtr size,IntPtr prev,IntPtr returned);
+ [DllImport("kernel32.dll")] static extern void DeleteProcThreadAttributeList(IntPtr list);
+ [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool CreateProcess(string app,StringBuilder command,IntPtr pa,IntPtr ta,bool inherit,uint flags,IntPtr env,string cwd,ref SIX start,out PI info);
+ [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle,uint milliseconds);
+ [DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr process,out uint code);
+ [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+ [DllImport("shell32.dll",CharSet=CharSet.Unicode)] static extern int SetCurrentProcessExplicitAppUserModelID(string id);
+ [StructLayout(LayoutKind.Sequential)] struct Key {public Guid fmtid;public uint pid;}
+ [StructLayout(LayoutKind.Explicit,Size=24)] struct Value { [FieldOffset(0)] public ushort type;[FieldOffset(8)] public IntPtr pointer;[FieldOffset(8)] public short boolean; }
+ [ComImport,Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"),InterfaceType(ComInterfaceType.InterfaceIsIUnknown)] interface Store {
+  void GetCount(out uint count);void GetAt(uint index,out Key key);void GetValue(ref Key key,out Value value);void SetValue(ref Key key,ref Value value);void Commit();
+ }
+ [DllImport("shell32.dll")] static extern int SHGetPropertyStoreForWindow(IntPtr hwnd,ref Guid iid,out Store store);
+ [DllImport("user32.dll")] static extern bool DestroyIcon(IntPtr icon);
+ public static int? RestartIfPackaged(bool already) {
+  uint n=0;int identity=GetPackageFullName(GetCurrentProcess(),ref n,null);
+  if(identity==15700)return null;
+  if(identity!=122 || already)throw new InvalidOperationException("Independent updater launch failed; no update was started.");
+  IntPtr size=IntPtr.Zero,list=IntPtr.Zero;bool initialized=false;
+  try {
+   InitializeProcThreadAttributeList(IntPtr.Zero,1,0,ref size);
+   if(size==IntPtr.Zero)throw new InvalidOperationException("Independent launch policy unavailable.");
+   list=Marshal.AllocHGlobal(size);
+   if(!InitializeProcThreadAttributeList(list,1,0,ref size))throw new System.ComponentModel.Win32Exception();
+   initialized=true;uint policy=1; // desktop package identity only; no elevation or job breakaway
+   if(!UpdateProcThreadAttribute(list,0,new IntPtr(0x20012),ref policy,new IntPtr(4),IntPtr.Zero,IntPtr.Zero))throw new System.ComponentModel.Win32Exception();
+   var start=new SIX();start.si.cb=(uint)Marshal.SizeOf(typeof(SIX));start.attributes=list;
+   var command=new StringBuilder(Marshal.PtrToStringUni(GetCommandLineW())+" -IndependentLaunch");
+   var exe=System.Diagnostics.Process.GetCurrentProcess().MainModule.FileName;
+   PI info;
+   if(!CreateProcess(exe,command,IntPtr.Zero,IntPtr.Zero,false,0x08080000,IntPtr.Zero,null,ref start,out info))throw new System.ComponentModel.Win32Exception();
+   try {
+    if(WaitForSingleObject(info.process,0xFFFFFFFF)!=0)throw new System.ComponentModel.Win32Exception();
+    uint exit;if(!GetExitCodeProcess(info.process,out exit))throw new System.ComponentModel.Win32Exception();
+    return unchecked((int)exit);
+   }finally{CloseHandle(info.thread);CloseHandle(info.process);}
+  }finally{if(initialized)DeleteProcThreadAttributeList(list);if(list!=IntPtr.Zero)Marshal.FreeHGlobal(list);}
+ }
+ public static void SetIdentity() {Marshal.ThrowExceptionForHR(SetCurrentProcessExplicitAppUserModelID("AgentEgress.Updater"));}
+ public static void ConfigureWindow(IntPtr hwnd) {
+  Guid iid=typeof(Store).GUID;Store store;Marshal.ThrowExceptionForHR(SHGetPropertyStoreForWindow(hwnd,ref iid,out store));
+  try {
+   var key=new Key {fmtid=new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"),pid=9};
+   var value=new Value {type=11,boolean=-1};store.SetValue(ref key,ref value); // updater must not be pinned with stale process arguments
+   key.pid=5;value=new Value {type=31,pointer=Marshal.StringToCoTaskMemUni("AgentEgress.Updater")};
+   try{store.SetValue(ref key,ref value);}finally{Marshal.FreeCoTaskMem(value.pointer);}
+  }finally{Marshal.ReleaseComObject(store);}
+ }
+ public static Icon Icon(string path) {
+  if(System.IO.File.Exists(path))return new Icon(path);
+  // Old releases can bootstrap with this script alone; provide an AEC shield without downloads.
+  using(var bitmap=new Bitmap(32,32)){
+   using(var g=Graphics.FromImage(bitmap)){
+    g.SmoothingMode=System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+    using(var brush=new SolidBrush(Color.FromArgb(15,118,110)))g.FillPolygon(brush,new[]{new Point(16,1),new Point(29,7),new Point(27,22),new Point(16,31),new Point(5,22),new Point(3,7)});
+    using(var pen=new Pen(Color.White,3))g.DrawLines(pen,new[]{new Point(9,16),new Point(14,21),new Point(23,11)});
+   }
+   IntPtr h=bitmap.GetHicon();try{using(var borrowed=System.Drawing.Icon.FromHandle(h))return (Icon)borrowed.Clone();}finally{DestroyIcon(h);}
+  }
+ }
+}
+'@
+}
+
+function Enter-IndependentUpdater([bool]$AlreadyRelaunched) {
+    Initialize-UpdaterNative
+    return [AecUpdaterNative]::RestartIfPackaged($AlreadyRelaunched)
+}
+
 function Show-UpdateMessage([string]$Text, [string]$Title, [bool]$Confirm = $false) {
-    Add-Type -AssemblyName System.Windows.Forms
-    if ($Confirm) {
-        return [Windows.Forms.MessageBox]::Show($Text, $Title, 'YesNo', 'Question') -eq 'Yes'
-    }
-    [void][Windows.Forms.MessageBox]::Show($Text, $Title, 'OK', 'Information')
-    return $false
+    Initialize-UpdaterNative
+    [AecUpdaterNative]::SetIdentity()
+    [Windows.Forms.Application]::EnableVisualStyles()
+    $form=New-Object Windows.Forms.Form
+    $iconPath=if($PSScriptRoot){Join-Path $PSScriptRoot 'app.ico'}else{''}
+    $icon=[AecUpdaterNative]::Icon($iconPath)
+    try {
+        $form.Text=$Title; $form.Icon=$icon; $form.ShowInTaskbar=$true
+        $form.StartPosition='CenterScreen';$form.Size=New-Object Drawing.Size(620,350)
+        $form.MinimumSize=$form.Size;$form.MaximizeBox=$false;$form.MinimizeBox=$false
+        $form.Font=New-Object Drawing.Font('Segoe UI',10)
+        $body=New-Object Windows.Forms.TextBox
+        $body.Multiline=$true;$body.ReadOnly=$true;$body.BorderStyle='None';$body.ScrollBars='Vertical'
+        $body.Dock='Fill';$body.Text=$Text;$body.BackColor=[Drawing.SystemColors]::Window
+        $form.Padding=New-Object Windows.Forms.Padding(18)
+        $buttons=New-Object Windows.Forms.FlowLayoutPanel
+        $buttons.Dock='Bottom';$buttons.Height=48;$buttons.FlowDirection='RightToLeft'
+        $cancel=New-Object Windows.Forms.Button
+        $cancel.Text=if($Confirm){'取消'}else{'确定'};$cancel.Size=New-Object Drawing.Size(96,34)
+        $cancel.DialogResult=if($Confirm){'Cancel'}else{'OK'}
+        $buttons.Controls.Add($cancel);$form.CancelButton=$cancel;$form.AcceptButton=$cancel
+        if($Confirm){
+            $yes=New-Object Windows.Forms.Button
+            $yes.Text='继续';$yes.Size=New-Object Drawing.Size(96,34);$yes.DialogResult='Yes'
+            $buttons.Controls.Add($yes)
+        }
+        $form.Controls.Add($body);$form.Controls.Add($buttons)
+        [AecUpdaterNative]::ConfigureWindow($form.Handle)
+        return $form.ShowDialog() -eq [Windows.Forms.DialogResult]::Yes
+    } finally {$form.Dispose();$icon.Dispose()}
 }
 
 # Never persist exception.Message, response bodies, URLs, command lines or settings.
@@ -644,6 +759,8 @@ if ($SelfTest) {
 try {
     $install = [IO.Path]::GetFullPath($PSScriptRoot)
     $data = if ($DataDir) { $DataDir } elseif (Test-Path -LiteralPath (Join-Path $install 'portable.flag')) { Join-Path $install 'data' } else { Join-Path $env:LOCALAPPDATA 'AgentEgressController' }
+    $launchResult=Enter-IndependentUpdater $IndependentLaunch.IsPresent
+    if($null -ne $launchResult){exit $launchResult}
     Initialize-UpdateLog $data $CurrentVersion $UiOnly.IsPresent
     if (-not $CurrentPid -or $CurrentVersion -notmatch '^\d{1,5}\.\d{1,5}\.\d{1,5}$') { Stop-Update 'invalid_invocation' }
     $updateMutex = New-Object Threading.Mutex($false, 'Local\AgentEgressControllerUpdater')
@@ -795,6 +912,7 @@ try {
 } catch {
     $failure=$_
     try {
+        if(-not $script:UpdateLog -and $data){Initialize-UpdateLog $data $CurrentVersion $UiOnly.IsPresent}
         if (-not $script:UpdateFailureRecorded) { [void](Write-UpdateFailure $failure) }
         $lastFailure=@($script:UpdateLog.events | Where-Object { $_.status -eq 'failed' }) | Select-Object -Last 1
         $code=$lastFailure.code

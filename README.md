@@ -24,7 +24,9 @@ Agent 出口控制器把这件事收进一个托盘图标：从托盘打开的�
 
 ## 它怎么工作
 
-**0.5.4：多个本机代理上游。** 在控制中心「规则、站点与路径 → 本机代理上游」新增、修改、检测和选择 XxYun、Clash 等客户端；托盘可一键选择，MCP/本机鉴权 HTTP 提供同样操作。系统代理始终指向 AEC，切换的是 AEC 的普通上游，不是 Windows 系统代理端口。现有唯一普通上游选择会保留，例如 GPT 原来走 XxYun，新增 Clash 不会自动切换；Claude 等受保护站点和预期 ISP IP 不变。
+**0.5.5：独立启动链路和更新弹窗。** 修复从打包 Agent 启动时继承宿主包身份、仍与 ChatGPT/Codex 合组的问题。控制中心和更新窗口使用 AEC 自己的图标；更新默认取消，核心安装仍单独确认停服。已经打开的旧窗口不会自动改变，详见 [升级指南](docs/UPDATING.md)。
+
+**多个本机代理上游：** 在控制中心「规则、站点与路径 → 本机代理上游」新增、修改、检测和选择 XxYun、Clash 等客户端；托盘可一键选择，MCP/本机鉴权 HTTP 提供同样操作。系统代理始终指向 AEC，切换的是 AEC 的普通上游，不是 Windows 系统代理端口。现有唯一普通上游选择会保留，例如 GPT 原来走 XxYun，新增 Clash 不会自动切换；Claude 等受保护站点和预期 ISP IP 不变。
 
 客户端端口不是固定值：填写实际 HTTP/SOCKS5/mixed 端口，各客户端避开相同地址端口，并关闭它们的系统代理和 TUN 接管。管理器只支持免认证 loopback 上游，最多 16 个；拒绝 AEC 自环、重复端点和隧道传输出站。检测只验证固定测试站的 HTTPS，不保证 GPT 登录或所有网站可用。运行中应用配置可能短暂断连，但不退出网关；原有 DIRECT 兜底保留，不会新增直连回退。详见[用户指南](docs/USER-GUIDE.md#多个本机代理上游)与[Agent 接入](docs/AGENT-INTEGRATION.md#本机代理上游管理)。
 
@@ -61,7 +63,7 @@ Agent 出口控制器把这件事收进一个托盘图标：从托盘打开的�
 
 **需要：** Windows 10/11；本机已装 Edge 或 Chrome；一个你自己的出口代理（SOCKS5 或 HTTP，地址、端口，有账号就带上）。
 
-1. 到 [Releases](https://github.com/zxs4KHf/agent-egress-controller/releases/latest) 选择 `AgentEgressController-0.5.4-setup.exe` 安装，或下载 `AgentEgressController-0.5.4-portable.zip` 便携运行；按同版本 SHA256 文件核对。
+1. 到 [Releases](https://github.com/zxs4KHf/agent-egress-controller/releases/latest) 选择 `AgentEgressController-0.5.5-setup.exe` 安装，或下载 `AgentEgressController-0.5.5-portable.zip` 便携运行；按同版本 SHA256 文件核对。
 2. 安装版从开始菜单启动 Agent Egress Controller；便携版双击 `aec-tray.exe`。首次启动会打开桌面控制中心。程序没有签名，Windows 可能提示「已保护你的电脑」，点「更多信息 → 仍要运行」。若提示缺少 WebView2 Runtime，按提示从微软安装后重试。
 3. 设置页填自己的出口、端口和账号、目标时区。直接连接失败时启用隧道；只代理 AI 域名可选「分流」，其他流量默认直连，也可填自己的日常代理。需要修改时区或系统代理时分别勾选相应开关。
 4. 托盘圆点（可能藏在「^」里）→「进入 Agent 模式」，然后从菜单打开 Edge 或 Chrome，让本地检查页回报时区、语言等证据。未打开浏览器或检查证据不足时保持黄色；全部硬门槛通过后才变绿，再开始使用 AI 服务或 CLI。
@@ -78,7 +80,7 @@ Agent 出口控制器把这件事收进一个托盘图标：从托盘打开的�
 
 托盘和看板提供「仅更新界面」与「检查完整更新」。**0.5.3 更新器支持真正按组件增量下载**：读取小型校验清单，比较实际文件 SHA256，仅下载有变化的组件；未变化的 mihomo 内核可跳过。确认框显示所需组件数、预计大小和完整包大小。这不是二进制字节差分，不承诺固定节省比例。仅界面更新只下载界面组件，不停止网络服务；核心更新仍需独立停服确认。取消不停止、不替换，保留用户配置、凭据和回滚备份。
 
-**老用户升级 0.5.3：** 原 0.5.1/0.5.2 更新器仍会全量下载一次；若这次就要增量，先按 [升级指南](docs/UPDATING.md) 校验并替换独立更新脚本，再从原托盘启动。原 0.5.0 必须先替换脚本；更旧版本手动升级。只更新界面不会升级程序/Agent 工具。升级不重置规则、固定 ISP、密钥、自启或原 OpenAI/Claude 分流。便携版转安装版不会自动迁移数据。
+**老用户升级 0.5.5：** 原 0.5.1/0.5.2 更新器仍会全量下载一次；若这次就要增量，先按 [升级指南](docs/UPDATING.md) 校验并替换独立更新脚本，再从原托盘启动。原 0.5.0 必须先替换脚本；更旧版本手动升级。只更新界面不会升级程序/Agent 工具。升级不重置规则、固定 ISP、密钥、自启或原 OpenAI/Claude 分流。便携版转安装版不会自动迁移数据。
 
 **更新失败不依赖弹窗截图：** `aec-agent.exe update-status` 直接读取最近 20 次本地更新日志，托盘关闭、Agent API 关闭也可用；MCP/已鉴权 HTTP 使用 `aec_update_status`。输出包含阶段、错误码、HTTP 状态、下载量和下一步建议。日志位于数据目录 `update-logs/`，不记录密码、令牌、网址或原始异常正文。Agent 可启动更新器，但不能替用户确认停服；未完成日志不算更新成功。详见 [Agent 接入](docs/AGENT-INTEGRATION.md)。
 
@@ -119,7 +121,7 @@ R11 通过仅证明观测到的连接遵循路由，实际 ISP 身份和出口 I
 
 ## 已知限制
 
-`0.5.4` 仍为预览质量：提供 Windows x64 per-user 安装 EXE 和便携 ZIP，没有代码签名；在 GitHub 标记为 Latest 供更新器发现，不代表所有环境均已验收。本机 Agent 控制由用户在看板显式启用，登录自启默认关闭。GEOSITE/GEOIP 需要用户提供可信的 `GeoSite.dat` 和 `GeoIP.dat` 到 `bin\`；包中不附带未核实来源的数据文件，程序不自动下载。未提供时保持「国内直连」关闭；相关规则预检会明确报缺项。
+`0.5.5` 仍为预览质量：提供 Windows x64 per-user 安装 EXE 和便携 ZIP，没有代码签名；在 GitHub 标记为 Latest 供更新器发现，不代表所有环境均已验收。本机 Agent 控制由用户在看板显式启用，登录自启默认关闭。GEOSITE/GEOIP 需要用户提供可信的 `GeoSite.dat` 和 `GeoIP.dat` 到 `bin\`；包中不附带未核实来源的数据文件，程序不自动下载。未提供时保持「国内直连」关闭；相关规则预检会明确报缺项。
 
 已验证的范围包括本地完整链路、真实 mihomo 配置与选择恢复、固定保护阻断和重载，以及维护者旧路由表导入后的真实出口等价性；其他用户网络中的隧道可用性、Windows 10/11 普通账号的全局写入与恢复仍需实机验收。详细证据见 [0.3.2 恢复修复验收](docs/RELEASE-0.3.2.md)、[0.3.1 验收记录](docs/RELEASE-0.3.1.md) 和 [0.3.0 看板验收](docs/RELEASE-0.3.0.md)。遇到问题请开 [Issue](https://github.com/zxs4KHf/agent-egress-controller/issues/new/choose)，附上已脱敏的排查提示词。
 
@@ -133,7 +135,7 @@ R11 通过仅证明观测到的连接遵循路由，实际 ISP 身份和出口 I
 
 ## AI Agent 控制
 
-本次交付版本为 0.5.4；新增面板、托盘、Agent 共用的本机上游管理，保留独立任务栏、组件增量下载与离线更新诊断。验证范围见 [0.5.4 交付记录](docs/RELEASE-0.5.4.md)，历史记录见 [0.5.3](docs/RELEASE-0.5.3.md)、[0.5.2](docs/RELEASE-0.5.2.md)、[0.5.1](docs/RELEASE-0.5.1.md)。
+本次交付版本为 0.5.5；补齐独立启动与更新弹窗，保留面板、托盘、Agent 共用的本机上游管理、组件增量下载与离线更新诊断。验证范围见 [0.5.5 交付记录](docs/RELEASE-0.5.5.md)，历史记录见 [0.5.4](docs/RELEASE-0.5.4.md)、[0.5.3](docs/RELEASE-0.5.3.md)、[0.5.2](docs/RELEASE-0.5.2.md)、[0.5.1](docs/RELEASE-0.5.1.md)。
 
 发布包包含 aec-agent.exe。在看板选择「Agent 接入与 MCP」并显式开启后，可复制配置到支持本机 MCP stdio 的桌面 Agent；自建本机 host 可用 loopback HTTP/JSON 接口。纯云端 Agent 不能直接访问你的电脑。MCP bridge 不需要另外安装 Node、Python 或 SDK。接口只提供具名状态、设置、规则、路径和模式工具，不提供任意 shell；Agent 看不到密码，需用户在本机设置页填写。对接步骤、HTTP 契约、工具 schema 和安全边界见 [Agent 接入指南](docs/AGENT-INTEGRATION.md)。本机接口默认关闭，托盘关闭后停止。
 
