@@ -41,6 +41,24 @@ MCP 使用官方 2025-11-25 JSON-RPC 生命周期与 newline-delimited stdio tra
 
 所有字段在本机按严格 schema 校验，未声明字段和任意命令都拒绝。成功表示操作已执行，不代表 Agent 模式通过检查。之后读取 aec_state；只有实际证据确认时才报告就绪。连接超时的结果可能未知，先读取状态，不要盲目重试有副作用的操作。
 
+## 本机代理上游管理
+
+0.5.4 新增下列 MCP 工具，同名 HTTP 调用使用 `/api/v1/call`：
+
+| 工具 | 参数 | 语义 |
+| --- | --- | --- |
+| `aec_upstreams` | `{}` | 列出名称、地址、端口、协议、当前选择和 bound 状态，不检测或修改 |
+| `aec_upstream_save` | `{"name":"Clash","host":"127.0.0.1","port":7890,"protocol":"http"}` | 新增或按稳定名称修改；不替换路由预设，不自动选择新成员 |
+| `aec_upstream_select` | `{"name":"Clash"}` | 选择已保存普通上游，绝不取消保护站点 |
+| `aec_upstream_delete` | `{"name":"Clash"}` | 删除非当前、未被其他规则直接引用的成员 |
+| `aec_upstream_probe` | `{"name":"Clash"}` | 仅检测，不修改；返回 pass/fail/unknown、错误码、检查时间与 HTTP 状态 |
+
+地址枚举为 `127.0.0.1`、`localhost`、`::1`，协议为 `http`、`socks5`；示例端口不代表用户的实际配置。不要使用 AEC 自己的端口、控制口或 DNS 端口。最多 16 个免认证本机端点，名称是不可变标识；不得传密码、远程地址、URL、任意命令或 force。首次接入会保留原唯一被规则引用的普通上游，例如 XxYun。多个旧上游分别被引用时拒绝自动合并，不能擅自抹掉用途差异。
+
+`bound:false` 表示没有规则引用选择组；保存成功不等于流量已使用它。需要用户明确决定哪些普通规则指向「本机代理上游」，受保护站点仍优先固定 ISP。原有 DIRECT 兜底保持，不新增直连回退。运行中保存/选择可能短暂断连，重载失败尝试回存旧配置，固定证据失败继续阻断。操作不关闭或修改 XxYun/Clash。
+
+检测经显式指定的端口访问 `https://www.cloudflare.com/cdn-cgi/trace`，约 8 秒超时，不跟随重定向，不绕过 TLS，不自动选择或回退直连。`UPSTREAM_HTTPS_OK` 只证明测试 URL 可用，不能报告 GPT 对话、Claude ISP 或整个网关已就绪。核心 0.5.4 是必需条件，只有新版界面或 stdio bridge 不足以提供新工具。
+
 ## HTTP/JSON
 
 用于自建本机 Agent host。数据目录下的 agent-api.json 是发现信息：

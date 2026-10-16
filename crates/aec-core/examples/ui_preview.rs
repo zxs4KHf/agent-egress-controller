@@ -14,6 +14,25 @@ struct Preview {
     active: AtomicBool,
 }
 impl SetupBackend for Preview {
+    fn upstream(
+        &self,
+        command: aec_core::local_upstream::Command,
+    ) -> Result<serde_json::Value, Vec<FieldError>> {
+        let mut set = self.profiles.lock().unwrap();
+        if let aec_core::local_upstream::Command::Probe { .. } = command {
+            return Ok(
+                serde_json::json!({"probe":{"status":"unknown","code":"PREVIEW_NO_NETWORK","message":"隔离预览不访问外部网络"}}),
+            );
+        }
+        *set = aec_core::local_upstream::plan(&set, &command, aec_core::core::CorePorts::default())
+            .map_err(|message| {
+                vec![FieldError {
+                    path: "upstream".into(),
+                    message,
+                }]
+            })?;
+        Ok(serde_json::json!({"applied":true,"upstreams":aec_core::local_upstream::view(&set)}))
+    }
     fn route(&self, form: aec_core::route_switch::Form) -> Result<(), Vec<FieldError>> {
         let mut set = self.profiles.lock().unwrap();
         *set = aec_core::route_switch::plan(&set, &form)
@@ -114,6 +133,13 @@ fn main() {
         })
         .collect();
     agent.egress.fixed_exit = true;
+    agent.routing.outbounds.push(
+        serde_json::from_value(
+            serde_json::json!({"name":"xxyun", "kind":"http", "server":"127.0.0.1", "port":7892}),
+        )
+        .unwrap(),
+    );
+    agent.routing.final_target = "xxyun".into();
     agent.egress.expected.ip = Some("192.0.2.1".into());
     agent.routing.groups.push(serde_json::from_value(serde_json::json!({"name":"Preview GPT","type":"select","members":["relay","DIRECT"],"switchable":true})).unwrap());
     agent.routing.rules.push(serde_json::from_value(serde_json::json!({"kind":"domain_suffix","value":"chatgpt.com","target":"Preview GPT"})).unwrap());

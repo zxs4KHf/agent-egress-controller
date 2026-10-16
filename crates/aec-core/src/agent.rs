@@ -119,6 +119,39 @@ fn fields(errors: Vec<crate::profile::FieldError>) -> String {
         .join(", ")
         + ": validation failed; check the local panel"
 }
+fn upstream_error(errors: Vec<crate::profile::FieldError>) -> String {
+    // Only known codes cross the Agent boundary, not arbitrary validation text or credentials.
+    const CODES: &[&str] = &[
+        "UPSTREAM_GROUP_CONFLICT",
+        "UPSTREAM_AMBIGUOUS",
+        "UPSTREAM_PROFILE_MISSING",
+        "UPSTREAM_NAME",
+        "UPSTREAM_HOST",
+        "UPSTREAM_PORT",
+        "UPSTREAM_OWNERSHIP",
+        "UPSTREAM_DUPLICATE",
+        "UPSTREAM_LIMIT",
+        "UPSTREAM_NOT_FOUND",
+        "UPSTREAM_IN_USE",
+        "UPSTREAM_INVALID",
+        "UPSTREAM_MODE_BUSY",
+        "UPSTREAM_READ_FAILED",
+        "UPSTREAM_BACKUP_FAILED",
+        "UPSTREAM_INVALIDATE_FAILED",
+        "UPSTREAM_SAVE_FAILED",
+        "UPSTREAM_RELOAD_FAILED",
+    ];
+    let code = errors
+        .iter()
+        .find_map(|e| {
+            CODES
+                .iter()
+                .find(|code| e.message.split(':').next() == Some(**code))
+        })
+        .copied()
+        .unwrap_or("UPSTREAM_FAILED");
+    format!("{code}: inspect aec_upstreams and aec_state; do not assume applied or ready")
+}
 fn settings_properties() -> Value {
     let mut p = serde_json::Map::new();
     for key in [
@@ -175,6 +208,11 @@ pub fn tools() -> Value {
     );
     let specs = vec![
         ("aec_state", "Read mode, readiness summary, fixed-exit block, paths and rules. Unknown is never pass.", none.clone(), true),
+        ("aec_upstreams", "List editable local proxy upstreams, current selection and whether rules use the group. Does not change routes or probe the network.", none.clone(), true),
+        ("aec_upstream_save", "Add or edit a named local HTTP/SOCKS5 upstream; mixed ports accept either. Preserves protected sites and ISP identity. First adoption preserves the uniquely referenced local upstream; ambiguous routing is rejected. Active reload briefly interrupts connections, never stops the gateway process.", schema(json!({"name":{"type":"string"},"host":{"type":"string","enum":["127.0.0.1","localhost","::1"]},"port":{"type":"integer","minimum":1,"maximum":65535},"protocol":{"type":"string","enum":["http","socks5"]}}), &["name","host","port","protocol"]), false),
+        ("aec_upstream_select", "Select a saved ordinary upstream for rules using the local upstream group. Never removes protected sites or changes ISP identity. May briefly interrupt connections; no automatic DIRECT fallback is added.", schema(json!({"name":{"type":"string"}}), &["name"]), false),
+        ("aec_upstream_delete", "Delete an unused, unselected local upstream. Referenced or selected entries cannot be deleted.", schema(json!({"name":{"type":"string"}}), &["name"]), false),
+        ("aec_upstream_probe", "Probe a saved local upstream with a bounded HTTPS request to Cloudflare. Does not select it or change global settings. Success proves this test URL only, not GPT login or Claude ISP identity.", schema(json!({"name":{"type":"string"}}), &["name"]), true),
         ("aec_update_status", "Read persistent update history, transfer bytes, failure stages/codes and recovery guidance. Read-only; never retries or confirms. If tray is unavailable use aec-agent update-status offline.", none.clone(), true),
         ("aec_settings", "Read settings without passwords. Do not publish private hosts, usernames or exit IP.", none.clone(), true),
         ("aec_options", "Read capabilities, dropdown options, HTTP contract and security guidance.", none.clone(), true),
@@ -189,7 +227,7 @@ pub fn tools() -> Value {
         ("aec_exit", "Exit and restore snapshotted globals; connections may stop. Inspect returned state for recovery failures.", none.clone(), false),
         ("aec_recheck", "Run checks and return state; failure or unknown never becomes ready.", none, false),
     ];
-    Value::Array(specs.into_iter().map(|(name,description,input,readonly)| json!({"name":name,"description":description,"inputSchema":input,"annotations":{"readOnlyHint":readonly,"destructiveHint":!readonly,"openWorldHint":!readonly}})).collect())
+    Value::Array(specs.into_iter().map(|(name,description,input,readonly)| json!({"name":name,"description":description,"inputSchema":input,"annotations":{"readOnlyHint":readonly,"destructiveHint":!readonly,"openWorldHint":!readonly || name == "aec_upstream_probe"}})).collect())
 }
 
 pub fn call(backend: &dyn SetupBackend, request: Call) -> Result<Value, String> {
@@ -206,6 +244,25 @@ pub fn call(backend: &dyn SetupBackend, request: Call) -> Result<Value, String> 
         return Err(invalid());
     }
     match request.name.as_str() {
+        "aec_upstream_save"
+        | "aec_upstream_select"
+        | "aec_upstream_delete"
+        | "aec_upstream_probe" => {
+            let mut command = a.clone();
+            command.as_object_mut().unwrap().insert(
+                "action".into(),
+                request.name.trim_start_matches("aec_upstream_").into(),
+            );
+            return backend
+                .upstream(serde_json::from_value(command).map_err(|_| invalid())?)
+                .map_err(upstream_error);
+        }
+        "aec_upstreams" => {
+            return backend
+                .dashboard()
+                .map(|d| serde_json::to_value(d.upstreams).expect("serializes"))
+                .ok_or_else(|| "state unavailable".into())
+        }
         "aec_update_status" => return Ok(backend.update_status()),
         "aec_state" => {
             return serde_json::to_value(backend.dashboard())

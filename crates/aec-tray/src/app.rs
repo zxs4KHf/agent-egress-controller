@@ -146,6 +146,10 @@ impl Layout {
 }
 
 pub enum Cmd {
+    Upstream(
+        aec_core::local_upstream::Command,
+        Sender<Result<serde_json::Value, Vec<FieldError>>>,
+    ),
     Configure(serde_json::Value, Sender<Result<(), Vec<FieldError>>>),
     AgentAction(String, Sender<Result<(), Vec<FieldError>>>),
     Startup(bool, Sender<Result<(), Vec<FieldError>>>),
@@ -327,6 +331,7 @@ impl Worker {
                 continue;
             }
             let label = match &cmd {
+                Cmd::Upstream(..) => "正在处理本机代理上游…",
                 Cmd::AgentAction(..) => "正在执行 Agent 操作…",
                 Cmd::Startup(..) | Cmd::Shortcuts(..) => "正在保存启动入口…",
                 Cmd::Save(..) | Cmd::Rules(..) | Cmd::Configure(..) => "正在保存设置…",
@@ -379,6 +384,10 @@ impl Worker {
     fn handle(&mut self, cmd: Cmd) -> bool {
         let data_dir = self.layout.data_dir.clone();
         match cmd {
+            Cmd::Upstream(command, done) => {
+                let result = self.change_upstream(command).map_err(field_error);
+                let _ = done.send(result);
+            }
             Cmd::Route(form, done) => {
                 let result = self.change_route(form).map_err(field_error);
                 let _ = done.send(result);
@@ -630,6 +639,11 @@ impl Worker {
     }
 
     fn change_route(&mut self, form: aec_core::route_switch::Form) -> Result<(), String> {
+        if form.group == aec_core::local_upstream::GROUP {
+            return self
+                .change_upstream(aec_core::local_upstream::Command::Select { name: form.member })
+                .map(|_| ());
+        }
         if !self.active() && self.controller.state().mode != Mode::Daily {
             return Err("当前正在恢复或切换模式，请完成后重试".into());
         }
@@ -751,6 +765,80 @@ fn field_error(message: String) -> Vec<FieldError> {
 }
 
 impl Worker {
+    fn change_upstream(
+        &mut self,
+        command: aec_core::local_upstream::Command,
+    ) -> Result<serde_json::Value, String> {
+        use aec_core::local_upstream::{self, Command};
+        if !self.active() && self.controller.state().mode != Mode::Daily {
+            return Err("UPSTREAM_MODE_BUSY: 当前正在切换或恢复，请完成后重试".into());
+        }
+        let store = ProfileStore::new(&self.layout.data_dir);
+        let previous = store.load().map_err(|_| "UPSTREAM_READ_FAILED")?;
+        let ports = Settings::load(&self.layout.data_dir).core_ports();
+        if let Command::Probe { name } = command {
+            return Ok(
+                serde_json::json!({"probe":local_upstream::probe(&previous, &name, ports)?, "upstreams":local_upstream::view(&previous)}),
+            );
+        }
+        let next = local_upstream::plan(&previous, &command, ports)?;
+        aec_core::store::write_atomic(
+            &self.layout.data_dir.join("upstreams-before.json"),
+            &serde_json::to_vec_pretty(&previous).expect("serializes"),
+        )
+        .map_err(|_| "UPSTREAM_BACKUP_FAILED: 无法备份，未应用修改")?;
+        let p = &next.agent[0];
+        if self.active() {
+            self.controller
+                .invalidate_routing_checks()
+                .map_err(|_| "UPSTREAM_INVALIDATE_FAILED")?;
+            if p.egress.fixed_exit {
+                self.block()?;
+            }
+        }
+        store
+            .save(&next)
+            .map_err(|_| "UPSTREAM_SAVE_FAILED: 保存失败，固定保护未解除")?;
+        if self.active() {
+            if self
+                .controller
+                .platform()
+                .core
+                .reload(&aec_core::windows::WindowsHost, p, &WindowsCredentials)
+                .is_err()
+            {
+                let saved = store.save(&previous).is_ok();
+                let restored = saved
+                    && self
+                        .controller
+                        .platform()
+                        .core
+                        .reload(
+                            &aec_core::windows::WindowsHost,
+                            &previous.agent[0],
+                            &WindowsCredentials,
+                        )
+                        .is_ok();
+                return Err(format!("UPSTREAM_RELOAD_FAILED: 旧档案恢复={saved}，旧规则恢复={restored}；固定出口保持阻断，请重新检测。"));
+            }
+            if p.egress.fixed_exit {
+                if self.open_fixed(p).is_err() {
+                    self.note(
+                        "本机上游已保存，固定 ISP 待验证",
+                        "普通上游规则已应用；受保护站点未取得同一 ISP 证据时继续阻断。",
+                        true,
+                    );
+                }
+            } else {
+                let _ = self.controller.recheck(p);
+            }
+        }
+        self.write_report();
+        Ok(
+            serde_json::json!({"applied":true, "upstreams":local_upstream::view(&next), "fixedExitBlocked":p.egress.fixed_exit && !self.controller.platform().fixed_verified()}),
+        )
+    }
+
     fn active(&self) -> bool {
         matches!(
             self.controller.state().mode,
@@ -925,6 +1013,17 @@ impl Backend {
 }
 
 impl SetupBackend for Backend {
+    fn upstream(
+        &self,
+        command: aec_core::local_upstream::Command,
+    ) -> Result<serde_json::Value, Vec<FieldError>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(Cmd::Upstream(command, tx))
+            .map_err(|_| field_error("托盘服务已退出".into()))?;
+        rx.recv()
+            .map_err(|_| field_error("托盘服务已退出".into()))?
+    }
     fn update_status(&self) -> serde_json::Value {
         aec_core::update_log::collect(self.data_dir.clone())
     }

@@ -42,6 +42,19 @@ fn contains(parent: &str, child: &str) -> bool {
 }
 
 pub fn plan(set: &ProfileSet, form: &Form) -> Result<Plan, String> {
+    if form.group == crate::local_upstream::GROUP {
+        return Ok(Plan {
+            profiles: crate::local_upstream::plan(
+                set,
+                &crate::local_upstream::Command::Select {
+                    name: form.member.clone(),
+                },
+                crate::core::CorePorts::default(),
+            )?,
+            fixed: false,
+            domains: Vec::new(),
+        });
+    }
     let p = set.agent.first().ok_or("缺少 Agent 档案")?;
     let index = p
         .routing

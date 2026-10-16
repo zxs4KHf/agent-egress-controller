@@ -755,6 +755,12 @@ pub fn apply_settings(
 
 /// What the page server needs from its owner.
 pub trait SetupBackend: Send + Sync {
+    fn upstream(
+        &self,
+        _command: crate::local_upstream::Command,
+    ) -> Result<serde_json::Value, Vec<FieldError>> {
+        Err(vec![err("upstream", "本机上游管理不可用")])
+    }
     fn configure(&self, patch: serde_json::Value) -> Result<(), Vec<FieldError>> {
         self.save(crate::agent::patch_settings(self.view(), patch)?)
     }
@@ -1004,7 +1010,7 @@ fn handle(
         (
             "POST",
             "/save" | "/rules" | "/path" | "/startup" | "/shortcuts" | "/action" | "/agent-access"
-            | "/update" | "/route",
+            | "/update" | "/route" | "/upstream",
         ) if token_ok => {
             if header(&head, "origin") != Some(format!("http://{me}").as_str()) {
                 return respond(&mut s, "403 Forbidden", "text/plain", "origin rejected");
@@ -1041,6 +1047,22 @@ fn handle(
                 ui_only: bool,
             }
             let malformed = || vec![err("form", "表单格式不对")];
+            if path == "/upstream" {
+                let result = serde_json::from_slice(body)
+                    .map_err(|_| malformed())
+                    .and_then(|command| backend.upstream(command));
+                buf.iter_mut().for_each(|b| *b = 0);
+                let reply = match result {
+                    Ok(result) => serde_json::json!({"ok":true,"result":result}),
+                    Err(errors) => serde_json::json!({"ok":false,"errors":errors}),
+                };
+                return respond(
+                    &mut s,
+                    "200 OK",
+                    "application/json; charset=utf-8",
+                    &reply.to_string(),
+                );
+            }
             let result = match path {
                 "/update" => serde_json::from_slice::<UpdateForm>(body)
                     .map_err(|_| malformed())
@@ -1086,7 +1108,7 @@ fn handle(
             _,
             "/app" | "/setup" | "/proxy-help" | "/save" | "/dashboard" | "/state" | "/rules"
             | "/path" | "/startup" | "/shortcuts" | "/agent" | "/agent-access" | "/action"
-            | "/agent-info" | "/update" | "/route",
+            | "/agent-info" | "/update" | "/route" | "/upstream",
         ) => respond(&mut s, "403 Forbidden", "text/plain", "token rejected"),
         _ => respond(&mut s, "404 Not Found", "text/plain", "not found"),
     }
