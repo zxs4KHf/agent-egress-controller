@@ -22,6 +22,7 @@ pub mod http;
 pub mod import;
 #[cfg(windows)]
 pub mod live;
+pub mod local_upstream;
 pub mod log;
 pub mod model;
 pub mod paths;

@@ -338,7 +338,7 @@ mod tray {
                                 flags,
                                 ID_SWITCH_BASE + i,
                                 &format!(
-                                    "路由：{group} → {member}（{}）",
+                                    "{group} → {member}（{}）",
                                     if *fixed {
                                         "固定 ISP"
                                     } else {

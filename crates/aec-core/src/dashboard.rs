@@ -13,6 +13,7 @@ pub struct RulesForm {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct View {
+    pub upstreams: crate::local_upstream::View,
     pub switches: Vec<RouteChoice>,
     pub autostart: bool,
     pub mode: String,
@@ -58,6 +59,7 @@ pub fn view(
     targets.extend(p.routing.groups.iter().map(|g| g.name.clone()));
     targets.extend(p.routing.outbounds.iter().map(|o| o.name.clone()));
     View {
+        upstreams: crate::local_upstream::view(set),
         switches: p
             .routing
             .groups
