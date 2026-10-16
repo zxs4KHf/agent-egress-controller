@@ -87,19 +87,6 @@ fn wfp_persistent_rules_block_bypass_and_ipv6_even_after_engine_exit() {
         probe(allowed.local_addr().unwrap()),
         "The selected IPv4 proxy remains reachable"
     );
-    if probe(other.local_addr().unwrap()) {
-        let apps = [fixture.to_string_lossy().into_owned()];
-        engine.test_matching(port, &apps, false, false).unwrap();
-        let app_only_blocks = !probe(other.local_addr().unwrap());
-        eprintln!("[DEBUG-wfp-0616] app_only_blocks={app_only_blocks}");
-        engine.test_matching(port, &apps, false, true).unwrap();
-        let high_priority_blocks = !probe(other.local_addr().unwrap());
-        eprintln!("[DEBUG-wfp-0616] app_only_high_priority_blocks={high_priority_blocks}");
-        engine.test_matching(port, &apps, true, false).unwrap();
-        let user_high_priority_blocks = !probe(other.local_addr().unwrap());
-        eprintln!("[DEBUG-wfp-0616] app_and_user_high_priority_blocks={user_high_priority_blocks}");
-        panic!("Original user-scoped bypass policy failed; diagnostic probes do not constitute a passing test");
-    }
     assert!(
         !probe(other.local_addr().unwrap()),
         "Another loopback proxy must be blocked"
@@ -122,6 +109,31 @@ fn wfp_persistent_rules_block_bypass_and_ipv6_even_after_engine_exit() {
     );
     let engine = Engine::open_test(&sid, &scope, true).unwrap();
     assert_eq!(engine.count().unwrap(), 4);
+    // Exercise the user-facing path spelling as well as the canonical one. On Windows runners
+    // TEMP commonly contains RUNNER~1; application IDs must still identify the same executable.
+    let file_wide: Vec<u16> = fixture
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    let mut short = vec![0u16; 32768];
+    let n = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetShortPathNameW(
+            file_wide.as_ptr(),
+            short.as_mut_ptr(),
+            short.len() as u32,
+        )
+    };
+    assert!(
+        n > 0 && (n as usize) < short.len(),
+        "Cannot query the fixture's Windows path alias"
+    );
+    let alias = String::from_utf16_lossy(&short[..n as usize]);
+    assert_eq!(engine.apply(port, &[alias]).unwrap(), 4);
+    assert!(
+        !probe(other.local_addr().unwrap()),
+        "Path aliases must not bypass application identity matching"
+    );
     assert_eq!(engine.apply(port, &[]).unwrap(), 0);
     assert!(
         probe(other.local_addr().unwrap()),

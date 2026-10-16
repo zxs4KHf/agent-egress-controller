@@ -1,4 +1,4 @@
-name: isolated-guard-diagnostics
+name: isolated-guard-validation
 on:
   workflow_dispatch:
   push:
@@ -21,5 +21,7 @@ jobs:
         run: |
           cargo build -p aec-core --example guard_probe --locked
           if ($LASTEXITCODE) { throw 'Probe build failed' }
-          cargo test -p aec-core --test wfp_guard -- --include-ignored --nocapture
-          if ($LASTEXITCODE) { throw 'Application blocking not verified; not releasable' }
+          1..3 | ForEach-Object {
+            cargo test -p aec-core --test wfp_guard -- --include-ignored --nocapture
+            if ($LASTEXITCODE) { throw "Application blocking failed on iteration $_; not releasable" }
+          }

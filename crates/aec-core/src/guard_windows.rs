@@ -98,7 +98,6 @@ pub struct Engine {
     sublayer: GUID,
     dynamic: bool,
     owner: String,
-    testing: bool,
 }
 impl Drop for Engine {
     fn drop(&mut self) {
@@ -150,7 +149,6 @@ impl Engine {
             sublayer,
             dynamic,
             owner: owner.into(),
-            testing: !scope.is_empty(),
         };
         let mut name = wide("Agent Egress application protection");
         let mut p: FWPM_PROVIDER0 = unsafe { std::mem::zeroed() };
@@ -223,12 +221,6 @@ impl Engine {
             }
             for entry in unsafe { std::slice::from_raw_parts(entries, count as usize) } {
                 let entry = unsafe { &**entry };
-                if self.testing {
-                    eprintln!(
-                        "[DEBUG-wfp-0616] filter flags={} weight_type={} conditions={}",
-                        entry.flags, entry.weight.r#type, entry.numFilterConditions
-                    );
-                }
                 if !same_guid(entry.subLayerKey, self.sublayer)
                     || entry.action.r#type != FWP_ACTION_BLOCK
                 {
@@ -254,28 +246,6 @@ impl Engine {
     }
     /// Atomic replacement never leaves an unfiltered gap. An empty list is explicit release.
     pub fn apply(&self, port: u16, apps: &[String]) -> Result<usize, String> {
-        self.apply_scoped(port, apps, true, false)
-    }
-    /// Temporary diagnostic seam: only isolated test providers may change matching conditions.
-    pub fn test_matching(
-        &self,
-        port: u16,
-        apps: &[String],
-        user: bool,
-        high_priority: bool,
-    ) -> Result<usize, String> {
-        if !self.testing {
-            return Err("GUARD_TEST_ONLY".into());
-        }
-        self.apply_scoped(port, apps, user, high_priority)
-    }
-    fn apply_scoped(
-        &self,
-        port: u16,
-        apps: &[String],
-        user_constraint: bool,
-        high_priority: bool,
-    ) -> Result<usize, String> {
         if port == 0
             || apps.len() > 16
             || apps.iter().any(|p| {
@@ -300,30 +270,8 @@ impl Engine {
             }
         }
         let mut txn = Transaction(self.handle, false);
-        if high_priority {
-            // Isolated fixture namespace only. Never alter a foreign sublayer.
-            for key in &keys {
-                check(unsafe { FwpmFilterDeleteByKey0(self.handle, key) })?;
-            }
-            check(unsafe { FwpmSubLayerDeleteByKey0(self.handle, &self.sublayer) })?;
-            let mut key = self.provider;
-            let mut name = wide("AEC isolated high-priority diagnostic");
-            let mut layer: FWPM_SUBLAYER0 = unsafe { std::mem::zeroed() };
-            layer.subLayerKey = self.sublayer;
-            layer.providerKey = &mut key;
-            layer.displayData.name = name.as_mut_ptr();
-            layer.weight = u16::MAX;
-            layer.flags = if self.dynamic {
-                0
-            } else {
-                FWPM_SUBLAYER_FLAG_PERSISTENT
-            };
-            check(unsafe { FwpmSubLayerAdd0(self.handle, &layer, null_mut()) })?;
-        }
         for key in keys {
-            if !high_priority {
-                check(unsafe { FwpmFilterDeleteByKey0(self.handle, &key) })?;
-            }
+            check(unsafe { FwpmFilterDeleteByKey0(self.handle, &key) })?;
         }
         let sd = SecurityDescriptor::from_sddl(&format!("D:(A;;CC;;;{})", self.owner))?;
         let mut user = FWP_BYTE_BLOB {
@@ -339,16 +287,10 @@ impl Engine {
             let resolved = crate::paths::strip_verbatim(&resolved)
                 .to_string_lossy()
                 .into_owned();
-            if self.testing {
-                eprintln!(
-                    "[DEBUG-wfp-0616] canonical_path_changed={}",
-                    !path.eq_ignore_ascii_case(&resolved)
-                );
-            }
             let mut app = null_mut();
             check(unsafe { FwpmGetAppIdFromFileName0(wide(&resolved).as_ptr(), &mut app) })?;
             let _app = Allocation(app.cast());
-            let mut common = vec![
+            let common = [
                 FWPM_FILTER_CONDITION0 {
                     fieldKey: FWPM_CONDITION_ALE_APP_ID,
                     matchType: FWP_MATCH_EQUAL,
@@ -366,9 +308,6 @@ impl Engine {
                     },
                 },
             ];
-            if !user_constraint {
-                common.pop();
-            }
             let deny = [
                 FWPM_FILTER_CONDITION0 {
                     fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
