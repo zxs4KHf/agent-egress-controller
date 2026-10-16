@@ -21,6 +21,8 @@ pub mod fixed;
 pub mod http;
 pub mod import;
 #[cfg(windows)]
+pub mod independent_launch;
+#[cfg(windows)]
 pub mod live;
 pub mod local_upstream;
 pub mod log;

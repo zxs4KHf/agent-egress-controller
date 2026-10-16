@@ -1,4 +1,8 @@
-param([string]$Dist = (Join-Path (Split-Path -Parent $PSScriptRoot) 'dist'), [string]$BaselineZip = '')
+param(
+    [string]$Dist = (Join-Path (Split-Path -Parent $PSScriptRoot) 'dist'),
+    [string]$BaselineZip = '',
+    [ValidateSet('0.5.2','0.5.4')][string]$BaselineVersion = '0.5.2'
+)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -132,13 +136,17 @@ try {
         }
     }
     if ($BaselineZip) {
-        if ((Get-FileHash -LiteralPath $BaselineZip).Hash -ne '70d4103d9e1879e3b1be084bb2243cf55a77e17bd895c76478ed5397ac197fdc') { throw 'Pinned 0.5.2 baseline hash mismatch' }
+        $baselineHashes=@{
+            '0.5.2'='70d4103d9e1879e3b1be084bb2243cf55a77e17bd895c76478ed5397ac197fdc'
+            '0.5.4'='a21c6f8f1242387c9e1d5a72072f0c6170d98550793e0b4d5c9457379f839330'
+        }
+        if ((Get-FileHash -LiteralPath $BaselineZip).Hash -ne $baselineHashes[$BaselineVersion]) { throw 'Pinned public baseline hash mismatch' }
         & {
             . (Get-UpdaterFunctions (Get-Content -LiteralPath $bootstrap -Raw -Encoding UTF8))
             $root=Join-Path $sandbox 'real-incremental'
             New-Item -ItemType Directory -Path $root | Out-Null
             Expand-Archive -LiteralPath $BaselineZip -DestinationPath $root
-            $target=Join-Path $root 'AgentEgressController-0.5.2-portable'
+            $target=Join-Path $root "AgentEgressController-$BaselineVersion-portable"
             Test-PackageIntegrity $target
             $manifestPath=Join-Path $Dist "aec-incremental-$version.json"
             Assert-ReleaseHash $manifestPath (Join-Path $Dist "SHA256INCREMENTAL-$version.txt")
@@ -162,7 +170,7 @@ try {
             if ((Get-IncrementalPlan $feed $target $false).DownloadBytes -ne 0) { throw 'Real no-op update downloads payload' }
             Restore-UpdateBackup $target $backup
             Test-PackageIntegrity $target
-            Write-Output "PASS: public 0.5.2 baseline -> $version incremental payload $script:payloadBytes bytes vs full ZIP $((Get-Item -LiteralPath $zip).Length); unchanged mihomo skipped; all file hashes, no-op and full rollback verified."
+            Write-Output "PASS: public $BaselineVersion baseline -> $version incremental payload $script:payloadBytes bytes vs full ZIP $((Get-Item -LiteralPath $zip).Length); unchanged mihomo skipped; all file hashes, no-op and full rollback verified."
         }
     }
     Write-Output 'Release upgrade compatibility passed. No real service or global setting was touched.'

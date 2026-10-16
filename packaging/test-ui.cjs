@@ -6,7 +6,8 @@ const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
 async function run() {
-  let child, browser, installation, url = process.argv[2];
+  let child, browser, page, installation, url = process.argv[2];
+  const transportFailures=[];
   if (!url) {
     installation=fs.mkdtempSync(path.join(os.tmpdir(),'aec-ui-qa-'));
     fs.copyFileSync(path.resolve('target/debug/examples/ui_preview.exe'),path.join(installation,'ui_preview.exe'));
@@ -16,7 +17,12 @@ async function run() {
   }
   try {
     browser=await chromium.launch({channel:'msedge',headless:true});
-    const page=await browser.newPage({viewport:{width:1100,height:780}});
+    page=await browser.newPage({viewport:{width:1100,height:780}});
+    // Diagnostics are confined to the synthetic installation; never capture user pages/tokens.
+    if(installation){
+      page.on('requestfailed',r=>transportFailures.push({path:new URL(r.url()).pathname,error:r.failure()?.errorText}));
+      page.on('response',r=>{if(r.status()>=400)transportFailures.push({path:new URL(r.url()).pathname,status:r.status()})});
+    }
     const errors=[];page.on('pageerror',e=>errors.push(e.message));
     await page.goto(url);const frame=id=>page.frameLocator('#'+id);
     page.on('dialog',dialog=>dialog.accept());
@@ -113,6 +119,19 @@ async function run() {
     await page.setViewportSize({width:600,height:780});await page.screenshot({path:path.join(screenshotDir,'compact.png')});
     assert.deepEqual(errors,[],'page JavaScript errors');
     console.log('UI passed: filters, pagination/full save, draft preservation, folding/search, two-way Agent toggle, live badge, authenticated navigation, scrollable targets, live resource switch without process restart; screenshots saved.');
+  } catch(error) {
+    if(installation&&page){
+      const dir=process.env.AEC_UI_SCREENSHOT_DIR||'.scratch/ui-qa';fs.mkdirSync(dir,{recursive:true});
+      const diagnostics={transportFailures:transportFailures.slice(-30),frames:[]};
+      for(const f of page.frames()){
+        try{diagnostics.frames.push({path:new URL(f.url()).pathname,body:(await f.locator('body').innerText({timeout:1500})).slice(0,3000)})}
+        catch{diagnostics.frames.push({unreadable:true})}
+      }
+      fs.writeFileSync(path.join(dir,'failure.json'),JSON.stringify(diagnostics,null,2));
+      await page.screenshot({path:path.join(dir,'failure.png'),timeout:5000}).catch(()=>{});
+      console.error('Isolated UI failure evidence:',JSON.stringify(diagnostics));
+    }
+    throw error;
   } finally {
     if(browser)await browser.close();
     if(child&&child.exitCode===null){const exited=new Promise(resolve=>child.once('exit',resolve));child.stdin.end('quit\n');await exited;}

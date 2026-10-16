@@ -472,6 +472,17 @@ fn real_core_switches_ordinary_upstreams_while_claude_remains_fail_closed() {
             "unavailable selected proxy must not silently fall back"
         );
         assert_eq!(request(m.ports.mixed, "claude.ai"), None);
+        set = upstream::plan(
+            &set,
+            &upstream::Command::Select {
+                name: "xxyun".into(),
+            },
+            m.ports,
+        )
+        .unwrap();
+        m.reload(&WindowsHost, &set.agent[0], &Creds).unwrap();
+        assert_eq!(request(m.ports.mixed, "chatgpt.com"), Some(b'X'));
+        assert_eq!(request(m.ports.mixed, "claude.ai"), None);
     });
     let down = m.down(&WindowsHost);
     stop.store(true, Ordering::Relaxed);

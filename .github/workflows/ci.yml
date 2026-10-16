@@ -43,6 +43,15 @@ jobs:
             powershell -NoProfile -ExecutionPolicy Bypass -File packaging/test-shell-identity.ps1 -ControlExe ./target/debug/aec-control.exe
             if ($LASTEXITCODE) { throw "Native shell check failed on iteration $_" }
           }
+      - name: Test packaged launch contract and updater dialog cancellation
+        shell: powershell
+        run: |
+          cargo build -p aec-core --example packaged_identity_probe --locked
+          if ($LASTEXITCODE) { throw 'Launch fixture build failed' }
+          ./packaging/test-packaged-launch.ps1 -ProbeExe ./target/debug/examples/packaged_identity_probe.exe
+          if ($LASTEXITCODE) { throw 'Launch contract failed' }
+          powershell -NoProfile -ExecutionPolicy Bypass -File packaging/test-updater-shell.ps1 -ReportPath "$env:RUNNER_TEMP/aec-updater-shell.txt"
+          if ($LASTEXITCODE) { throw 'Updater dialog identity/cancel failed' }
       - name: Diagnose native shell test failure
         if: failure()
         shell: powershell
@@ -64,6 +73,14 @@ jobs:
           $env:AEC_NODE_MODULES = Join-Path $deps 'node_modules'
           node packaging/test-ui.cjs
           if ($LASTEXITCODE) { throw 'UI interaction tests failed' }
+      - name: Preserve isolated UI diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: isolated-ui-failure-${{ github.run_id }}
+          path: .scratch/ui-qa/
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Install NSIS for installer smoke test
         run: choco install nsis --yes --no-progress
       - name: Test interactive installer compilation
@@ -100,19 +117,23 @@ jobs:
           $baseline = Join-Path $env:RUNNER_TEMP 'aec-baseline-0.5.2.zip'
           Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/zxs4KHf/agent-egress-controller/releases/download/v0.5.2/AgentEgressController-0.5.2-portable.zip' -OutFile $baseline
           ./packaging/test-release-upgrade.ps1 -BaselineZip $baseline
+          if ($LASTEXITCODE) { throw '0.5.2 upgrade compatibility failed' }
+          $recent = Join-Path $env:RUNNER_TEMP 'aec-baseline-0.5.4.zip'
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/zxs4KHf/agent-egress-controller/releases/download/v0.5.4/AgentEgressController-0.5.4-portable.zip' -OutFile $recent
+          ./packaging/test-release-upgrade.ps1 -BaselineZip $recent -BaselineVersion '0.5.4'
       - name: Upload release candidates
         uses: actions/upload-artifact@v4
         with:
-          name: AgentEgressController-0.5.4-windows
+          name: AgentEgressController-0.5.5-windows
           path: |
-            dist/AgentEgressController-0.5.4-portable.zip
-            dist/AgentEgressController-0.5.4-setup.exe
-            dist/SHA256SUMS-0.5.4.txt
-            dist/SHA256SETUP-0.5.4.txt
-            dist/aec-update-0.5.4.ps1
-            dist/SHA256UPDATER-0.5.4.txt
-            dist/aec-incremental-0.5.4.json
-            dist/SHA256INCREMENTAL-0.5.4.txt
-            dist/aec-0.5.4-*.zip
+            dist/AgentEgressController-0.5.5-portable.zip
+            dist/AgentEgressController-0.5.5-setup.exe
+            dist/SHA256SUMS-0.5.5.txt
+            dist/SHA256SETUP-0.5.5.txt
+            dist/aec-update-0.5.5.ps1
+            dist/SHA256UPDATER-0.5.5.txt
+            dist/aec-incremental-0.5.5.json
+            dist/SHA256INCREMENTAL-0.5.5.txt
+            dist/aec-0.5.5-*.zip
           if-no-files-found: error
           retention-days: 14

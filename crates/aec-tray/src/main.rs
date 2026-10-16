@@ -23,6 +23,18 @@ fn main() {
 
 #[cfg(windows)]
 fn main() {
+    match aec_core::independent_launch::enter() {
+        Ok(Some(code)) => std::process::exit(code),
+        Ok(None) => {}
+        Err(error) => {
+            win::message_box(std::ptr::null_mut(), &error, "Agent Egress 启动失败");
+            std::process::exit(1);
+        }
+    }
+    if let Err(error) = aec_core::shell_identity::initialize_tray_process() {
+        win::message_box(std::ptr::null_mut(), &error, "Agent Egress 启动失败");
+        std::process::exit(1);
+    }
     for arg in std::env::args().skip(1) {
         let operation = match arg.as_str() {
             "--enable-autostart" => Some(startup::set(true)),
@@ -718,6 +730,163 @@ mod tray {
             unsafe {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod menu_tests {
+        use super::*;
+        use aec_core::{core::CorePorts, local_upstream, profile::*, route_switch};
+
+        #[test]
+        fn native_menu_selects_clash_then_xxyun_without_changing_claude_protection() {
+            let mut profiles = ProfileSet::default();
+            profiles.agent[0].egress.fixed_exit = true;
+            profiles.agent[0].egress.expected.ip = Some("198.51.100.8".into());
+            profiles.agent[0].targets = vec![Target {
+                domain: "claude.ai".into(),
+                trace: true,
+            }];
+            profiles.agent[0].routing.outbounds.push(serde_json::from_value(serde_json::json!({"name":"xxyun","kind":"http","server":"127.0.0.1","port":7892})).unwrap());
+            profiles.agent[0].routing.final_target = "xxyun".into();
+            profiles = local_upstream::plan(
+                &profiles,
+                &local_upstream::Command::Save {
+                    name: "Clash".into(),
+                    host: "127.0.0.1".into(),
+                    port: 7890,
+                    protocol: UpstreamProto::Http,
+                },
+                CorePorts::default(),
+            )
+            .unwrap();
+            let original = profiles.agent[0].clone();
+            let switches = |set: &ProfileSet| {
+                aec_core::dashboard::view(set, "agent_ready", false, false, None)
+                    .switches
+                    .into_iter()
+                    .map(|c| (c.group, c.member, c.selected, c.fixed))
+                    .collect()
+            };
+            let shared = Arc::new(Mutex::new(Shared {
+                fixed_blocked: false,
+                mode: Mode::AgentReady,
+                busy: None,
+                configured: true,
+                entries: vec![],
+                switches: switches(&profiles),
+                has_report: false,
+                note: None,
+                summary: None,
+                clipboard: None,
+            }));
+            let (tx, rx) = channel();
+            let class = wide(&format!("AecMenuFixture-{}", std::process::id()));
+            let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(wndproc),
+                hInstance: instance,
+                lpszClassName: class.as_ptr(),
+                ..unsafe { std::mem::zeroed() }
+            };
+            assert_ne!(unsafe { RegisterClassW(&wc) }, 0);
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    0,
+                    class.as_ptr(),
+                    wide("Isolated AEC menu test").as_ptr(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    instance,
+                    std::ptr::null(),
+                )
+            };
+            assert!(!hwnd.is_null());
+            struct Cleanup(HWND, Vec<u16>, windows_sys::Win32::Foundation::HINSTANCE);
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    unsafe {
+                        DestroyWindow(self.0);
+                        UnregisterClassW(self.1.as_ptr(), self.2);
+                    }
+                }
+            }
+            let _cleanup = Cleanup(hwnd, class, instance);
+            UI.with(|cell| {
+                *cell.borrow_mut() = Some(Ui {
+                    hwnd,
+                    tx,
+                    shared: shared.clone(),
+                    layout: Layout {
+                        data_dir: "unused-fixture".into(),
+                        mihomo: "unused".into(),
+                        relay: "unused".into(),
+                    },
+                    icons: [std::ptr::null_mut(); 4],
+                    setup: None,
+                    _agent: None,
+                    taskbar_created: 0,
+                    quitting: false,
+                })
+            });
+            for desired in ["Clash", "xxyun"] {
+                let (menu, snapshot) = with_ui(|ui| ui.build_menu()).unwrap();
+                let index = snapshot
+                    .switches
+                    .iter()
+                    .position(|(g, m, _, _)| g == local_upstream::GROUP && m == desired)
+                    .unwrap();
+                let command = (ID_SWITCH_BASE + index) as u32;
+                let mut label = [0u16; 256];
+                let n = unsafe {
+                    GetMenuStringW(
+                        menu,
+                        command,
+                        label.as_mut_ptr(),
+                        label.len() as i32,
+                        MF_BYCOMMAND,
+                    )
+                };
+                assert!(String::from_utf16_lossy(&label[..n as usize]).contains(desired));
+                assert_eq!(
+                    unsafe { GetMenuState(menu, command, MF_BYCOMMAND) } & MF_GRAYED,
+                    0
+                );
+                unsafe {
+                    SendMessageW(hwnd, WM_COMMAND, command as usize, 0);
+                    DestroyMenu(menu);
+                }
+                let Cmd::Switch { group, member } =
+                    rx.recv_timeout(Duration::from_secs(1)).unwrap()
+                else {
+                    panic!("Menu did not dispatch a route selection")
+                };
+                assert_eq!(group, local_upstream::GROUP);
+                assert_eq!(member, desired);
+                profiles = route_switch::plan(&profiles, &route_switch::Form { group, member })
+                    .unwrap()
+                    .profiles;
+                assert_eq!(profiles.agent[0].targets, original.targets);
+                assert_eq!(profiles.agent[0].egress, original.egress);
+                assert_eq!(
+                    local_upstream::view(&profiles).selected.as_deref(),
+                    Some(desired)
+                );
+                shared.lock().unwrap().switches = switches(&profiles);
+                let (menu, _) = with_ui(|ui| ui.build_menu()).unwrap();
+                assert_ne!(
+                    unsafe { GetMenuState(menu, command, MF_BYCOMMAND) } & MF_CHECKED,
+                    0
+                );
+                unsafe {
+                    DestroyMenu(menu);
+                }
             }
         }
     }

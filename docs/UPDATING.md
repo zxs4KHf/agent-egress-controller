@@ -1,6 +1,8 @@
-# 升级到 0.5.4
+# 升级到 0.5.5
 
-下载入口：[v0.5.4 Release](https://github.com/zxs4KHf/agent-egress-controller/releases/tag/v0.5.4)。新版增加多个本机上游管理，沿用组件级增量下载：按本机文件哈希，只下载变化的组件，不是字节级二进制差分。上游管理等核心功能仍需完整程序更新，**仅更新界面不会安装这些功能**；核心更新仍需用户单独确认停服。
+下载入口：[v0.5.5 Release](https://github.com/zxs4KHf/agent-egress-controller/releases/tag/v0.5.5)。新版补齐独立启动链路与更新弹窗，保留多个本机上游管理和组件级增量下载：按本机文件哈希，只下载变化的组件，不是字节级二进制差分。启动链路、上游管理等核心功能仍需完整程序更新，**仅更新界面不会安装这些功能**；核心更新仍需用户单独确认停服。
+
+**0.5.3/0.5.4 用户的图标修复：** 原更新器可以增量升级，但当前弹窗仍由旧脚本创建。要让首次下载确认窗口也独立显示，先按下面「一次性更新器引导」校验并替换新版脚本，再从原托盘打开；复制脚本不需要停止网关。新版弹窗使用 AEC 图标，点击「继续」仅确认当前阶段；默认「取消」，关闭不授权停服。完整安装后仍需修复本安装快捷方式；旧的运行中进程不会被远程改变。
 
 | 当前版本 | 升级方式 |
 | --- | --- |
@@ -24,13 +26,13 @@
 0.5.1/0.5.2 的原脚本只认识完整 ZIP，新 Release 不能远程把旧程序变成增量更新器。原版 0.5.0 还存在包路径白名单限制（不认识图标/UI/中文说明），因此必须引导。不关闭校验、不改写旧 Release。
 
 1. 关闭正在运行的更新检查窗口。无需为了复制脚本停止网络服务。
-2. 从同一个 v0.5.4 Release 下载 `aec-update-0.5.4.ps1` 和 `SHA256UPDATER-0.5.4.txt`。这份脚本与完整 ZIP 里的 `aec-update.ps1` 字节一致。
+2. 从同一个 v0.5.5 Release 下载 `aec-update-0.5.5.ps1` 和 `SHA256UPDATER-0.5.5.txt`。这份脚本与完整 ZIP 里的 `aec-update.ps1` 字节一致。
 3. 在下载目录打开 PowerShell，核对 SHA256。下面只校验，不运行下载的脚本：
 
    ```powershell
-   $actual = (Get-FileHash -LiteralPath '.\aec-update-0.5.4.ps1' -Algorithm SHA256).Hash
-   $line = Get-Content -LiteralPath '.\SHA256UPDATER-0.5.4.txt' -Raw
-   if ($line.Trim() -notmatch '^([a-fA-F0-9]{64})\s+\*?aec-update-0\.5\.4\.ps1$') { throw '校验文件格式错误' }
+   $actual = (Get-FileHash -LiteralPath '.\aec-update-0.5.5.ps1' -Algorithm SHA256).Hash
+   $line = Get-Content -LiteralPath '.\SHA256UPDATER-0.5.5.txt' -Raw
+   if ($line.Trim() -notmatch '^([a-fA-F0-9]{64})\s+\*?aec-update-0\.5\.5\.ps1$') { throw '校验文件格式错误' }
    if ($actual -ne $Matches[1]) { throw 'SHA256 不匹配，不要安装' }
    'SHA256 核对通过'
    ```

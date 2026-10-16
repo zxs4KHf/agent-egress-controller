@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/aec-core", "crates/aec-dev", "crates/aec-tray", "crates/aec-control"]
 
 [workspace.package]
-version = "0.5.4"
+version = "0.5.5"
 edition = "2021"
 license = "GPL-3.0-only"
 publish = false
@@ -37,6 +37,7 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_Memory",
   "Win32_System_Registry",
   "Win32_System_Threading",
+  "Win32_Storage_Packaging_Appx",
   "Win32_System_Time",
   "Win32_UI_WindowsAndMessaging",
 ] }

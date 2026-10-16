@@ -180,7 +180,9 @@ function Start-Process { throw 'TEST MUST NEVER START A REAL SERVICE' }
         [IO.File]::WriteAllText((Join-Path $install 'docs/test.md'),'old-doc')
         if ($case.Name -eq 'cancel-core') { [IO.File]::WriteAllText((Join-Path $install 'aec-tray.exe'),'old-tray') }
         $runner=Join-Path $install 'test-entry.ps1'
-        $prefix='param([string]$Assets,[string]$Scenario)' + "`n" + '$CurrentPid=1; $CurrentVersion="8.0.0"; $DataDir=Join-Path $PSScriptRoot "data"; [switch]$UiOnly=$false; $SelfTest=$false; $ResumeAgent=$false; $OpenDashboard=$false' + "`n"
+        # Keep the production entry's launch marker: a packaged Agent really re-executes this
+        # isolated script, including these I/O overrides, before any update operation.
+        $prefix='param([string]$Assets,[string]$Scenario,[switch]$IndependentLaunch)' + "`n" + '$CurrentPid=1; $CurrentVersion="8.0.0"; $DataDir=Join-Path $PSScriptRoot "data"; [switch]$UiOnly=$false; $SelfTest=$false; $ResumeAgent=$false; $OpenDashboard=$false' + "`n"
         [IO.File]::WriteAllText($runner,($prefix + $definitions + "`n" + $overrides + "`n" + $entry),[Text.UTF8Encoding]::new($true))
         & powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Assets $assets -Scenario $case.Name | Out-Null
         $expectedExit=if ($case.Status -eq 'failed') {1} else {0}

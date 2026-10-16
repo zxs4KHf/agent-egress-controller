@@ -18,6 +18,14 @@ public static class AecWindowProperties {
  [DllImport("shell32.dll")] static extern int SHGetPropertyStoreForWindow(IntPtr hwnd, ref Guid iid, out Store store);
  [DllImport("ole32.dll")] static extern int PropVariantClear(ref Value value);
  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+ [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr OpenProcess(uint access,bool inherit,uint pid);
+ [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+ [DllImport("kernel32.dll",CharSet=CharSet.Unicode)] static extern int GetPackageFullName(IntPtr process,ref uint length,System.Text.StringBuilder name);
+ public static bool IsUnpackaged(uint pid) {
+  var process=OpenProcess(0x1000,false,pid);
+  if(process==IntPtr.Zero)throw new System.ComponentModel.Win32Exception();
+  try {uint length=0; return GetPackageFullName(process,ref length,null)==15700;} finally {CloseHandle(process);}
+ }
  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr hwnd, System.Text.StringBuilder title, int length);
  [DllImport("user32.dll", SetLastError=true)] static extern bool PostMessage(IntPtr hwnd, uint message, IntPtr wParam, IntPtr lParam);
  public static void CloseVerified(IntPtr hwnd, uint expectedProcessId) {
@@ -78,7 +86,7 @@ $window = $null
 $failure = $null
 try {
     if (-not $ExistingWindow) {
-        if ([Diagnostics.Process]::GetProcessesByName('aec-control').Count) { throw 'Close no user windows: a control center already exists; use -ExistingWindow to inspect it.' }
+        if (@([Diagnostics.Process]::GetProcessesByName('aec-control') | Where-Object {$_.Path -eq $ControlExe}).Count) { throw 'A control center from this exact installation already exists; use -ExistingWindow to inspect it.' }
         # Deterministically stop between requests, not merely while AcceptTcpClient is blocked.
         # The old fixture threw on its next Accept and terminated the entire PowerShell host.
         1..10 | ForEach-Object {
@@ -113,7 +121,11 @@ try {
     } while ([DateTime]::UtcNow -lt $deadline)
     if ($matches.Count -ne 1) { throw 'Exactly one matching control window is required.' }
     $window = $matches[0]
-    if ($owned -and $window.Id -ne $owned.Id) { throw 'The observed window is not the test-owned process.' }
+    if ($owned -and $window.Id -ne $owned.Id) {
+        $parent=(Get-CimInstance Win32_Process -Filter ('ProcessId = '+$window.Id)).ParentProcessId
+        if($parent -ne $owned.Id) {throw 'The window is neither the test-owned process nor its independent child'}
+    }
+    if(-not [AecWindowProperties]::IsUnpackaged($window.Id)) {throw 'HOST_IDENTITY_INHERITED: native control window still belongs to a packaged host'}
     $appId = [AecWindowProperties]::Read($window.MainWindowHandle,5)
     Write-Output 'Shell test: reading native application window properties.'
     if ($appId -ne 'AgentEgress.Controller') { throw 'Taskbar identity regression: window has no independent AgentEgress.Controller ID.' }
@@ -131,7 +143,7 @@ try {
         if ($owned.MainModule.FileName -ne $ControlExe) { throw 'Test process identity changed; refusing to close.' }
         # Keep the exact verified HWND instead of re-selecting a main window during cleanup.
         if ($window) {
-            [AecWindowProperties]::CloseVerified($window.MainWindowHandle, $owned.Id)
+            [AecWindowProperties]::CloseVerified($window.MainWindowHandle, $window.Id)
         } else {
             throw ('No verified application window to close safely. Original check: '+$failure)
         }
@@ -139,4 +151,4 @@ try {
     }
 }
 if ($failure) { throw $failure }
-Write-Output 'PASS: real control window has independent taskbar ID, own icon, and token-free dashboard relaunch; any test-owned window exited normally.'
+Write-Output 'PASS: real control window is unpackaged, has independent taskbar ID, own icon, and token-free dashboard relaunch; any test-owned window exited normally.'

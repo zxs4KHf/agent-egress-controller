@@ -9,7 +9,9 @@
 
 ## 决策
 
-控制中心在展示 UI 前设置进程标识，再设置窗口级 `AgentEgress.Controller`，确保窗口覆盖宿主身份。标识不含版本号，升级保留分组。窗口配置自己的图标、显示名和无令牌重开命令；只有全部成功才显示。看板 .lnk 使用同一 ID；只启动托盘的 .lnk 使用 `AgentEgress.Tray`，避免任务栏误选一个只启动托盘而不打开看板的入口。
+控制中心在展示 UI 前设置进程标识，再设置窗口级 `AgentEgress.Controller`。标识不含版本号，升级保留分组。窗口配置自己的图标、显示名和无令牌重开命令；只有全部成功才显示。看板 .lnk 使用同一 ID；只启动托盘的 .lnk 使用 `AgentEgress.Tray`，避免任务栏误选一个只启动托盘而不打开看板的入口。
+
+**0.5.5 修正：** 窗口属性不能单独证明已摆脱启动宿主的包身份。0.5.4 实机读回窗口 ID 正确，但 `GetPackageFullName` 仍返回 Codex 包，用户仍观察到合组。启动链路的独立包身份检查与修复见 [ADR-0018](0018-independent-desktop-launch.md)，本 ADR 不再声称窗口 ID 足以覆盖包身份。
 
 快捷方式通过 Windows 原生 IShellLinkW/IPropertyStore 写入，与安装包共用实现。先核对整批入口的目标与参数，再写入；不同安装、自定义参数或文件符号链接拒绝覆盖。维护命令 `aec-control.exe --create-shortcuts [all|desktop|start-menu]` 只创建/修复当前安装入口，不启动网络 Worker、不读出口密码。
 

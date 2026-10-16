@@ -24,6 +24,73 @@ use ::windows::Win32::UI::Shell::{
 pub const CONTROL_APP_ID: &str = "AgentEgress.Controller";
 pub const TRAY_APP_ID: &str = "AgentEgress.Tray";
 
+/// The presentation singleton is scoped to its installation. An isolated test/install must never
+/// focus or close another installation's authenticated window. The gateway remains a singleton.
+pub fn control_mutex_name(exe: &Path) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in crate::paths::strip_verbatim(exe)
+        .to_string_lossy()
+        .to_lowercase()
+        .bytes()
+    {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+    }
+    format!("Local\\AgentEgressControl-{hash:016x}")
+}
+
+pub fn find_control_window(exe: &Path) -> isize {
+    use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowTextW, GetWindowThreadProcessId,
+    };
+    struct Search {
+        expected: String,
+        found: isize,
+    }
+    unsafe extern "system" fn visit(hwnd: HWND, data: LPARAM) -> i32 {
+        let search = &mut *(data as *mut Search);
+        let mut title = [0u16; 128];
+        let n = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
+        if n <= 0 || String::from_utf16_lossy(&title[..n as usize]) != "Agent Egress Controller" {
+            return 1;
+        }
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return 1;
+        }
+        let mut path = vec![0u16; 32768];
+        let mut size = path.len() as u32;
+        let read = QueryFullProcessImageNameW(process, 0, path.as_mut_ptr(), &mut size);
+        CloseHandle(process);
+        if read != 0
+            && String::from_utf16_lossy(&path[..size as usize]).to_lowercase() == search.expected
+        {
+            search.found = hwnd as isize;
+            0
+        } else {
+            1
+        }
+    }
+    let mut search = Search {
+        expected: crate::paths::strip_verbatim(exe)
+            .to_string_lossy()
+            .to_lowercase(),
+        found: 0,
+    };
+    unsafe { EnumWindows(Some(visit), &mut search as *mut Search as isize) };
+    search.found
+}
+
+pub fn initialize_tray_process() -> Result<(), String> {
+    unsafe { SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(TRAY_APP_ID)) }
+        .map_err(|e| format!("设置托盘任务栏标识失败：{}", e.code()))
+}
+
 pub fn initialize_control_process() -> Result<(), String> {
     unsafe { SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(CONTROL_APP_ID)) }
         .map_err(|e| format!("设置控制中心任务栏标识失败：{}", e.code()))
@@ -47,7 +114,7 @@ fn set_string(
     }
 }
 
-/// Set a window-level override before showing it. This also overrides inherited packaged-host IDs.
+/// Set window identity before showing it; independent_launch must first clear host package identity.
 /// The HWND is supplied by the caller's own window; no other application's window is modified.
 pub fn configure_control_window(hwnd: isize, control_exe: &Path) -> Result<(), String> {
     let control_exe = crate::paths::strip_verbatim(control_exe);

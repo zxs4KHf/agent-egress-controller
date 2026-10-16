@@ -23,8 +23,6 @@ fn main() {
 
 #[cfg(windows)]
 fn main() {
-    use std::ptr::null;
-
     use tao::dpi::LogicalSize;
     use tao::event::{Event, WindowEvent};
     use tao::event_loop::{ControlFlow, EventLoop};
@@ -33,12 +31,29 @@ fn main() {
     use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
     use windows_sys::Win32::System::Threading::CreateMutexW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, MessageBoxW, PostMessageW, SetForegroundWindow, ShowWindow, MB_ICONWARNING,
-        MB_OK, SW_RESTORE, SW_SHOW, WM_CLOSE,
+        MessageBoxW, PostMessageW, SetForegroundWindow, ShowWindow, MB_ICONWARNING, MB_OK,
+        SW_RESTORE, SW_SHOW, WM_CLOSE,
     };
     use wry::{WebContext, WebViewBuilder};
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    match aec_core::independent_launch::enter() {
+        Ok(Some(code)) => std::process::exit(code),
+        Ok(None) => {}
+        Err(error) => {
+            show_error(&error);
+            std::process::exit(1);
+        }
+    }
+    let args: Vec<String> = aec_core::independent_launch::arguments()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let executable = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(_) => {
+            show_error("无法定位控制中心程序");
+            return;
+        }
+    };
     // Maintenance entry point changes only owned shortcuts, never starts the network worker.
     if args.first().is_some_and(|arg| arg == "--create-shortcuts") {
         use aec_core::shell_identity::{create_shortcuts, ShortcutScope};
@@ -60,8 +75,8 @@ fn main() {
         return;
     }
     if args.first().is_some_and(|arg| arg == "--quit") {
-        let title = wide("Agent Egress Controller");
-        let hwnd = unsafe { FindWindowW(null(), title.as_ptr()) };
+        let hwnd = aec_core::shell_identity::find_control_window(&executable)
+            as windows_sys::Win32::Foundation::HWND;
         if !hwnd.is_null() {
             unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
         }
@@ -82,15 +97,15 @@ fn main() {
         .map(|port| format!("http://127.0.0.1:{port}/"))
         .expect("validated loopback URL has a port");
 
-    let mutex_name = wide("Local\\AgentEgressControllerControlWindow");
+    let mutex_name = wide(&aec_core::shell_identity::control_mutex_name(&executable));
     let mutex = unsafe { CreateMutexW(std::ptr::null(), 1, mutex_name.as_ptr()) };
     if mutex.is_null() {
         show_error("无法创建桌面控制中心。");
         return;
     }
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        let title = wide("Agent Egress Controller");
-        let hwnd = unsafe { FindWindowW(null(), title.as_ptr()) };
+        let hwnd = aec_core::shell_identity::find_control_window(&executable)
+            as windows_sys::Win32::Foundation::HWND;
         if !hwnd.is_null() {
             unsafe {
                 ShowWindow(hwnd, SW_RESTORE);
