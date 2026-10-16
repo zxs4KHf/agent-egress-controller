@@ -44,6 +44,24 @@ fn wfp_persistent_rules_block_bypass_and_ipv6_even_after_engine_exit() {
             .unwrap()
             .success()
     };
+    let udp_probe = |port| {
+        let udp = UdpSocket::bind(("127.0.0.1", port)).unwrap();
+        udp.set_read_timeout(Some(Duration::from_millis(800)))
+            .unwrap();
+        let echo = std::thread::spawn(move || {
+            let mut b = [0; 16];
+            if let Ok((n, source)) = udp.recv_from(&mut b) {
+                udp.send_to(&b[..n], source).unwrap();
+            }
+        });
+        let result = std::process::Command::new(&fixture)
+            .args(["udp", &format!("127.0.0.1:{port}")])
+            .status()
+            .unwrap()
+            .success();
+        echo.join().unwrap();
+        result
+    };
     assert!(
         probe(other.local_addr().unwrap()),
         "Baseline wrong-port connection must work before protection"
@@ -52,9 +70,13 @@ fn wfp_persistent_rules_block_bypass_and_ipv6_even_after_engine_exit() {
         probe(ipv6.local_addr().unwrap()),
         "Baseline IPv6 connection must work before protection"
     );
+    let port = allowed.local_addr().unwrap().port();
+    assert!(
+        udp_probe(port),
+        "Baseline UDP echo must work before protection"
+    );
     let engine = Engine::open_test(&sid, &scope, true)
         .expect("Real WFP test needs administrator privileges");
-    let port = allowed.local_addr().unwrap().port();
     assert_eq!(
         engine
             .apply(port, &[fixture.to_string_lossy().into_owned()])
@@ -76,24 +98,10 @@ fn wfp_persistent_rules_block_bypass_and_ipv6_even_after_engine_exit() {
     assert!(!probe(ipv6.local_addr().unwrap()), "IPv6 must be blocked");
     // Parent/application not selected: independent connectivity remains available.
     assert!(std::net::TcpStream::connect(other.local_addr().unwrap()).is_ok());
-    let udp = UdpSocket::bind(("127.0.0.1", port)).unwrap();
-    udp.set_read_timeout(Some(Duration::from_millis(800)))
-        .unwrap();
-    let echo = std::thread::spawn(move || {
-        let mut b = [0; 16];
-        if let Ok((n, source)) = udp.recv_from(&mut b) {
-            udp.send_to(&b[..n], source).unwrap();
-        }
-    });
     assert!(
-        !std::process::Command::new(&fixture)
-            .args(["udp", &format!("127.0.0.1:{port}")])
-            .status()
-            .unwrap()
-            .success(),
+        !udp_probe(port),
         "UDP cannot use the allowed TCP port as a bypass"
     );
-    echo.join().unwrap();
     drop(engine);
     assert!(
         !probe(other.local_addr().unwrap()),

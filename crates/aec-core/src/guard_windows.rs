@@ -181,9 +181,20 @@ impl Engine {
         Ok(engine)
     }
     fn filter_keys(&self) -> Result<Vec<GUID>, String> {
+        let mut keys = Vec::new();
+        for layer in [
+            FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+            FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+        ] {
+            keys.extend(self.layer_filter_keys(layer)?);
+        }
+        Ok(keys)
+    }
+    fn layer_filter_keys(&self, layer: GUID) -> Result<Vec<GUID>, String> {
         let mut provider = self.provider;
         let mut template: FWPM_FILTER_ENUM_TEMPLATE0 = unsafe { std::mem::zeroed() };
         template.providerKey = &mut provider;
+        template.layerKey = layer;
         template.enumType = FWP_FILTER_ENUM_FULLY_CONTAINED;
         template.actionMask = u32::MAX;
         let mut enumeration = null_mut();
