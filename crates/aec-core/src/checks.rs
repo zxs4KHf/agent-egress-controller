@@ -488,7 +488,7 @@ fn dns_path(input: &CheckInput, mark: Option<u64>) -> CheckResult {
                 let mut r = if !wrong.is_empty() {
                     CheckResult::new("G3", Kind::Hard, Status::Fail, Some("wrong_group"))
                 } else if !missing.is_empty() {
-                    CheckResult::new("G3", Kind::Hard, Status::Fail, Some("no_domain_record"))
+                    CheckResult::new("G3", Kind::Hard, Status::Unknown, Some("no_domain_record"))
                 } else if !uncertain.is_empty() {
                     CheckResult::new(
                         "G3",
@@ -503,7 +503,7 @@ fn dns_path(input: &CheckInput, mark: Option<u64>) -> CheckResult {
                     r = r.with("core log", w);
                 }
                 for m in missing {
-                    r = r.with("core log", format!("no connection to {m} by name: the client did not hand the host name to the core"));
+                    r = r.with("core log", format!("no new domain connection evidence for {m} in this run; connection reuse or incomplete observation cannot prove local DNS use"));
                 }
                 for e in evidence {
                     r = r.with("core log", e);
@@ -1705,6 +1705,18 @@ mod tests {
     fn g3(observer: Option<&dyn CoreObserver>) -> CheckResult {
         let r = run_full(&profile(), &healthy(), Ok(()), observer);
         get(&r, "G3").clone()
+    }
+
+    #[test]
+    fn missing_domain_records_are_unknown_not_proof_of_dns_leakage() {
+        let mut log = good_log();
+        log.records.clear();
+        let result = g3(Some(&log));
+        assert_eq!(result.status, Status::Unknown);
+        assert!(result
+            .evidence
+            .iter()
+            .all(|e| !e.detail.contains("client did not hand")));
     }
 
     #[test]

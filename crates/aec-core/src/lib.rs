@@ -18,6 +18,8 @@ pub mod desktop;
 pub mod diagnostics;
 pub mod entries;
 pub mod fixed;
+#[cfg(windows)]
+pub mod guard_windows;
 pub mod http;
 pub mod import;
 #[cfg(windows)]
@@ -31,6 +33,7 @@ pub mod paths;
 pub mod probe;
 pub mod profile;
 pub mod prompts;
+pub mod protection;
 pub mod providers;
 pub mod relay;
 pub mod route_switch;

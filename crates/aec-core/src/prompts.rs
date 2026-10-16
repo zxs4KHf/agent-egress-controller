@@ -325,7 +325,10 @@ pub fn for_restore(item: &RestoreItem, ctx: &PromptContext) -> Option<String> {
     let what = match item.status {
         RestoreStatus::Failed => "恢复失败",
         RestoreStatus::Conflict => "恢复冲突：退出时发现该值已被其他程序改过，本应用没有覆盖它",
-        RestoreStatus::Restored | RestoreStatus::DryRun | RestoreStatus::LeftOpen => return None,
+        RestoreStatus::Restored
+        | RestoreStatus::DryRun
+        | RestoreStatus::LeftOpen
+        | RestoreStatus::PreservedExternal => return None,
     };
     let background = format!("我在 Windows 本机使用 Agent Egress Controller，退出 Agent 模式时「{}」{what}。请帮我判断现在应该保留当前值，还是恢复到进入前的值。", item.item);
     let evidence = redact(&format!("- 恢复记录: {}\n", item.detail), ctx.mask_ip);

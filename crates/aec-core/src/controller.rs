@@ -156,6 +156,8 @@ pub enum RestoreStatus {
     DryRun,
     /// Somebody else changed the value after we did; left as it is.
     Conflict,
+    /// The user selected another system proxy during this session; preserving it completes exit.
+    PreservedExternal,
     Failed,
     /// Deliberately left to the user (a CLI session); reported, not a failure.
     LeftOpen,
@@ -1111,6 +1113,11 @@ impl<P: Platform> Controller<P> {
                         status: RestoreStatus::Restored,
                         detail: "already back to the snapshot value".into(),
                     },
+                    Ok(GlobalValue::SystemProxy { .. }) => RestoreItem {
+                        item: name,
+                        status: RestoreStatus::PreservedExternal,
+                        detail: "保留你后来选择的系统代理；AEC 已交还控制，不覆盖该选择".into(),
+                    },
                     Ok(now) => RestoreItem {
                         item: name,
                         status: RestoreStatus::Conflict,
@@ -1893,6 +1900,31 @@ mod tests {
         assert_eq!(out.gate.state, GateState::Closed);
         assert!(out.gate.reasons.iter().any(|r| r.contains("AIEgressGuard")));
         assert!(c.platform().writes.borrow().is_empty());
+    }
+
+    #[test]
+    fn exit_to_daily_keeps_the_users_new_proxy_without_an_extra_acknowledgement() {
+        let d = tmp("proxy-exit-daily");
+        let mut c = open(FakePlatform::new(), &d, true);
+        c.enter(&system_scope(), EnterOptions::default()).unwrap();
+        let proxy = ProxySettings {
+            flags: proxy_flags::DIRECT | proxy_flags::PROXY,
+            proxy_server: Some("127.0.0.1:7897".into()),
+            bypass: None,
+            auto_config_url: None,
+        };
+        c.platform().host.borrow_mut().proxy = proxy.clone();
+        c.keep_system_proxy();
+        let report = c.exit().unwrap();
+        assert_eq!(
+            report.mode_after,
+            Mode::Daily,
+            "An external proxy choice is not a failed restoration"
+        );
+        assert_eq!(c.platform().host.borrow().proxy, proxy);
+        assert!(c.state().journal.is_empty());
+        assert!(c.state().unacknowledged_restore_failures.is_empty());
+        assert!(!c.platform().core_running.get());
     }
 
     #[test]

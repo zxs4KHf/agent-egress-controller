@@ -105,7 +105,14 @@ jobs:
           New-Item -ItemType Directory -Path runtime/bin -Force | Out-Null
           Copy-Item -LiteralPath $exe -Destination runtime/bin/aec-mihomo.exe
       - name: Test pinned core and loopback relay chain
-        run: cargo test -- --include-ignored
+        run: cargo test -- --include-ignored --skip wfp_persistent_rules_block_bypass_and_ipv6_even_after_engine_exit
+      - name: Test Windows application enforcement on temporary probe only
+        shell: powershell
+        run: |
+          cargo build -p aec-core --example guard_probe --locked
+          if ($LASTEXITCODE) { throw 'WFP probe build failed' }
+          cargo test -p aec-core --test wfp_guard -- --include-ignored
+          if ($LASTEXITCODE) { throw 'WFP enforcement failed' }
       - name: Build portable package and installer
         shell: powershell
         run: ./packaging/build-portable.ps1

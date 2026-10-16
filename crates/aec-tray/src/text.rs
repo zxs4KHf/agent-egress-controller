@@ -30,7 +30,7 @@ pub fn check_label(id: &str) -> String {
     match base {
         "G1" => "出口 IP 与本机直连不同".into(),
         "G2" => format!("目标站点 {arg} 可达且走同一出口"),
-        "G3" => "DNS 查询由内核代办（不经本机 DNS）".into(),
+        "G3" => "域名交给 AEC，且连接遵循分流".into(),
         "G4" => "系统时区与浏览器时区符合设置".into(),
         "G5" => format!("浏览器 {arg} 的语言符合设置"),
         "G6" => "系统代理指向本程序".into(),
@@ -86,7 +86,7 @@ pub fn summary(report: &CheckReport) -> String {
     let bad: Vec<String> = hard
         .iter()
         .filter(|r| r.status != Status::Pass)
-        .map(|r| format!("{} {}", r.id, status_label(r.status)))
+        .map(|r| format!("{} {}", check_label(&r.id), status_label(r.status)))
         .collect();
     if bad.is_empty() {
         format!("硬门槛 {} 项全部通过", hard.len())
@@ -140,6 +140,12 @@ pub fn restore_summary(r: &RestoreReport) -> String {
             left.join("、")
         ));
     }
+    if r.items
+        .iter()
+        .any(|i| i.status == RestoreStatus::PreservedExternal)
+    {
+        s.push_str(" 保留你后来选择的系统代理，未覆盖其他客户端的开关。");
+    }
     s
 }
 
@@ -181,6 +187,9 @@ mod tests {
         assert!(t.find("[通过] G1").unwrap() > hard_at);
         assert!(t.find("[未通过] G2:claude.ai  目标站点 claude.ai").unwrap() < soft_at);
         assert!(t.find("[注意] R2").unwrap() > soft_at);
-        assert_eq!(summary(&rep), "没通过：G2:claude.ai 未通过");
+        assert_eq!(
+            summary(&rep),
+            "没通过：目标站点 claude.ai 可达且走同一出口 未通过"
+        );
     }
 }

@@ -120,7 +120,12 @@ fn main() {
     let window = match WindowBuilder::new()
         .with_visible(false)
         .with_window_icon(
-            tao::window::Icon::from_rgba(aec_core::brand::rgba(64, (15, 118, 110)), 64, 64).ok(),
+            tao::window::Icon::from_rgba(
+                aec_core::brand::rgba(64, aec_core::brand::APP_COLOR),
+                64,
+                64,
+            )
+            .ok(),
         )
         .with_title("Agent Egress Controller")
         .with_inner_size(LogicalSize::new(1100.0, 780.0))
