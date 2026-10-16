@@ -331,8 +331,22 @@ impl Engine {
             data: sd.pointer.cast(),
         };
         for path in apps {
+            // Windows TEMP can contain 8.3 aliases (RUNNER~1). The ALE identity uses the
+            // normalized executable path, not the spelling used to start CreateProcess.
+            let resolved = std::path::Path::new(path)
+                .canonicalize()
+                .map_err(|_| "GUARD_APPLICATION_UNREADABLE")?;
+            let resolved = crate::paths::strip_verbatim(&resolved)
+                .to_string_lossy()
+                .into_owned();
+            if self.testing {
+                eprintln!(
+                    "[DEBUG-wfp-0616] canonical_path_changed={}",
+                    !path.eq_ignore_ascii_case(&resolved)
+                );
+            }
             let mut app = null_mut();
-            check(unsafe { FwpmGetAppIdFromFileName0(wide(path).as_ptr(), &mut app) })?;
+            check(unsafe { FwpmGetAppIdFromFileName0(wide(&resolved).as_ptr(), &mut app) })?;
             let _app = Allocation(app.cast());
             let mut common = vec![
                 FWPM_FILTER_CONDITION0 {
