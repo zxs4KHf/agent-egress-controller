@@ -63,6 +63,8 @@ MCP 使用官方 2025-11-25 JSON-RPC 生命周期与 newline-delimited stdio tra
 
 只有包含本功能的新核心才提供以下工具；UI 热更不能给旧核心增加能力：
 
+0.5.8 的 `aec_configure` 支持 `{"clientCooperation":true}`，仅日常模式可保存；同时关闭 AEC 系统接管选项，不改当前 Windows 系统代理。旧配置缺字段默认 false，不能通过 UI 热更升级能力。`aec_state` 返回 `clientCooperation` 和 G7 `scopeEvidence`；协作状态也返回 `systemProxyTakeover`。协作启动不要求先打开 Clash 开关，但日常浏览器要经过 Clash 入口才受规则覆盖。关闭开关是保护失效，重新开启必须重新核对。G7 的 unknown 不能用内部 ISP pass 或历史规则报告覆盖。
+
 | 工具 | 参数 | 边界 |
 | --- | --- | --- |
 | `aec_cooperation` | `{}` | 生成只含受保护站点的局部脚本；`status:export_only`，不是安装/激活/验证 |
@@ -78,6 +80,8 @@ MCP 使用官方 2025-11-25 JSON-RPC 生命周期与 newline-delimited stdio tra
 不存在 Agent **浏览器环境应用/强制确认**工具。用户在看板查看影响浏览器、排除项、原值与目标后确认，或取消。修改选项会使当前 UI 计划失效；过期、旧 planId、外部策略变化与机器策略冲突均拒绝。全局范围不写 Chrome / Chrome for Testing；如指纹浏览器使用 Edge，不能应用全局范围。不要依据独立 user-data-dir 推断注册表策略隔离。
 
 协作规则安装的授权与浏览器确认门不同：已获用户明确授权选定站点范围后，Agent 可预览/安装精确 planId。自定义脚本、共享/全局脚本、路径逃逸、未知版本、GUI DNS 接管、文件变化均拒绝。只操作标准 CVR 数据目录的已注册脚本，不接受 Agent 提供文件路径、端口、secret 或任意 JS。安装后由用户在 Clash 官方界面手动重新激活；AEC 不提供自动 PUT/重载接口。修改站点后先撤销旧块再预览；取消确认不写文件。
+
+CVR 默认 named pipe 控制通道也可核对，不要为了 AEC 开启 TCP controller。只读取白名单路径，进程或生成配置变化会拒绝旧通道。固定范围只取用户的站点列表；旧列表如含 GPT，不能未经确认删除或声称 GPT 已不受管。升级程序、选择工作方式、安装持久规则和 Clash 激活是四个独立步骤，不能只完成第一步就报告现场已修复。
 
 看板使用 `POST /cooperation?t=<页面令牌>` 与精确 Origin，action 为 state/preview/install（planId）/restore/verify/dns_probe（consent）。Agent 使用同名 MCP/鉴权 HTTP 工具；两者共用串行 Worker。未知字段，包括 state/restore 中的 force，均拒绝。`cooperation-error.json` 保存动作、静态错误码和时间；`cooperation-runtime.json`、`cooperation-dns.json` 保存有作用域/时间的报告。关闭提示仍可查；API 不可用时 Agent 可离线只读这些 JSON，不要上传配置或调用更新来代替排查。
 

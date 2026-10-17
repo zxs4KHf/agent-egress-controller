@@ -134,6 +134,8 @@ pub struct SetupView {
     pub targets: String,
     pub extra_domains: String,
     pub system_proxy: bool,
+    #[serde(default)]
+    pub client_cooperation: bool,
     pub max_inflight: u32,
     pub connect_timeout_ms: u32,
     pub dial_budget_ms: u32,
@@ -202,6 +204,9 @@ pub struct ExitForm {
     pub extra_domains: String,
     #[serde(default)]
     pub system_proxy: bool,
+    /// Older pages preserve the existing topology instead of silently disabling it.
+    #[serde(default)]
+    pub client_cooperation: Option<bool>,
     /// Zero keeps the current value.
     #[serde(default)]
     pub max_inflight: u32,
@@ -261,6 +266,7 @@ pub struct ViewInput<'a> {
     pub stored_user: Option<&'a str>,
     pub tunnel_password_stored: bool,
     pub takeover_enabled: bool,
+    pub client_cooperation: bool,
     pub locked: bool,
 }
 
@@ -358,6 +364,7 @@ pub fn view(set: &ProfileSet, input: &ViewInput) -> SetupView {
         targets: lines(p.targets.iter().map(|t| t.domain.clone()).collect()),
         extra_domains: lines(extra),
         system_proxy: p.proxy_scope.mode == ProxyScopeMode::SystemAndExplicit,
+        client_cooperation: input.client_cooperation,
         max_inflight: p.egress.relay.max_inflight,
         connect_timeout_ms: p.egress.relay.connect_timeout_ms,
         dial_budget_ms: p.egress.relay.dial_budget_ms,
@@ -663,6 +670,9 @@ pub fn apply(
     };
     let ip = form.expected_ip.trim();
     p.egress.expected.ip = (!ip.is_empty()).then(|| ip.to_string());
+    if form.client_cooperation == Some(true) {
+        p.egress.fixed_exit = true;
+    }
     let (_, _, windows_id, iana) = tz.expect("checked");
     p.locale.timezone.windows_id = (*windows_id).into();
     p.locale.timezone.iana = (*iana).into();
@@ -716,6 +726,15 @@ pub fn apply_settings(
     form: &ExitForm,
     previous: crate::controller::Settings,
 ) -> Result<crate::controller::Settings, Vec<FieldError>> {
+    let cooperation = form
+        .client_cooperation
+        .unwrap_or(previous.client_cooperation);
+    if cooperation && form.system_proxy {
+        return Err(vec![err(
+            "clientCooperation",
+            "站点协作与 AEC 系统代理接管只能选择一种；协作时保留 Clash 的系统代理",
+        )]);
+    }
     let port = match form.core_mixed_port.as_deref().map(str::trim) {
         None => previous.core_mixed_port,
         Some("" | "0") => None,
@@ -752,6 +771,7 @@ pub fn apply_settings(
     Ok(crate::controller::Settings {
         takeover_enabled: form.takeover_enabled,
         core_mixed_port: port,
+        client_cooperation: cooperation,
     })
 }
 
@@ -811,15 +831,10 @@ pub trait SetupBackend: Send + Sync {
         let Some(view) = self.dashboard().filter(|view| view.fixed_exit) else {
             return serde_json::json!({"available":false,"code":"COOP_FIXED_EXIT_REQUIRED","runtimeVerified":false});
         };
-        let Some(port) = crate::fixed::ingress_port(&crate::core::CorePorts::default()) else {
-            return serde_json::json!({"available":false,"code":"COOP_PORT_INVALID","runtimeVerified":false});
-        };
-        match crate::cooperation::client_script(&crate::cooperation::Selection {
-            domains: view.form.sites.clone(),
-            fixed_port: port,
-        }) {
+        let selection = crate::cooperation::Selection::for_sites(view.form.sites);
+        match crate::cooperation::client_script(&selection) {
             Ok(script) => serde_json::json!({
-                "available":true,"domains":view.form.sites,"fixedPort":port,"script":script,
+                "available":true,"domains":selection.domains,"fixedPort":selection.fixed_port,"script":script,
                 "runtimeVerified":false,"persistentInstalled":null,"installedByAec":false,"status":"export_only",
                 "message":"仅生成局部订阅脚本，未修改或重载客户端；安装后仍需核对运行规则与固定身份。"
             }),
@@ -1350,6 +1365,7 @@ mod tests {
             targets: String::new(),
             extra_domains: String::new(),
             system_proxy: false,
+            client_cooperation: None,
             max_inflight: 0,
             connect_timeout_ms: 0,
             dial_budget_ms: 0,
@@ -1362,6 +1378,7 @@ mod tests {
             stored_user: user,
             tunnel_password_stored: false,
             takeover_enabled: true,
+            client_cooperation: false,
             locked: false,
         }
     }
@@ -1371,6 +1388,7 @@ mod tests {
         let previous = crate::controller::Settings {
             takeover_enabled: false,
             core_mixed_port: Some(27893),
+            client_cooperation: false,
         };
         let mut json = serde_json::to_value(form()).unwrap();
         for (value, expected) in [
@@ -1401,6 +1419,39 @@ mod tests {
         let mut i = input(None);
         i.core_mixed_port = previous.core_mixed_port;
         assert_eq!(view(&ProfileSet::default(), &i).core_mixed_port, "27893");
+    }
+
+    #[test]
+    fn cooperation_settings_preserve_old_forms_and_refuse_two_system_proxy_owners() {
+        let previous = crate::controller::Settings {
+            client_cooperation: true,
+            ..Default::default()
+        };
+        let mut f = form();
+        assert!(
+            apply_settings(&f, previous).unwrap().client_cooperation,
+            "old pages preserve topology"
+        );
+        f.system_proxy = true;
+        assert!(
+            apply_settings(&f, previous).is_err(),
+            "no ambiguous dual ownership"
+        );
+        f.system_proxy = false;
+        f.client_cooperation = Some(true);
+        f.expected_ip = "198.51.100.7".into();
+        let mut profiles = ProfileSet::default();
+        apply(&mut profiles, &f, None, false).unwrap();
+        assert!(
+            profiles.agent[0].egress.fixed_exit,
+            "cooperation must use an identity gate"
+        );
+        assert_eq!(
+            profiles.agent[0].proxy_scope.mode,
+            ProxyScopeMode::ExplicitOnly
+        );
+        f.client_cooperation = Some(false);
+        assert!(!apply_settings(&f, previous).unwrap().client_cooperation);
     }
     #[test]
     fn a_form_becomes_one_candidate_per_port_with_one_credential() {

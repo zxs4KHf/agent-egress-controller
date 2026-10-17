@@ -179,6 +179,8 @@ pub struct Shared {
     pub has_report: bool,
     pub note: Option<Note>,
     pub summary: Option<String>,
+    pub scope_evidence: Option<aec_core::checks::CheckResult>,
+    pub client_cooperation: bool,
     /// Text for the UI thread to put on the clipboard: only a window-owned clipboard accepts data.
     pub clipboard: Option<String>,
 }
@@ -198,6 +200,7 @@ fn agent_profile(data_dir: &Path) -> AgentProfile {
 pub struct Worker {
     _session: aec_core::store::SessionLease,
     last_fixed_probe: std::time::Instant,
+    last_cooperation_probe: std::time::Instant,
     layout: Layout,
     controller: Controller<LivePlatform>,
     shared: SharedRef,
@@ -222,6 +225,7 @@ impl Worker {
         let w = Self {
             _session: session,
             last_fixed_probe: std::time::Instant::now(),
+            last_cooperation_probe: std::time::Instant::now(),
             layout,
             controller,
             shared,
@@ -254,6 +258,7 @@ impl Worker {
         {
             let mut s = self.shared.lock().expect("lock");
             s.mode = self.controller.state().mode;
+            s.client_cooperation = self.controller.settings().client_cooperation;
             s.fixed_blocked = p.egress.fixed_exit && !self.controller.platform().fixed_verified();
             s.busy = busy;
             s.configured = profile::validate(&set).is_empty();
@@ -263,6 +268,12 @@ impl Worker {
                 .map(|e| (e.id().to_string(), text::entry_label(e)))
                 .collect();
             s.has_report = self.controller.state().last_report.is_some();
+            s.scope_evidence = self
+                .controller
+                .state()
+                .last_report
+                .as_ref()
+                .and_then(|report| report.results.iter().find(|r| r.id == "G7").cloned());
             s.switches = p
                 .routing
                 .groups
@@ -361,50 +372,75 @@ impl Worker {
         let data_dir = self.layout.data_dir.clone();
         match cmd {
             Cmd::Cooperation(command, done) => {
-                let result = (|| {
-                    use aec_core::cooperation::{Command, RuntimeHost};
-                    let set = load_set(&data_dir);
-                    let profile = set.agent.first().ok_or("COOP_FIXED_EXIT_REQUIRED")?;
-                    if !profile.egress.fixed_exit
-                        && !matches!(&command, Command::State | Command::Restore)
-                    {
-                        return Err("COOP_FIXED_EXIT_REQUIRED");
-                    }
-                    let selection = aec_core::cooperation::Selection {
-                        domains: profile.targets.iter().map(|t| t.domain.clone()).collect(),
-                        fixed_port: aec_core::fixed::ingress_port(
-                            &aec_core::core::CorePorts::default(),
-                        )
-                        .ok_or("COOP_PORT_INVALID")?,
-                    };
-                    let root = aec_core::cooperation::windows::client_root()?;
-                    if matches!(&command, Command::Preview | Command::Install { .. }) {
-                        let runtime = aec_core::cooperation::windows::ClientRuntime::open(&root)?;
-                        let config = runtime.get("/configs")?;
-                        if config["mode"].as_str() != Some("rule") {
-                            return Err("COOP_CLIENT_NOT_RULE_MODE");
-                        }
-                        if [
-                            "mixed-port",
-                            "port",
-                            "socks-port",
-                            "redir-port",
-                            "tproxy-port",
-                        ]
-                        .iter()
-                        .any(|key| config[*key].as_u64() == Some(u64::from(selection.fixed_port)))
+                let result =
+                    (|| {
+                        use aec_core::cooperation::{Command, RuntimeHost};
+                        let set = load_set(&data_dir);
+                        let profile = set.agent.first().ok_or("COOP_FIXED_EXIT_REQUIRED")?;
+                        if !profile.egress.fixed_exit
+                            && !matches!(&command, Command::State | Command::Restore)
                         {
-                            return Err("COOP_PROXY_LOOP");
+                            return Err("COOP_FIXED_EXIT_REQUIRED");
                         }
-                    }
-                    aec_core::cooperation::Manager::new(&data_dir, &root)
-                        .execute(command, &selection)
-                })()
-                .map_err(|code| {
-                    aec_core::cooperation::record_failure(&data_dir, code);
-                    field_error(code.into())
-                });
+                        let selection = aec_core::cooperation::Selection::for_profile(profile);
+                        let verify = matches!(&command, Command::Verify);
+                        let root = aec_core::cooperation::windows::client_root()?;
+                        if matches!(&command, Command::Preview | Command::Install { .. }) {
+                            let runtime =
+                                aec_core::cooperation::windows::ClientRuntime::open(&root)?;
+                            let config = runtime.get("/configs")?;
+                            if config["mode"].as_str() != Some("rule") {
+                                return Err("COOP_CLIENT_NOT_RULE_MODE");
+                            }
+                            if [
+                                "mixed-port",
+                                "port",
+                                "socks-port",
+                                "redir-port",
+                                "tproxy-port",
+                            ]
+                            .iter()
+                            .any(|key| {
+                                config[*key].as_u64() == Some(u64::from(selection.fixed_port))
+                            }) {
+                                return Err("COOP_PROXY_LOOP");
+                            }
+                        }
+                        let mut result = aec_core::cooperation::Manager::new(&data_dir, &root)
+                            .execute(command, &selection)?;
+                        if verify {
+                            self.controller
+                                .observe_cooperation(profile)
+                                .map_err(|_| "COOP_STATE_WRITE_FAILED")?;
+                        }
+                        if let Some(value) = result.as_object_mut() {
+                            value.insert(
+                                "clientCooperation".into(),
+                                self.controller.settings().client_cooperation.into(),
+                            );
+                            value.insert(
+                                "systemProxyTakeover".into(),
+                                self.controller.enabled(profile).system_proxy.into(),
+                            );
+                            value.insert(
+                                "scopeEvidence".into(),
+                                serde_json::to_value(
+                                    self.controller.state().last_report.as_ref().and_then(
+                                        |report| report.results.iter().find(|r| r.id == "G7"),
+                                    ),
+                                )
+                                .map_err(|_| "COOP_STATE_INVALID")?,
+                            );
+                        }
+                        Ok(result)
+                    })()
+                    .map_err(|code| {
+                        aec_core::cooperation::record_failure(&data_dir, code);
+                        field_error(code.into())
+                    });
                 let _ = done.send(result);
+                self.write_report();
+                self.publish(None);
             }
             Cmd::Upstream(command, done) => {
                 let result = self.change_upstream(command).map_err(field_error);
@@ -606,13 +642,21 @@ impl Worker {
             Some(KeepOutcome::Changed { found }) => self.note(
                 "系统代理发生冲突",
                 &format!(
-                    "检测到系统代理被改为 {found}，已撤销就绪状态；本程序不会与其他程序争写。请关闭另一代理客户端的「系统代理」开关（可保留内核并切换节点），不要同时启用 VPN/TUN/全局代理。具体步骤见托盘菜单「代理冲突说明」，处理后退出并重新进入 Agent 模式。"
+                    "检测到系统代理被改为 {found}，当前是 AEC 接管兼容模式，已撤销就绪；AEC 不会抢写。若要保留 Clash 系统代理，请在出口设置改用「站点协作」并安装、激活选定站点规则，不要靠反复开关混用。若继续 AEC 接管模式，另一客户端仅运行本地上游。具体步骤见托盘「代理冲突说明」。"
                 ),
                 true,
             ),
             Some(KeepOutcome::Failed(e)) => self.note("系统代理巡检失败", &e, true),
         }
         let p = agent_profile(&self.layout.data_dir);
+        if self.last_cooperation_probe.elapsed() >= std::time::Duration::from_secs(5) {
+            match self.controller.observe_cooperation(&p) {
+                Ok(true) => self.publish(Some("系统代理协作证据已变化，请查看 G7 站点协作范围")),
+                Err(e) => self.note("站点协作巡检未完成", &e.message, true),
+                _ => {}
+            }
+            self.last_cooperation_probe = std::time::Instant::now();
+        }
         if p.egress.fixed_exit
             && matches!(
                 self.controller.state().mode,
@@ -624,7 +668,8 @@ impl Worker {
                 platform: self.controller.platform(),
                 profile: &p,
             });
-            let refresh_unverified = needs_refresh(&poll, self.controller.state().mode);
+            let refresh_unverified = !self.controller.settings().client_cooperation
+                && needs_refresh(&poll, self.controller.state().mode);
             match poll {
                 FixedPoll::Healthy => {}
                 FixedPoll::Recovered => {
@@ -1082,6 +1127,7 @@ impl Backend {
                 stored_user: user.as_deref(),
                 tunnel_password_stored: tunnel_stored,
                 takeover_enabled: settings.takeover_enabled,
+                client_cooperation: settings.client_cooperation,
                 locked,
             },
         )
@@ -1184,6 +1230,8 @@ impl SetupBackend for Backend {
             s.summary,
         );
         view.autostart = crate::startup::enabled();
+        view.client_cooperation = Settings::load(&self.data_dir).client_cooperation;
+        view.scope_evidence = s.scope_evidence;
         Some(view)
     }
     fn startup(&self, enabled: bool) -> Result<(), Vec<FieldError>> {

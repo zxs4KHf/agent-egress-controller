@@ -154,6 +154,7 @@ impl aec_core::setup::SetupBackend for Panel {
                 stored_user: None,
                 tunnel_password_stored: false,
                 takeover_enabled: false,
+                client_cooperation: false,
                 locked: false,
             },
         )
@@ -209,6 +210,26 @@ fn panel_http_uses_the_same_commands_and_rejects_missing_origin_and_unknown_fiel
         r#"{"action":"select","name":"Clash","force":true}"#,
     );
     assert!(reply.contains("\"ok\":false"));
+}
+
+#[test]
+fn cooperation_uses_only_explicit_selected_sites_even_when_fixed_exit_is_enabled() {
+    let mut set = configured();
+    let profile = &mut set.agent[0];
+    assert!(profile.egress.fixed_exit);
+    profile.targets = vec![aec_core::profile::Target {
+        domain: "claude.ai".into(),
+        trace: false,
+    }];
+    let selection = aec_core::cooperation::Selection::for_profile(profile);
+    assert_eq!(selection.domains, ["claude.ai"]);
+    assert_eq!(selection.fixed_port, 17328);
+    profile.targets[0].domain = "custom.example.com".into();
+    assert_eq!(
+        aec_core::cooperation::Selection::for_profile(profile).domains,
+        ["custom.example.com"],
+        "cooperation must not widen user-approved domains to any AI service family"
+    );
 }
 
 #[test]

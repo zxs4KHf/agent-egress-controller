@@ -253,6 +253,94 @@ fn running_rule_evidence_uses_real_pinned_api_without_claiming_dns_or_endpoint_p
 }
 
 #[test]
+#[ignore = "requires pinned mihomo; isolated Windows named-pipe controller"]
+fn default_windows_pipe_controller_reads_rules_with_tcp_controller_disabled() {
+    use cooperation::{windows::ControllerChannel, RuntimeHost};
+    let fixed = Proxy::start(b'F');
+    let ordinary = Proxy::start(b'O');
+    let selection = Selection {
+        domains: vec!["claude.ai".into(), "anthropic.com".into()],
+        fixed_port: fixed.port,
+    };
+    let core = Core::new(52000);
+    let pipe = format!(
+        r"\\.\pipe\aec-test-{}",
+        aec_core::crypto::random_hex(12).unwrap()
+    );
+    let yaml = cooperation::prepare(&ordinary_config(ordinary.port), &selection)
+        .unwrap()
+        .candidate_yaml()
+        + &format!("\nexternal-controller-pipe: '{pipe}'\n");
+    core.start(&yaml);
+    // The extra TCP endpoint belongs only to CoreManager's isolated lifecycle. The
+    // client-facing generated config matches CVR's default: pipe, no TCP, no secret.
+    let root = core.0.data_dir.join("client");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("clash-verge.yaml"),
+        format!("external-controller: ''\nexternal-controller-pipe: '{pipe}'\n"),
+    )
+    .unwrap();
+    let channel = ControllerChannel::open(&root).unwrap_or_else(|e| {
+        panic!("Default Windows pipe must be usable without enabling TCP: {e}")
+    });
+    assert_eq!(channel.get("/version").unwrap()["version"], "v1.19.31");
+    let evidence = cooperation::verify_runtime(&channel, &selection);
+    assert_eq!(evidence["rules"], "pass", "{evidence}");
+    assert_eq!(evidence["runtimeVerified"], false);
+    assert_eq!(request(core.0.ports.mixed, "claude.ai"), Some(b'F'));
+    assert_eq!(request(core.0.ports.mixed, "google.com"), Some(b'O'));
+    let mut system = aec_core::model::ProxySettings {
+        flags: aec_core::model::proxy_flags::DIRECT | aec_core::model::proxy_flags::PROXY,
+        proxy_server: Some(format!("127.0.0.1:{}", core.0.ports.mixed)),
+        bypass: Some("<local>;localhost;127.*;10.*;192.168.*;172.16.*".into()),
+        auto_config_url: None,
+    };
+    let scope = cooperation::scope_check(&channel, &selection, &system);
+    assert_eq!(
+        scope.reason.as_deref(),
+        Some("cooperation_endpoint_dns_unverified")
+    );
+    system.flags = aec_core::model::proxy_flags::DIRECT;
+    let off = cooperation::scope_check(&channel, &selection, &system);
+    assert_eq!(off.status, aec_core::checks::Status::Fail);
+    system.flags |= aec_core::model::proxy_flags::PROXY;
+    system.bypass = Some("*".into());
+    let bypass = cooperation::scope_check(&channel, &selection, &system);
+    assert_eq!(
+        bypass.reason.as_deref(),
+        Some("cooperation_proxy_bypass_unverified")
+    );
+    system.bypass = Some("claude.ai".into());
+    assert_eq!(
+        cooperation::scope_check(&channel, &selection, &system)
+            .reason
+            .as_deref(),
+        Some("cooperation_proxy_bypass_unverified")
+    );
+    system.bypass = None;
+    system.proxy_server = Some(format!("127.0.0.1:{}", ordinary.port));
+    assert_eq!(
+        cooperation::scope_check(&channel, &selection, &system)
+            .reason
+            .as_deref(),
+        Some("cooperation_system_proxy_bypassed")
+    );
+    // Re-enabling the same verified entry requires fresh rule evidence, never a stale pass.
+    system.proxy_server = Some(format!("127.0.0.1:{}", core.0.ports.mixed));
+    assert_eq!(
+        cooperation::scope_check(&channel, &selection, &system).status,
+        aec_core::checks::Status::Unknown
+    );
+    assert!(channel.get("/configs?bad=1").is_err());
+    assert!(channel
+        .get("/dns/query?name=bad HTTP/1.1\r\n.test.dnscheck.tools&type=TXT")
+        .is_err());
+    std::fs::write(root.join("clash-verge.yaml"), "external-controller: ''\n").unwrap();
+    assert_eq!(channel.get("/version").unwrap_err(), "COOP_RUNTIME_CHANGED");
+}
+
+#[test]
 fn planning_refuses_to_forward_the_client_back_to_its_own_listener() {
     let current = ordinary_config(7890) + "\nmixed-port: 7897\n";
     assert!(
@@ -265,6 +353,79 @@ fn planning_refuses_to_forward_the_client_back_to_its_own_listener() {
         )
         .is_err(),
         "A client-to-itself proxy loop must not be generated"
+    );
+}
+
+#[test]
+fn cooperation_rechecks_rules_after_system_proxy_is_reenabled() {
+    use aec_core::{
+        checks::Status,
+        model::{proxy_flags, ProxySettings},
+    };
+    use std::cell::Cell;
+    struct Client {
+        installed: Cell<bool>,
+        reads: Cell<usize>,
+    }
+    impl cooperation::RuntimeHost for Client {
+        fn get(&self, path: &str) -> Result<serde_json::Value, &'static str> {
+            self.reads.set(self.reads.get() + 1);
+            Ok(match path {
+                "/configs" => serde_json::json!({"mixed-port":7897,"mode":"rule"}),
+                "/proxies" if self.installed.get() => {
+                    serde_json::json!({"proxies":{"AEC-MANAGED-FIXED":{"type":"Http"}}})
+                }
+                "/proxies" => serde_json::json!({"proxies":{}}),
+                "/rules" => serde_json::json!({"rules":[
+                    {"type":"AND","payload":"((DomainSuffix,claude.ai) && (Network,udp))","proxy":"REJECT"},
+                    {"type":"DomainSuffix","payload":"claude.ai","proxy":"AEC-MANAGED-FIXED"}
+                ]}),
+                _ => return Err("UNEXPECTED_READ"),
+            })
+        }
+    }
+    let client = Client {
+        installed: Cell::new(true),
+        reads: Cell::new(0),
+    };
+    let selection = Selection::for_sites(vec!["claude.ai".into()]);
+    let mut system = ProxySettings {
+        flags: proxy_flags::DIRECT,
+        proxy_server: Some("127.0.0.1:7897".into()),
+        bypass: None,
+        auto_config_url: None,
+    };
+    // Starting AEC before Clash's switch is allowed, but cannot be called protected.
+    assert_eq!(
+        cooperation::scope_check(&client, &selection, &system).status,
+        Status::Fail
+    );
+    assert_eq!(client.reads.get(), 0);
+    system.flags |= proxy_flags::PROXY;
+    assert_eq!(
+        cooperation::scope_check(&client, &selection, &system)
+            .reason
+            .as_deref(),
+        Some("cooperation_endpoint_dns_unverified")
+    );
+    system.flags = proxy_flags::DIRECT;
+    assert_eq!(
+        cooperation::scope_check(&client, &selection, &system).status,
+        Status::Fail
+    );
+    client.installed.set(false); // Subscription changed while the system switch was off.
+    system.flags |= proxy_flags::PROXY;
+    let result = cooperation::scope_check(&client, &selection, &system);
+    assert_eq!(result.status, Status::Fail);
+    assert_eq!(
+        result.reason.as_deref(),
+        Some("cooperation_rules_missing_or_changed")
+    );
+    client.installed.set(true);
+    assert_eq!(
+        cooperation::scope_check(&client, &selection, &system).status,
+        Status::Unknown,
+        "matching rules are fresh evidence, never proof of browser-wide fixed exit/DNS"
     );
 }
 

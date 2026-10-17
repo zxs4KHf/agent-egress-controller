@@ -2,6 +2,7 @@
 <div class="eyebrow">PROXY COOPERATION</div><h1>保留系统代理，单独维护固定站点</h1><div class="breadcrumbs"><a href="/dashboard?t=__TOKEN__" data-nav="dashboard" data-icon="back">返回看板</a><a href="/setup?t=__TOKEN__" data-nav="setup" data-icon="settings">出口与环境设置</a></div>
 <p class="lead">普通网站继续由当前系统代理自动分流；只有明确选定的站点转交 AEC 固定 ISP。GPT 不绑定某家代理，Arena 和独立指纹浏览器不自动纳入。</p>
 <div class="callout warning"><b>局部脚本导出不代表已安装或已保护</b><p>AEC 不循环抢回系统代理，也不因“生成成功”就显示固定出口、DNS 或浏览器环境全部通过。客户端挂载、激活及运行规则核对仍是单独步骤，不能自动覆盖已有订阅脚本。</p></div>
+<section><h2>开关与启动顺序</h2><p>在出口设置选择“站点协作”，同时关闭 AEC 的系统代理接管选项。进入 Agent 模式与打开 Clash 系统代理的先后顺序不限；要让日常浏览器经过规则，Clash 系统代理须保持开启。</p><p>关闭 Clash 系统代理后浏览器会绕过其规则，需要代理的普通网站可能不通，固定站点也不再受此入口保护。AEC 不会抢回开关；重新开启后 G7 重新读取入口和规则，不使用旧的通过结果。此方案没有系统级强制阻断绕过能力。</p><p>Clash Verge Rev 2.5.8 默认 named pipe 可直接核对，不需要额外开启 TCP controller。当前规则没有 AEC-MANAGED-FIXED 时，Claude 固定转发尚未生效。普通 IP 检测网页遵循 Clash 原规则，不能用它的 IP 判断所有站点出口。</p></section>
 <section><h2>所选站点的连接路径</h2><p>浏览器 → 当前系统代理客户端 → AEC 固定专用入口 → 原 ISP。其他网站继续走客户端原规则，不需要反复更换系统代理端口。</p><ol>
 <li>在支持的 Clash Verge Rev 中保留系统代理开关，使用规则模式。全局/直连模式会绕开域名规则；TUN、裸 IP 和其他绕过路径不能按这份脚本声称已保护。</li>
 <li>在 AEC 看板维护受保护站点，并填写原固定 ISP 的精确预期 IP。不要把 <code>cloud.ai</code> 当作 <code>claude.ai</code> 自动加入。</li>

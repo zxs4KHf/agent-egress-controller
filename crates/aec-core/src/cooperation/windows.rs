@@ -7,6 +7,32 @@ use windows_sys::Win32::Storage::FileSystem::{
     GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW, VS_FIXEDFILEINFO,
 };
 
+#[path = "pipe.rs"]
+mod pipe;
+
+enum Endpoint {
+    Pipe(String),
+    Tcp { port: u16, secret: String },
+}
+
+fn read_path(path: &str) -> bool {
+    matches!(path, "/configs" | "/rules" | "/proxies" | "/version")
+        || path
+            .strip_prefix("/dns/query?name=")
+            .and_then(|s| s.strip_suffix(".test.dnscheck.tools&type=TXT"))
+            .is_some_and(|nonce| nonce.len() == 8 && nonce.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+fn pipe_name(name: &str) -> bool {
+    name.strip_prefix(r"\\.\pipe\").is_some_and(|tail| {
+        !tail.is_empty()
+            && tail.len() <= 200
+            && tail
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    })
+}
+
 pub fn client_root() -> Result<PathBuf, &'static str> {
     std::env::var_os("APPDATA")
         .map(|p| PathBuf::from(p).join("io.github.clash-verge-rev.clash-verge-rev"))
@@ -47,36 +73,112 @@ fn supported_gui(exe: &Path) -> bool {
             && info.dwFileVersionLS >> 16 == 8
     }
 }
-pub struct ClientRuntime {
-    port: u16,
-    secret: String,
+/// A read-only, identity-bound channel from a trusted local generated configuration.
+/// Client-specific adapters must additionally validate their supported application/version.
+pub struct ControllerChannel {
+    endpoint: Endpoint,
     pid: u32,
     identity: (String, u64),
     file: PathBuf,
     hash: String,
 }
-impl ClientRuntime {
+impl ControllerChannel {
     pub fn open(root: &Path) -> Result<Self, &'static str> {
         let file = root.join("clash-verge.yaml");
         let config = super::client::yaml(&file)?;
-        let endpoint = config["external-controller"]
+        // CVR's default controller is an OS-authenticated pipe. Never enable TCP to use it.
+        let (endpoint, pid) = if let Some(name) = config["external-controller-pipe"]
             .as_str()
-            .ok_or("COOP_CONTROLLER_DISABLED")?;
-        let address = endpoint
-            .parse::<std::net::SocketAddr>()
-            .map_err(|_| "COOP_CONTROLLER_NOT_IPV4_LOOPBACK")?;
-        if address.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-            || address.port() == 0
+            .filter(|s| !s.is_empty())
         {
-            return Err("COOP_CONTROLLER_NOT_IPV4_LOOPBACK");
+            if !pipe_name(name) {
+                return Err("COOP_CONTROLLER_PIPE_INVALID");
+            }
+            let connection = pipe::Connection::open(name)?;
+            (Endpoint::Pipe(name.into()), connection.pid()?)
+        } else {
+            let endpoint = config["external-controller"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .ok_or("COOP_CONTROLLER_DISABLED")?;
+            let address = endpoint
+                .parse::<std::net::SocketAddr>()
+                .map_err(|_| "COOP_CONTROLLER_NOT_IPV4_LOOPBACK")?;
+            if address.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                || address.port() == 0
+            {
+                return Err("COOP_CONTROLLER_NOT_IPV4_LOOPBACK");
+            }
+            let owner = crate::windows::WindowsHost
+                .listener_owner(address.port())
+                .map_err(|_| "COOP_CONTROLLER_OWNER_UNKNOWN")?
+                .ok_or("COOP_CONTROLLER_OWNER_UNKNOWN")?;
+            let secret = config["secret"]
+                .as_str()
+                .filter(|s| !s.is_empty() && s.len() <= 1024 && !s.contains(['\r', '\n']))
+                .ok_or("COOP_CONTROLLER_AUTH_UNAVAILABLE")?
+                .to_owned();
+            (
+                Endpoint::Tcp {
+                    port: address.port(),
+                    secret,
+                },
+                owner.pid,
+            )
+        };
+        let identity =
+            crate::core::process::process_identity(pid).ok_or("COOP_CONTROLLER_OWNER_UNKNOWN")?;
+        Ok(Self {
+            endpoint,
+            pid,
+            identity,
+            file: file.clone(),
+            hash: crate::crypto::sha256_file(&file).map_err(|_| "COOP_FILE_UNAVAILABLE")?,
+        })
+    }
+}
+impl RuntimeHost for ControllerChannel {
+    fn get(&self, path: &str) -> Result<Value, &'static str> {
+        if !read_path(path) {
+            return Err("COOP_READ_PATH_INVALID");
         }
-        let owner = crate::windows::WindowsHost
-            .listener_owner(address.port())
-            .map_err(|_| "COOP_CONTROLLER_OWNER_UNKNOWN")?
-            .ok_or("COOP_CONTROLLER_OWNER_UNKNOWN")?;
-        let identity = crate::core::process::process_identity(owner.pid)
-            .ok_or("COOP_CONTROLLER_OWNER_UNKNOWN")?;
-        let path = PathBuf::from(&identity.0);
+        if crate::core::process::process_identity(self.pid).as_ref() != Some(&self.identity)
+            || crate::crypto::sha256_file(&self.file).ok().as_ref() != Some(&self.hash)
+        {
+            return Err("COOP_RUNTIME_CHANGED");
+        }
+        let (status, body) = match &self.endpoint {
+            Endpoint::Pipe(name) => {
+                let connection = pipe::Connection::open(name)?;
+                if connection.pid()? != self.pid {
+                    return Err("COOP_RUNTIME_CHANGED");
+                }
+                connection.get(path)?
+            }
+            Endpoint::Tcp { port, secret } => {
+                let owner = crate::windows::WindowsHost
+                    .listener_owner(*port)
+                    .map_err(|_| "COOP_CONTROLLER_OWNER_UNKNOWN")?
+                    .ok_or("COOP_CONTROLLER_OWNER_UNKNOWN")?;
+                if owner.pid != self.pid {
+                    return Err("COOP_RUNTIME_CHANGED");
+                }
+                crate::core::process::http_get_local(*port, path, Some(secret))
+                    .map_err(|_| "COOP_CONTROLLER_READ_FAILED")?
+            }
+        };
+        if status != 200 {
+            return Err("COOP_CONTROLLER_READ_FAILED");
+        }
+        serde_json::from_str(&body).map_err(|_| "COOP_CONTROLLER_REPLY_INVALID")
+    }
+}
+
+pub struct ClientRuntime(ControllerChannel);
+impl ClientRuntime {
+    pub fn open(root: &Path) -> Result<Self, &'static str> {
+        let channel = ControllerChannel::open(root)?;
+        let path = PathBuf::from(&channel.identity.0);
         if !path.file_name().is_some_and(|n| {
             n.eq_ignore_ascii_case("verge-mihomo.exe")
                 || n.eq_ignore_ascii_case("verge-mihomo-alpha.exe")
@@ -90,45 +192,11 @@ impl ClientRuntime {
         if !supported_gui(&gui) {
             return Err("COOP_CLIENT_VERSION_UNSUPPORTED");
         }
-        let secret = config["secret"]
-            .as_str()
-            .filter(|s| !s.is_empty() && s.len() <= 1024 && !s.contains(['\r', '\n']))
-            .ok_or("COOP_CONTROLLER_AUTH_UNAVAILABLE")?
-            .to_owned();
-        Ok(Self {
-            port: address.port(),
-            secret,
-            pid: owner.pid,
-            identity,
-            file: file.clone(),
-            hash: crate::crypto::sha256_file(&file).map_err(|_| "COOP_FILE_UNAVAILABLE")?,
-        })
+        Ok(Self(channel))
     }
 }
 impl RuntimeHost for ClientRuntime {
     fn get(&self, path: &str) -> Result<Value, &'static str> {
-        if !matches!(path, "/configs" | "/rules" | "/proxies" | "/version")
-            && !(path.starts_with("/dns/query?name=")
-                && path.ends_with(".test.dnscheck.tools&type=TXT"))
-        {
-            return Err("COOP_READ_PATH_INVALID");
-        }
-        let owner = crate::windows::WindowsHost
-            .listener_owner(self.port)
-            .map_err(|_| "COOP_CONTROLLER_OWNER_UNKNOWN")?
-            .ok_or("COOP_CONTROLLER_OWNER_UNKNOWN")?;
-        if owner.pid != self.pid
-            || crate::core::process::process_identity(self.pid).as_ref() != Some(&self.identity)
-            || crate::crypto::sha256_file(&self.file).ok().as_ref() != Some(&self.hash)
-        {
-            return Err("COOP_RUNTIME_CHANGED");
-        }
-        let (status, body) =
-            crate::core::process::http_get_local(self.port, path, Some(&self.secret))
-                .map_err(|_| "COOP_CONTROLLER_READ_FAILED")?;
-        if status != 200 {
-            return Err("COOP_CONTROLLER_READ_FAILED");
-        }
-        serde_json::from_str(&body).map_err(|_| "COOP_CONTROLLER_REPLY_INVALID")
+        self.0.get(path)
     }
 }

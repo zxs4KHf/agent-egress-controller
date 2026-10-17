@@ -61,13 +61,29 @@ mod evidence;
 #[cfg(windows)]
 #[path = "cooperation/windows.rs"]
 pub mod windows;
-pub use evidence::{evaluate_dns, probe_fixed_dns, verify_runtime, RuntimeHost};
+pub use evidence::{evaluate_dns, probe_fixed_dns, scope_check, verify_runtime, RuntimeHost};
 
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Selection {
     pub domains: Vec<String>,
     pub fixed_port: u16,
+}
+
+impl Selection {
+    /// The exact user-approved scope used by the tray, export and runtime checks.
+    /// Never inherit internal Claude-family protection or infer additional AI domains.
+    pub fn for_profile(profile: &crate::profile::AgentProfile) -> Self {
+        let domains: Vec<String> = profile.targets.iter().map(|t| t.domain.clone()).collect();
+        Self::for_sites(domains)
+    }
+    pub fn for_sites(domains: Vec<String>) -> Self {
+        Self {
+            domains,
+            fixed_port: crate::fixed::ingress_port(&crate::core::CorePorts::default())
+                .expect("default fixed ingress"),
+        }
+    }
 }
 
 pub struct Plan {

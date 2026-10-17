@@ -349,6 +349,30 @@ fn fault(e: impl std::fmt::Display, code: &str) -> Fault {
 }
 
 impl Platform for LivePlatform {
+    fn cooperation_check(&self, profile: &AgentProfile) -> checks::CheckResult {
+        let result = (|| {
+            let root = crate::cooperation::windows::client_root().ok()?;
+            let runtime = crate::cooperation::windows::ClientRuntime::open(&root).ok()?;
+            let GlobalValue::SystemProxy { value } =
+                self.read_global(GlobalItem::SystemProxy).ok()?
+            else {
+                return None;
+            };
+            Some(crate::cooperation::scope_check(
+                &runtime,
+                &crate::cooperation::Selection::for_profile(profile),
+                &value,
+            ))
+        })();
+        result.unwrap_or_else(|| {
+            checks::CheckResult::new(
+                "G7",
+                checks::Kind::Hard,
+                checks::Status::Unknown,
+                Some("cooperation_controller_or_entry_unavailable"),
+            )
+        })
+    }
     fn now_ms(&self) -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)

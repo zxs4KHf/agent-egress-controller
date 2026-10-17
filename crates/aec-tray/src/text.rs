@@ -34,6 +34,7 @@ pub fn check_label(id: &str) -> String {
         "G4" => "系统时区与浏览器时区符合设置".into(),
         "G5" => format!("浏览器 {arg} 的语言符合设置"),
         "G6" => "系统代理指向本程序".into(),
+        "G7" => "系统代理入口与选定站点协作（缺证据保持未知）".into(),
         "R1" => "出口 IP 的网络类型（ASN）".into(),
         "R2" => "经出口的延迟".into(),
         "R3" => format!("浏览器 {arg} 的 WebRTC 不暴露本机 IP"),

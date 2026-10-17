@@ -15,6 +15,7 @@ struct Preview {
     profiles: Mutex<ProfileSet>,
     enabled: AtomicBool,
     active: AtomicBool,
+    cooperation_enabled: AtomicBool,
 }
 #[derive(Default)]
 struct MemoryBrowserHost(
@@ -143,15 +144,27 @@ impl SetupBackend for Preview {
                 stored_user: None,
                 tunnel_password_stored: false,
                 takeover_enabled: false,
+                client_cooperation: self.cooperation_enabled.load(Ordering::Relaxed),
                 locked: false,
             },
         )
     }
-    fn save(&self, _form: ExitForm) -> Result<(), Vec<FieldError>> {
+    fn save(&self, form: ExitForm) -> Result<(), Vec<FieldError>> {
+        let mut profiles = self.profiles.lock().unwrap();
+        let settings = setup::apply_settings(
+            &form,
+            aec_core::controller::Settings {
+                client_cooperation: self.cooperation_enabled.load(Ordering::Relaxed),
+                ..Default::default()
+            },
+        )?;
+        setup::apply(&mut profiles, &form, None, false)?;
+        self.cooperation_enabled
+            .store(settings.client_cooperation, Ordering::Relaxed);
         Ok(())
     }
     fn dashboard(&self) -> Option<dashboard::View> {
-        Some(dashboard::view(
+        let mut view = dashboard::view(
             &self.profiles.lock().unwrap(),
             if self.active.load(Ordering::Relaxed) {
                 "agent_unverified"
@@ -161,7 +174,9 @@ impl SetupBackend for Preview {
             false,
             false,
             Some("隔离界面演示，未运行真实网络服务".into()),
-        ))
+        );
+        view.client_cooperation = self.cooperation_enabled.load(Ordering::Relaxed);
+        Some(view)
     }
     fn agent_info(&self) -> serde_json::Value {
         serde_json::json!({"available":true,"enabled":self.enabled.load(Ordering::Relaxed),"mcpConfig":{"mcpServers":{"agent-egress-controller":{"command":"C:\\Example\\aec-agent.exe","args":["mcp"]}}}})
@@ -250,6 +265,7 @@ fn main() {
         profiles: Mutex::new(profiles),
         enabled: AtomicBool::new(false),
         active: AtomicBool::new(false),
+        cooperation_enabled: AtomicBool::new(false),
     });
     let server = setup::SetupServer::start(0, "preview".into(), backend).unwrap();
     println!("{}", server.control_tab_url("dashboard"));
