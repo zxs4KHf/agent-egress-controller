@@ -14,9 +14,9 @@ Agent 可帮助管理站点规则、连接第一跳、模式、检查、自启�
 
 ## 下载与首次使用
 
-当前源码候选为 0.5.9，公开发布以 Releases 为准。安装版包含 per-user 安装向导；安装后在一个桌面窗口中使用出口设置、规则/站点、固定出口路径、Agent/MCP 和代理帮助。系统托盘继续独立显示状态并提供恢复、检测和打开看板入口。便携版保留完整功能。以下命令中的版本号和文件名以实际 Release 资产为准。
+本指南对应 0.5.9，公开发布以 Releases 为准。安装版包含 per-user 安装向导；安装后在一个桌面窗口中使用出口设置、规则/站点、固定出口路径、Agent/MCP 和代理帮助。系统托盘继续独立显示状态并提供恢复、检测和打开看板入口。便携版保留完整功能。以下命令中的版本号和文件名以实际 Release 资产为准。
 
-从 [GitHub Releases](https://github.com/zxs4KHf/agent-egress-controller/releases/latest) 下载对应版本的安装 EXE 或便携 ZIP（0.5.8 文件名为 `AgentEgressController-0.5.8-setup.exe`、`AgentEgressController-0.5.8-portable.zip`），并核对对应的 SHA256 文件。安装版只安装到当前用户目录，不需要管理员权限；登录自启为可选项且默认关闭。便携版需完整解压到可写目录，保留 `portable.flag`、`bin`、`ui` 目录、应用 exe 和说明文件。桌面控制中心需要 Microsoft Edge WebView2 Runtime；程序不会自动下载，缺失时会提示用户处理。
+从 [GitHub Releases](https://github.com/zxs4KHf/agent-egress-controller/releases/latest) 下载对应版本的安装 EXE 或便携 ZIP（0.5.9 文件名为 `AgentEgressController-0.5.9-setup.exe`、`AgentEgressController-0.5.9-portable.zip`），并核对对应的 SHA256 文件。安装版只安装到当前用户目录，不需要管理员权限；登录自启为可选项且默认关闭。便携版需完整解压到可写目录，保留 `portable.flag`、`bin`、`ui` 目录、应用 exe 和说明文件。桌面控制中心需要 Microsoft Edge WebView2 Runtime；程序不会自动下载，缺失时会提示用户处理。
 
 双击 aec-tray.exe，在首次打开的本机设置页填出口、端口、协议和账号。端口可逐项附协议，例如 `12324/socks5`、`12323/http`；同一候选池的地址必须相同，备用端口用于拨号切换，不表示多个出口。
 

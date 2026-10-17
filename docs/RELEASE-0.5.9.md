@@ -1,6 +1,15 @@
 # 0.5.9：系统代理外部改写的红色冲突提示
 
-日期：2026-10-17。候选提交和公开发布状态以 GitHub PR / Releases 为准。
+日期：2026-10-17。对应 PR #15，公开发布状态、合并提交与 CI 证据以 [v0.5.9 Release](https://github.com/zxs4KHf/agent-egress-controller/releases/tag/v0.5.9) 为准。
+
+## 发布资产与老用户升级
+
+- Windows x64 安装包：`AgentEgressController-0.5.9-setup.exe`，校验文件 `SHA256SETUP-0.5.9.txt`。
+- 完整便携包：`AgentEgressController-0.5.9-portable.zip`，校验文件 `SHA256SUMS-0.5.9.txt`。
+- 独立更新器：`aec-update-0.5.9.ps1`，校验文件 `SHA256UPDATER-0.5.9.txt`；字节与完整包内 `aec-update.ps1` 一致。
+- 组件清单：`aec-incremental-0.5.9.json`、`SHA256INCREMENTAL-0.5.9.txt`，以及九个 `aec-0.5.9-*.zip` 组件，供托盘更新器按实际文件哈希选择下载。不是二进制字节补丁，不承诺固定节省比例。
+
+0.5.3–0.5.8 从托盘「设置与维护 → 检查完整更新」升级；下载和核心停服分别确认。0.5.1/0.5.2 原更新器可全量升级一次，需当次增量则先校验并替换独立更新脚本；原 0.5.0 必须先引导，更旧版本手动升级。本次仅更新界面不足以安装核心修复。规则、原 ISP、普通上游、密钥和自启设置保留。详见[升级指南](UPDATING.md)。
 
 ## 问题与决策
 
