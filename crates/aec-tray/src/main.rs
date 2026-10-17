@@ -312,74 +312,96 @@ mod tray {
             let agent = matches!(s.mode, Mode::AgentReady | Mode::AgentUnverified);
             unsafe {
                 let m = CreatePopupMenu();
-                let add = |flags: u32, id: usize, label: &str| {
-                    let w = wide(label);
-                    AppendMenuW(m, flags, id, w.as_ptr());
+                let add = |menu: HMENU, flags: u32, id: usize, label: &str| {
+                    AppendMenuW(menu, flags, id, wide(label).as_ptr());
                 };
                 let on = |ok: bool| if ok { MF_STRING } else { MF_STRING | MF_GRAYED };
+                let submenu = |parent: HMENU, child: HMENU, label: &str, enabled: bool| {
+                    add(parent, MF_POPUP | on(enabled), child as usize, label);
+                };
                 add(
+                    m,
                     MF_STRING | MF_GRAYED,
                     0,
                     s.busy.unwrap_or(text::mode_label(s.mode)),
                 );
-                if let Some(sum) = &s.summary {
-                    if agent {
-                        add(MF_STRING | MF_GRAYED, 0, sum);
+                AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
+                add(m, MF_STRING, ID_DASHBOARD, "打开控制中心");
+                match s.mode {
+                    Mode::Daily => add(
+                        m,
+                        on(idle),
+                        ID_ENTER,
+                        if s.configured {
+                            "进入 Agent 模式"
+                        } else {
+                            "进入 Agent 模式（先设置出口）"
+                        },
+                    ),
+                    Mode::AgentReady | Mode::AgentUnverified => {
+                        add(m, on(idle), ID_EXIT, "退出 Agent 模式并恢复");
+                    }
+                    Mode::RestoreIncomplete => {
+                        add(m, on(idle), ID_EXIT, "重试恢复");
+                        add(m, on(idle), ID_ACK, "保持现状，回到日常模式");
+                    }
+                    Mode::Entering | Mode::Exiting => {
+                        add(m, on(idle), ID_EXIT, "恢复上次未完成的会话");
                     }
                 }
-                AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
-                match s.mode {
-                    Mode::Daily => {
-                        add(
-                            on(idle),
-                            ID_ENTER,
-                            if s.configured {
-                                "进入 Agent 模式"
-                            } else {
-                                "进入 Agent 模式（先设置出口）"
-                            },
-                        );
+                if agent && !s.entries.is_empty() {
+                    let entries = CreatePopupMenu();
+                    for (i, (_, label)) in s.entries.iter().enumerate() {
+                        add(entries, on(idle), ID_ENTRY_BASE + i, label);
                     }
-                    Mode::AgentReady | Mode::AgentUnverified => {
-                        for (i, (_, label)) in s.entries.iter().enumerate() {
-                            add(on(idle), ID_ENTRY_BASE + i, label);
+                    submenu(m, entries, "打开 AI 浏览器或终端", idle);
+                }
+                if agent && !s.switches.is_empty() {
+                    let routes = CreatePopupMenu();
+                    let mut groups: Vec<&str> = Vec::new();
+                    for (group, _, _, _) in &s.switches {
+                        if !groups.contains(&group.as_str()) {
+                            groups.push(group);
                         }
-                        for (i, (group, member, selected, fixed)) in s.switches.iter().enumerate() {
-                            let flags = on(idle) | if *selected { MF_CHECKED } else { 0 };
+                    }
+                    for group in groups {
+                        let members = CreatePopupMenu();
+                        for (i, (name, member, selected, fixed)) in s.switches.iter().enumerate() {
+                            if name != group {
+                                continue;
+                            }
                             add(
-                                flags,
+                                members,
+                                on(idle) | if *selected { MF_CHECKED } else { 0 },
                                 ID_SWITCH_BASE + i,
                                 &format!(
-                                    "{group} → {member}（{}）",
-                                    if *fixed {
-                                        "固定 ISP"
-                                    } else {
-                                        "非固定出口"
-                                    }
+                                    "{member}（{}）",
+                                    if *fixed { "固定 ISP" } else { "普通出口" }
                                 ),
                             );
                         }
-                        AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
-                        add(on(idle), ID_RECHECK, "重新检测");
-                        add(on(idle), ID_EXIT, "退出 Agent 模式（恢复设置）");
+                        submenu(routes, members, group, idle);
                     }
-                    Mode::RestoreIncomplete => {
-                        add(on(idle), ID_EXIT, "重试恢复");
-                        add(on(idle), ID_ACK, "保持现状，回到日常模式");
-                    }
-                    Mode::Entering | Mode::Exiting => {
-                        add(on(idle), ID_EXIT, "恢复上次未完成的会话");
-                    }
+                    submenu(m, routes, "出口与分流", idle);
                 }
-                AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
-                add(on(s.has_report), ID_REPORT, "查看检测结果");
-                add(on(idle), ID_PROMPTS, "复制排查提示词");
-                add(MF_STRING, ID_SETTINGS, "设置出口和分流…");
-                add(MF_STRING, ID_DASHBOARD, "打开看板（连接路径与规则）");
-                add(MF_STRING, ID_PROXY_HELP, "代理冲突说明");
-                add(on(idle), ID_UPDATE, "检查并安装更新…");
-                add(on(idle), ID_UPDATE_UI, "仅更新界面（不停服务）…");
+                let checks = CreatePopupMenu();
                 add(
+                    checks,
+                    on(agent && idle),
+                    ID_RECHECK,
+                    "重新检测（不重载规则）",
+                );
+                add(checks, on(s.has_report), ID_REPORT, "查看检测结果");
+                add(checks, on(idle), ID_PROMPTS, "复制排查提示词");
+                add(checks, MF_STRING, ID_PROXY_HELP, "代理共存说明");
+                if let Some(summary) = &s.summary {
+                    add(checks, MF_STRING | MF_GRAYED, 0, summary);
+                }
+                submenu(m, checks, "检测与排查", true);
+                let settings = CreatePopupMenu();
+                add(settings, MF_STRING, ID_SETTINGS, "出口与环境设置…");
+                add(
+                    settings,
                     MF_STRING
                         | if crate::startup::enabled() {
                             MF_CHECKED
@@ -387,12 +409,22 @@ mod tray {
                             0
                         },
                     ID_STARTUP,
-                    "登录时启动并进入 Agent 模式",
+                    "登录时自动启动",
                 );
-                add(MF_STRING, ID_DATA, "打开数据和日志目录");
-                add(on(idle), ID_SHORTCUTS, "创建桌面和开始菜单快捷方式");
+                add(
+                    settings,
+                    on(idle),
+                    ID_SHORTCUTS,
+                    "修复桌面和开始菜单快捷方式",
+                );
+                add(settings, MF_STRING, ID_DATA, "打开数据和日志目录");
+                AppendMenuW(settings, MF_SEPARATOR, 0, std::ptr::null());
+                add(settings, on(idle), ID_UPDATE_UI, "仅更新界面（不停服务）…");
+                add(settings, on(idle), ID_UPDATE, "检查完整更新…");
+                submenu(m, settings, "设置与维护", true);
                 AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
                 add(
+                    m,
                     on(!self.quitting),
                     ID_QUIT,
                     if s.mode == Mode::Daily {
@@ -401,7 +433,6 @@ mod tray {
                         "恢复设置并退出程序"
                     },
                 );
-
                 (m, s)
             }
         }
@@ -837,6 +868,8 @@ mod tray {
             });
             for desired in ["Clash", "xxyun"] {
                 let (menu, snapshot) = with_ui(|ui| ui.build_menu()).unwrap();
+                assert!(unsafe { GetMenuItemCount(menu) } <= 12,
+                    "The root tray menu must not expand every route, diagnostic and maintenance action");
                 let index = snapshot
                     .switches
                     .iter()

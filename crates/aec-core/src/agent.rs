@@ -208,6 +208,9 @@ pub fn tools() -> Value {
     );
     let specs = vec![
         ("aec_state", "Read mode, readiness summary, fixed-exit block, paths and rules. Unknown is never pass.", none.clone(), true),
+        ("aec_cooperation", "Export an owned selected-site subscription script, without changing or reloading the system proxy client. Export is NOT installation, runtime verification, DNS/ECS safety proof or permission to replace an existing script.", none.clone(), true),
+        ("aec_browser_environment", "Read browser environment settings and recovery availability. Saved settings never imply runtime DNS/WebRTC/UDP/ECS verification.", none.clone(), true),
+        ("aec_browser_environment_preview", "Preview AI-only or global supported-Edge browser changes. Chrome/Chrome for Testing/fingerprint profiles are excluded from global policies. Creates a five-minute local confirmation plan, never applies or restarts browsers. User must review and confirm in the panel.", schema(json!({"scope":{"type":"string","enum":["ai_only","global"]},"language":{"type":"string","enum":crate::setup::LANGUAGES.iter().map(|p|p.0).collect::<Vec<_>>()},"preventWebrtc":{"type":"boolean"},"disableQuic":{"type":"boolean"},"remoteDnsOnly":{"type":"boolean"}}), &["scope","language","preventWebrtc","disableQuic","remoteDnsOnly"]), false),
         ("aec_upstreams", "List editable local proxy upstreams, current selection and whether rules use the group. Does not change routes or probe the network.", none.clone(), true),
         ("aec_upstream_save", "Add or edit a named local HTTP/SOCKS5 upstream; mixed ports accept either. Preserves protected sites and ISP identity. First adoption preserves the uniquely referenced local upstream; ambiguous routing is rejected. Active reload briefly interrupts connections, never stops the gateway process.", schema(json!({"name":{"type":"string"},"host":{"type":"string","enum":["127.0.0.1","localhost","::1"]},"port":{"type":"integer","minimum":1,"maximum":65535},"protocol":{"type":"string","enum":["http","socks5"]}}), &["name","host","port","protocol"]), false),
         ("aec_upstream_select", "Select a saved ordinary upstream for rules using the local upstream group. Never removes protected sites or changes ISP identity. May briefly interrupt connections; no automatic DIRECT fallback is added.", schema(json!({"name":{"type":"string"}}), &["name"]), false),
@@ -244,6 +247,16 @@ pub fn call(backend: &dyn SetupBackend, request: Call) -> Result<Value, String> 
         return Err(invalid());
     }
     match request.name.as_str() {
+        "aec_browser_environment" | "aec_browser_environment_preview" => {
+            let command = if request.name == "aec_browser_environment" {
+                crate::browser_environment::Command::State
+            } else {
+                crate::browser_environment::Command::Preview {
+                    options: serde_json::from_value(a.clone()).map_err(|_| invalid())?,
+                }
+            };
+            return backend.browser_environment(command, false).map_err(fields);
+        }
         "aec_upstream_save"
         | "aec_upstream_select"
         | "aec_upstream_delete"
@@ -268,12 +281,13 @@ pub fn call(backend: &dyn SetupBackend, request: Call) -> Result<Value, String> 
             return serde_json::to_value(backend.dashboard())
                 .map_err(|_| "state unavailable".into())
         }
+        "aec_cooperation" => return Ok(backend.cooperation()),
         "aec_settings" => {
             return serde_json::to_value(backend.view()).map_err(|_| "settings unavailable".into())
         }
         "aec_options" => {
             return Ok(
-                json!({"apiVersion":1,"tools":tools(),"timezones":crate::setup::TIMEZONES,"languages":crate::setup::LANGUAGES,"tunnelPresets":crate::tunnel::PRESETS.iter().map(|p|json!({"key":p.key,"label":p.label,"source":p.source})).collect::<Vec<_>>(),"security":"Loopback only; same Windows user; passwords are entered by the user in panel. Global VPN/TUN and competing system proxy unsupported. No readiness guarantee without evidence."}),
+                json!({"apiVersion":1,"tools":tools(),"timezones":crate::setup::TIMEZONES,"languages":crate::setup::LANGUAGES,"tunnelPresets":crate::tunnel::PRESETS.iter().map(|p|json!({"key":p.key,"label":p.label,"source":p.source})).collect::<Vec<_>>(),"security":"Loopback only; same Windows user; passwords are entered by the user in panel. AEC system takeover and selected-site client cooperation are different scopes. Cooperation currently exports only, with no installation/runtime proof. TUN/global bypass unsupported. Browser changes require local preview confirmation; no readiness guarantee without evidence."}),
             )
         }
         "aec_configure" => {
@@ -560,7 +574,7 @@ pub fn serve_mcp(
 pub fn page(token: &str, info: &Value) -> String {
     crate::ui::template(
         "agent.html",
-        include_str!("../../../ui/revisions/fluent-1/agent.html"),
+        include_str!("../../../ui/revisions/fluent-2/agent.html"),
     )
     .replace("__TOKEN__", token)
     .replace("__INFO__", &info.to_string().replace("</", "<\\/"))

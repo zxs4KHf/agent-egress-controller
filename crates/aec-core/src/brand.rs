@@ -1,4 +1,5 @@
-//! Product mark: a shield with two directional routes, with state-dependent background.
+//! Static application branding is purple; tray readiness colours are independent.
+pub const APP_COLOR: (u8, u8, u8) = (99, 91, 154);
 pub fn rgba(size: usize, color: (u8, u8, u8)) -> Vec<u8> {
     let mut pixels = Vec::with_capacity(size * size * 4);
     let lines = [
@@ -60,7 +61,7 @@ pub fn rgba(size: usize, color: (u8, u8, u8)) -> Vec<u8> {
 /// Single 64px uncompressed Windows ICO, generated during the build without external assets.
 pub fn ico() -> Vec<u8> {
     let size = 64usize;
-    let pixels = rgba(size, (15, 118, 110));
+    let pixels = rgba(size, APP_COLOR);
     let image_bytes = 40 + size * size * 4 + size * size / 8;
     let mut result = vec![0, 0, 1, 0, 1, 0, 64, 64, 0, 0, 1, 0, 32, 0];
     result.extend((image_bytes as u32).to_le_bytes());

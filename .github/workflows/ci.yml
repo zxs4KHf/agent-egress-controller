@@ -73,6 +73,12 @@ jobs:
           $env:AEC_NODE_MODULES = Join-Path $deps 'node_modules'
           node packaging/test-ui.cjs
           if ($LASTEXITCODE) { throw 'UI interaction tests failed' }
+          cargo build -p aec-core --example cooperation_fixture --example browser_environment_fixture --locked
+          if ($LASTEXITCODE) { throw 'Cooperation/browser fixtures build failed' }
+          node packaging/test-cooperation.cjs
+          if ($LASTEXITCODE) { throw 'Selected-site script preservation failed' }
+          node packaging/test-browser-environment.cjs
+          if ($LASTEXITCODE) { throw 'Installed Edge DNS/WebRTC environment test failed' }
       - name: Preserve isolated UI diagnostics
         if: failure()
         uses: actions/upload-artifact@v4

@@ -9,11 +9,76 @@ use std::sync::{
     Arc, Mutex,
 };
 struct Preview {
+    environment_data: std::path::PathBuf,
+    environment_host: MemoryBrowserHost,
+    environment_serial: Mutex<()>,
     profiles: Mutex<ProfileSet>,
     enabled: AtomicBool,
     active: AtomicBool,
 }
+#[derive(Default)]
+struct MemoryBrowserHost(
+    Mutex<
+        std::collections::BTreeMap<
+            (aec_core::browser_environment::Policy, bool),
+            aec_core::browser_environment::Value,
+        >,
+    >,
+);
+impl aec_core::browser_environment::Host for MemoryBrowserHost {
+    fn read(
+        &self,
+        policy: aec_core::browser_environment::Policy,
+        machine: bool,
+    ) -> Result<Option<aec_core::browser_environment::Value>, &'static str> {
+        Ok(self.0.lock().unwrap().get(&(policy, machine)).cloned())
+    }
+    fn write(
+        &self,
+        policy: aec_core::browser_environment::Policy,
+        value: Option<&aec_core::browser_environment::Value>,
+    ) -> Result<(), &'static str> {
+        let mut map = self.0.lock().unwrap();
+        if let Some(value) = value {
+            map.insert((policy, false), value.clone());
+        } else {
+            map.remove(&(policy, false));
+        }
+        Ok(())
+    }
+}
+impl Drop for Preview {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.environment_data);
+    }
+}
 impl SetupBackend for Preview {
+    fn browser_environment(
+        &self,
+        command: aec_core::browser_environment::Command,
+        local_confirmation: bool,
+    ) -> Result<serde_json::Value, Vec<FieldError>> {
+        let _serial = self.environment_serial.lock().unwrap();
+        let nonce = aec_core::crypto::random_hex(16).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        aec_core::browser_environment::execute(
+            &self.environment_data,
+            &self.environment_host,
+            command,
+            now,
+            &nonce,
+            local_confirmation,
+        )
+        .map_err(|code| {
+            vec![FieldError {
+                path: "browserEnvironment".into(),
+                message: code.into(),
+            }]
+        })
+    }
     fn upstream(
         &self,
         command: aec_core::local_upstream::Command,
@@ -143,7 +208,15 @@ fn main() {
     agent.egress.expected.ip = Some("192.0.2.1".into());
     agent.routing.groups.push(serde_json::from_value(serde_json::json!({"name":"Preview GPT","type":"select","members":["relay","DIRECT"],"switchable":true})).unwrap());
     agent.routing.rules.push(serde_json::from_value(serde_json::json!({"kind":"domain_suffix","value":"chatgpt.com","target":"Preview GPT"})).unwrap());
+    let environment_data = std::env::temp_dir().join(format!(
+        "aec-ui-browser-env-{}",
+        aec_core::crypto::random_hex(8).unwrap()
+    ));
+    std::fs::create_dir_all(&environment_data).unwrap();
     let backend = Arc::new(Preview {
+        environment_data,
+        environment_host: MemoryBrowserHost::default(),
+        environment_serial: Mutex::new(()),
         profiles: Mutex::new(profiles),
         enabled: AtomicBool::new(false),
         active: AtomicBool::new(false),

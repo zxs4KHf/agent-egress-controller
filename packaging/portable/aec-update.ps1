@@ -372,7 +372,7 @@ public static class AecUpdaterNative {
   using(var bitmap=new Bitmap(32,32)){
    using(var g=Graphics.FromImage(bitmap)){
     g.SmoothingMode=System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-    using(var brush=new SolidBrush(Color.FromArgb(15,118,110)))g.FillPolygon(brush,new[]{new Point(16,1),new Point(29,7),new Point(27,22),new Point(16,31),new Point(5,22),new Point(3,7)});
+    using(var brush=new SolidBrush(Color.FromArgb(99,91,154)))g.FillPolygon(brush,new[]{new Point(16,1),new Point(29,7),new Point(27,22),new Point(16,31),new Point(5,22),new Point(3,7)});
     using(var pen=new Pen(Color.White,3))g.DrawLines(pen,new[]{new Point(9,16),new Point(14,21),new Point(23,11)});
    }
    IntPtr h=bitmap.GetHicon();try{using(var borrowed=System.Drawing.Icon.FromHandle(h))return (Icon)borrowed.Clone();}finally{DestroyIcon(h);}

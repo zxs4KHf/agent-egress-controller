@@ -212,6 +212,40 @@ fn panel_http_uses_the_same_commands_and_rejects_missing_origin_and_unknown_fiel
 }
 
 #[test]
+fn agent_cooperation_export_is_read_only_scoped_and_not_an_installation_claim() {
+    let panel = Panel(std::sync::Mutex::new(configured()));
+    let before = panel.0.lock().unwrap().clone();
+    let call = |arguments| {
+        aec_core::agent::call(
+            &panel,
+            aec_core::agent::Call {
+                name: "aec_cooperation".into(),
+                arguments,
+            },
+        )
+    };
+    let result = call(serde_json::json!({})).unwrap();
+    assert_eq!(result["status"], "export_only");
+    assert_eq!(result["runtimeVerified"], false);
+    assert_eq!(
+        result["persistentInstalled"],
+        serde_json::Value::Null,
+        "without client readback, external installation is unknown rather than absent"
+    );
+    assert_eq!(result["domains"], serde_json::json!(["claude.ai"]));
+    assert!(result["script"]
+        .as_str()
+        .unwrap()
+        .contains("AEC-MANAGED-FIXED"));
+    assert!(
+        !result.to_string().contains("198.51.100.8"),
+        "export must not contain the private ISP identity"
+    );
+    assert!(call(serde_json::json!({"apply":true,"force":true})).is_err());
+    assert_eq!(*panel.0.lock().unwrap(), before);
+}
+
+#[test]
 fn agent_discovers_local_upstreams_without_credentials_or_global_configuration() {
     let panel = Panel(std::sync::Mutex::new(configured()));
     let result = aec_core::agent::call(

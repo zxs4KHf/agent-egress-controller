@@ -111,6 +111,11 @@ impl Layout {
 }
 
 pub enum Cmd {
+    BrowserEnvironment(
+        aec_core::browser_environment::Command,
+        bool,
+        Sender<Result<serde_json::Value, Vec<FieldError>>>,
+    ),
     Upstream(
         aec_core::local_upstream::Command,
         Sender<Result<serde_json::Value, Vec<FieldError>>>,
@@ -296,6 +301,7 @@ impl Worker {
                 continue;
             }
             let label = match &cmd {
+                Cmd::BrowserEnvironment(..) => "正在处理浏览器设置…",
                 Cmd::Upstream(..) => "正在处理本机代理上游…",
                 Cmd::AgentAction(..) => "正在执行 Agent 操作…",
                 Cmd::Startup(..) | Cmd::Shortcuts(..) => "正在保存启动入口…",
@@ -353,6 +359,26 @@ impl Worker {
                 let result = self.change_upstream(command).map_err(field_error);
                 let _ = done.send(result);
             }
+            Cmd::BrowserEnvironment(command, local_confirmation, done) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let result = aec_core::crypto::random_hex(16)
+                    .map_err(|_| "BROWSER_PLAN_ID_FAILED")
+                    .and_then(|nonce| {
+                        aec_core::browser_environment::execute(
+                            &data_dir,
+                            &aec_core::browser_environment_windows::WindowsBrowserHost,
+                            command,
+                            now,
+                            &nonce,
+                            local_confirmation,
+                        )
+                    })
+                    .map_err(|code| field_error(code.into()));
+                let _ = done.send(result);
+            }
             Cmd::Route(form, done) => {
                 let result = self.change_route(form).map_err(field_error);
                 let _ = done.send(result);
@@ -384,6 +410,7 @@ impl Worker {
                     }
                     "recheck" => self.recheck().map(|_| ()),
                     "exit" => self.controller.exit().and_then(|out| {
+                        self.restore_browser_environment()?;
                         if out.mode_after == Mode::Daily {
                             Ok(())
                         } else {
@@ -508,15 +535,11 @@ impl Worker {
                 );
             }
             Cmd::Restore(done) => {
-                if self.controller.state().mode != Mode::Daily {
-                    self.exit();
-                }
+                self.exit();
                 let _ = done.send(());
             }
             Cmd::Shutdown(done) => {
-                if self.controller.state().mode != Mode::Daily {
-                    self.exit();
-                }
+                self.exit();
                 let _ = done.send(());
                 return true;
             }
@@ -675,19 +698,45 @@ impl Worker {
     fn exit(&mut self) {
         match self.controller.exit() {
             Ok(r) => {
-                let ok = r.mode_after == Mode::Daily;
+                let environment = self.restore_browser_environment();
+                let ok = r.mode_after == Mode::Daily && environment.is_ok();
                 self.note(
                     if ok {
                         "已退出 Agent 模式"
                     } else {
                         "恢复未完成"
                     },
-                    &text::restore_summary(&r),
+                    &format!(
+                        "{}{}",
+                        text::restore_summary(&r),
+                        environment
+                            .err()
+                            .map(|error| format!(
+                                "；浏览器设置恢复失败：{}，请在看板重试，恢复记录仍保留",
+                                error.code
+                            ))
+                            .unwrap_or_default()
+                    ),
                     !ok,
                 );
             }
             Err(f) => self.note("退出失败", &f.to_string(), true),
         }
+    }
+
+    fn restore_browser_environment(&self) -> Result<(), aec_core::controller::Fault> {
+        aec_core::browser_environment::execute(
+            &self.layout.data_dir,
+            &aec_core::browser_environment_windows::WindowsBrowserHost,
+            aec_core::browser_environment::Command::Restore,
+            0,
+            "",
+            true,
+        )
+        .map(|_| ())
+        .map_err(|code| {
+            aec_core::controller::Fault::new(code, "浏览器设置需要在看板恢复；不覆盖外部变更")
+        })
     }
 
     fn prompts(&self) -> String {
@@ -989,6 +1038,18 @@ impl Backend {
 }
 
 impl SetupBackend for Backend {
+    fn browser_environment(
+        &self,
+        command: aec_core::browser_environment::Command,
+        local_confirmation: bool,
+    ) -> Result<serde_json::Value, Vec<FieldError>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(Cmd::BrowserEnvironment(command, local_confirmation, tx))
+            .map_err(|_| field_error("托盘服务已退出".into()))?;
+        rx.recv()
+            .map_err(|_| field_error("托盘服务已退出".into()))?
+    }
     fn upstream(
         &self,
         command: aec_core::local_upstream::Command,

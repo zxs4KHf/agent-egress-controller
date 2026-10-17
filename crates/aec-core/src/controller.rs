@@ -224,6 +224,10 @@ pub trait Platform {
     /// What a browser entry's check page reported; waits for the first report, then returns the
     /// same one. `None` when nothing came back.
     fn entry_signals(&self, entry_id: &str) -> Option<BrowserSignals>;
+    /// Expected browser-only settings, independently of system time zone and routing identity.
+    fn browser_profile(&self, profile: &AgentProfile) -> AgentProfile {
+        profile.clone()
+    }
     /// Ask an entry this application started to close (no forced kill).
     fn close_entry(&self, process: &OwnedProcess) -> Result<CloseOutcome, Fault>;
     /// Whether this process holds SeTimeZonePrivilege (evidence for G4).
@@ -707,6 +711,7 @@ impl<P: Platform> Controller<P> {
         // Browser entries started in this session: G5, R3–R5 from their check pages.
         let mut browser_timezones = Vec::new();
         let mut browser_results = Vec::new();
+        let browser_profile = self.platform.browser_profile(profile);
         for e in &self.state.journal {
             let JournalEntry::Entry { id, .. } = e else {
                 continue;
@@ -719,8 +724,12 @@ impl<P: Platform> Controller<P> {
                 continue;
             }
             let signals = self.platform.entry_signals(id);
-            let (results, tz) =
-                browser_checks(profile, id, signals.as_ref(), report.exit_ip.as_deref());
+            let (results, tz) = browser_checks(
+                &browser_profile,
+                id,
+                signals.as_ref(),
+                report.exit_ip.as_deref(),
+            );
             browser_results.extend(results);
             if let Some(tz) = tz {
                 browser_timezones.push((id.clone(), tz));

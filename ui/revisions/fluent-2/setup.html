@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>出口与分流设置</title>
+<link rel="stylesheet" href="/ui/theme.css?t=__TOKEN__"><script src="/ui/app.js?t=__TOKEN__"></script><style>main{max-width:920px}label:not(.check):not(.radio){display:block;margin:12px 0 5px}input[type=text],input[type=password],input[type=number],select{width:100%}#targets{min-height:100px;max-height:160px}#msg{display:none}#msg.ok{display:block;background:var(--okbg);padding:12px;border-radius:8px}#msg.bad{display:block;background:var(--errbg);padding:12px;border-radius:8px;color:var(--err)}details.compact-details{padding:12px;background:var(--soft);border-radius:8px}.fe{margin-top:4px}</style></head><body><main>
+<div class="eyebrow">CONNECTION SETTINGS</div><h1>出口与系统设置</h1><div class="breadcrumbs"><a href="/dashboard?t=__TOKEN__" data-nav="dashboard" data-icon="back">返回看板</a><a href="/agent?t=__TOKEN__" data-nav="agent" data-icon="agent">Agent 接入</a><a href="/proxy-help?t=__TOKEN__" data-nav="help" data-icon="help">代理共存说明</a></div>
+<p class="lead">填写你自己的固定出口、隧道与环境目标。想保留 Clash 等客户端的系统代理入口时，在看板使用“固定站点协作”；它和下面的旧系统代理接管不是同一方案，导出脚本也不会自动切换模式。</p>
+<p class="notice">站点协作仍需完成客户端挂载与运行核对。不要为它勾选旧“接管 Windows 系统代理”，也不要在未确认时退出当前网关。<a href="/dashboard?t=__TOKEN__" data-nav="dashboard">返回看板查看协作状态</a></p>
+<form id="f" autocomplete="off">
+
+<section><h2>出口代理</h2>
+<div class="row"><div><label for="host">地址</label><input id="host" type="text" placeholder="例如 203.0.113.10 或 proxy.example.com"><div class="fe" data-for="host"></div></div>
+<div class="narrow"><label for="proto">协议</label><select id="proto"><option value="socks5">SOCKS5</option><option value="http">HTTP</option></select></div></div>
+<label for="ports">端口</label><input id="ports" type="text" placeholder="例如 12324, 12323/http">
+<div class="hint">多个端口用逗号分隔，必须是同一个出口（同一台机器）；某个端口协议不同，就写成 <code>12323/http</code>。连不上一个会自动换下一个。</div><div class="fe" data-for="ports"></div>
+<div class="row"><div><label for="username">用户名</label><input id="username" type="text" placeholder="没有就留空"><div class="fe" data-for="username"></div></div>
+<div><label for="password">密码</label><input id="password" type="password" placeholder=""><div class="fe" data-for="password"></div></div></div>
+<div class="hint">密码保存在 Windows 凭据管理器，档案只保存引用；页面不会回显已保存的密码。</div>
+<label for="expectedIp">出口 IP（可选）</label><input id="expectedIp" type="text" placeholder="填了就严格比对，不一致算检测不通过">
+<div class="fe" data-for="expectedIp"></div>
+</section>
+
+<details class="panel" id="legacySystemProxy"><summary>兼容模式：AEC 接管系统代理 <span id="legacySystemState" class="badge"></span></summary>
+<label for="coreMixedPort">本机代理入口端口</label><input id="coreMixedPort" type="number" min="0" max="65535" placeholder="默认 17893"><div class="fe" data-for="coreMixedPort"></div>
+<div class="hint">留空或 0 使用默认端口。接替已有代理时，填写客户端当前使用的入口端口；不会改写用户级代理环境变量。保存后下次进入生效。若本机程序依赖这个端口，先核对，避免断网。</div>
+<label class="check"><input id="systemProxy" type="checkbox"><span>进入 Agent 模式时接管 Windows 系统代理，退出时恢复原样
+<div class="hint">Windows 只有一个系统代理设置。本程序接管后会把它指向自己的入口端口；不要同时打开 Clash 等客户端的「系统代理」、VPN/TUN 或全局代理开关。可以保留对方内核运行，在上方「本机代理」填它的本地端口作为普通流量上游，并照常切换节点。检测到其他程序改写时，本程序不会抢写，会撤销就绪并提示关闭冲突开关后退出、重新进入。默认关闭，真实写入需要接管门放行。</div></span></label>
+</details>
+<section><h2>加密隧道（可选）</h2>
+<label class="check"><input id="tunnelEnabled" type="checkbox"><span>经加密隧道连接出口
+<div class="hint">在国内直连某些出口（例如 IPRoyal 的 ISP / 静态住宅代理）会被重置、时通时断时打开。每个连接先走隧道，不通再按下面的设置直连；两条路均连接配置的出口，最终 IP 由检测确认。</div></span></label>
+<div id="tunnelBox" class="sub">
+<label for="tunnelPreset">隧道渠道</label><select id="tunnelPreset"></select><div class="fe" data-for="tunnelPreset"></div>
+<details class="compact-details" id="presetDetails"><summary>隧道来源与服务器</summary><div id="presetBox" class="box"></div></details>
+<div id="customBox">
+<label for="tunnelServers">隧道服务器（Shadowsocks）</label><textarea id="tunnelServers" placeholder="每行一个，地址:端口&#10;例如 ss.example.com:8388"></textarea><div class="fe" data-for="tunnelServers"></div>
+<div class="row"><div><label for="tunnelCipher">加密方式</label><select id="tunnelCipher"></select><div class="fe" data-for="tunnelCipher"></div></div>
+<div><label for="tunnelPassword">隧道密码</label><input id="tunnelPassword" type="password"><div class="fe" data-for="tunnelPassword"></div></div></div>
+</div>
+<label class="check"><input id="tunnelDirectFallback" type="checkbox"><span>隧道不通时直连出口
+<div class="hint">建议打开。两条路时好时坏会轮换，留着直连这条路断线最少。</div></span></label>
+</div>
+</section>
+
+<section><h2>分流</h2>
+<label class="radio"><input type="radio" name="routingMode" value="custom"><span><b>保留现有路由数据</b>
+<div class="hint">不改动已导入的出站、分组、规则和顺序。下面两个选项会重新套用预设并替换现有路由表。</div></span></label>
+<label class="radio"><input type="radio" name="routingMode" value="all"><span><b>全部走出口</b>
+<div class="hint">进入规则的所有网站都走出口。简单，但出口流量最多。</div></span></label>
+<label class="radio"><input type="radio" name="routingMode" value="split"><span><b>分流</b>
+<div class="hint">只有下面列出的站点走出口；其他网站交给你自己的本机代理（比如 Clash 的端口），本机代理没开就直连。</div></span></label>
+<div class="fe" data-for="routingMode"></div>
+<div id="splitBox" class="sub">
+<div class="row"><div><label for="localProxy">本机代理（可选）</label><input id="localProxy" type="text" placeholder="例如 127.0.0.1:7890，没有就留空"><div class="fe" data-for="localProxy"></div></div>
+<div class="narrow"><label for="localProxyProto">协议</label><select id="localProxyProto"><option value="socks5">SOCKS5</option><option value="http">HTTP</option></select></div></div>
+<div class="hint">留空：其他网站直连。本机代理不可用时可回退到直连；每 15 秒进行一次健康检查，恢复可用后重新选择。若使用 Clash 等客户端的端口作为上游，请关闭该客户端的「系统代理」和 VPN/TUN/全局接管开关；内核保持运行即可，节点仍可在客户端内切换。</div>
+<label for="extraDomains">也走出口的其他域名</label><textarea id="extraDomains" placeholder="每行一个，例如 openai.com"></textarea>
+<div class="hint">按后缀匹配，<code>openai.com</code> 也包括 <code>api.openai.com</code>。想让某个站点改走本机代理（比如 ChatGPT），就把它从这里和下面的「检测站点」里都删掉。 <button type="button" class="link" id="suggest">填入常用 AI 域名</button></div>
+<div class="fe" data-for="extraDomains"></div>
+</div>
+<label class="check"><input id="domesticDirect" type="checkbox"><span>国内网站直连
+<div class="hint">需要自行把可信的 GeoSite.dat、GeoIP.dat 放到 bin 目录；程序不会下载。没有这些文件时请关闭此项。</div></span></label>
+<details class="compact-details"><summary>检测站点 <span id="targetCount" class="count"></span></summary><label for="targets">每行一个检测域名</label><textarea id="targets"></textarea>
+<div class="hint">每行一个，每次逐项检测（G2）。预设会为这些站点生成出口规则；导入表保持原规则。要能读到 <code>/cdn-cgi/trace</code> 才能比对出口。</div>
+<div class="fe" data-for="targets"></div></details>
+</section>
+
+
+
+<section><h2>时区与语言</h2>
+<div class="row"><div><label for="timezone">目标时区</label><select id="timezone"></select><div class="fe" data-for="timezone"></div></div>
+<div><label for="language">浏览器语言</label><select id="language"></select><div class="fe" data-for="language"></div></div></div>
+<label class="check"><input id="takeoverEnabled" type="checkbox"><span>进入 Agent 模式时把系统时区改成目标时区，退出时改回原样
+<div class="hint">不勾选就不修改系统时区。仍会核对系统与浏览器时区；目标不一致或缺少证据时无法就绪。</div></span></label>
+</section>
+
+<details class="panel" id="relayAdvanced"><summary>高级：转发层</summary>
+<div class="hint" style="margin-top:8px">转发层替你连出口：一个端口或一条路不通，就换下一个，出口 IP 不变。</div>
+<div class="row"><div><label for="maxInflight">同时建立的连接数</label><input id="maxInflight" type="number" min="1" max="64"><div class="fe" data-for="maxInflight"></div>
+<div class="hint">只限制「正在建立」的连接，已经连上的不占名额。Claude、ChatGPT 客户端会一次新建很多连接，太小会排队失败。</div></div>
+<div><label for="connectTimeoutMs">每一步等待（毫秒）</label><input id="connectTimeoutMs" type="number" min="100" max="4900"><div class="fe" data-for="connectTimeoutMs"></div>
+<div class="hint">直连出口时每一步最多等多久；隧道自己会多等一些。</div></div></div>
+<label for="dialBudgetMs">一个连接的总时长（毫秒）</label><input id="dialBudgetMs" type="number" min="500" max="4999"><div class="fe" data-for="dialBudgetMs"></div>
+<div class="hint">在这段时间里把所有路轮流试一遍。必须小于 5000：内核等一个连接最多 5 秒。</div>
+</details>
+
+<button id="save" type="submit">保存</button>
+<div id="msg"></div>
+<div class="fe" data-for="form"></div><div id="other" class="fe"></div>
+</form></main>
+<script>
+const T="__TOKEN__",V=__VIEW__,TZ=__TZ__,LANG=__LANG__,PRESETS=__PRESETS__,CIPHERS=__CIPHERS__,SUGGESTED=__SUGGESTED__;
+const $=id=>document.getElementById(id);
+const opt=(sel,v,t)=>{const o=document.createElement("option");o.value=v;o.textContent=t;$(sel).append(o)};
+for(const [k,l] of TZ)opt("timezone",k,l);
+for(const [k,l] of LANG)opt("language",k,l+"  "+k);
+for(const p of PRESETS)opt("tunnelPreset",p.key,p.label);
+opt("tunnelPreset","custom","自定义 Shadowsocks 隧道");
+for(const c of CIPHERS)opt("tunnelCipher",c,c);
+for(const k of ["host","ports","username","expectedIp","tunnelServers","localProxy","targets","extraDomains","coreMixedPort"])$(k).value=V[k]||"";
+for(const k of ["maxInflight","connectTimeoutMs","dialBudgetMs"])$(k).value=V[k];
+$("proto").value=V.proto;$("timezone").value=V.timezone;$("language").value=V.language;
+$("tunnelPreset").value=V.tunnelPreset;$("tunnelCipher").value=V.tunnelCipher;$("localProxyProto").value=V.localProxyProto;
+for(const k of ["takeoverEnabled","tunnelEnabled","tunnelDirectFallback","domesticDirect","systemProxy"])$(k).checked=V[k];
+$("legacySystemState").textContent=V.systemProxy?"已配置接管":"未配置接管";$("legacySystemState").className='badge'+(V.systemProxy?' warn':'');
+document.querySelector('input[name=routingMode][value="'+V.routingMode+'"]').checked=true;
+$("password").placeholder=V.passwordStored?"已保存，不改就留空":"没有就留空";
+function tunnelPwHint(){$("tunnelPassword").placeholder=V.tunnelPasswordStored&&V.tunnelPreset==="custom"?"已保存，不改就留空":""}
+tunnelPwHint();
+function sync(){
+ $("tunnelBox").hidden=!$("tunnelEnabled").checked;
+ const pre=PRESETS.find(p=>p.key===$("tunnelPreset").value);
+ $("customBox").hidden=!!pre;$("presetBox").hidden=!pre;document.getElementById("presetDetails").hidden=!pre;
+ if(pre){$("presetBox").textContent="";const b=$("presetBox");
+  const line=t=>{const d=document.createElement("div");d.textContent=t;b.append(d)};
+  line("来源："+pre.source+"；文档核对日期："+pre.checked+"（节点连通性需在你的网络检测）。");
+  line("服务器："+pre.servers.join("、")+"，加密 "+pre.cipher+"，密码按官方公开值自动填写。");
+  line(pre.note)}
+ $("splitBox").hidden=document.querySelector("input[name=routingMode]:checked").value!=="split";
+}
+for(const id of ["tunnelEnabled","tunnelPreset"])$(id).addEventListener("change",sync);
+document.querySelectorAll("input[name=routingMode]").forEach(r=>r.addEventListener("change",()=>{sync();
+ if(r.value==="split"&&r.checked&&!$("extraDomains").value.trim())$("extraDomains").value=SUGGESTED.join("\n")}));
+$("suggest").addEventListener("click",()=>{const have=$("extraDomains").value.split(/\s+/).filter(Boolean);
+ $("extraDomains").value=[...new Set(have.concat(SUGGESTED))].join("\n")});
+sync();
+if(V.locked){$("save").disabled=true;show("bad","现在处于 Agent 模式。先从托盘「退出 Agent 模式」，再修改设置。")}
+function show(c,t){const m=$("msg");m.className=c;m.textContent=t}
+$("f").addEventListener("submit",async e=>{e.preventDefault();
+ document.querySelectorAll(".fe").forEach(x=>x.textContent="");$("msg").className="";
+ const num=id=>parseInt($(id).value,10)||0;
+ const form={host:$("host").value,proto:$("proto").value,ports:$("ports").value,username:$("username").value,
+  coreMixedPort:$("coreMixedPort").value,
+  password:$("password").value||null,timezone:$("timezone").value,language:$("language").value,
+  expectedIp:$("expectedIp").value,takeoverEnabled:$("takeoverEnabled").checked,
+  tunnelEnabled:$("tunnelEnabled").checked,tunnelPreset:$("tunnelPreset").value,tunnelServers:$("tunnelServers").value,
+  tunnelCipher:$("tunnelCipher").value,tunnelPassword:$("tunnelPassword").value||null,tunnelDirectFallback:$("tunnelDirectFallback").checked,
+  routingMode:document.querySelector("input[name=routingMode]:checked").value,localProxy:$("localProxy").value,
+  localProxyProto:$("localProxyProto").value,domesticDirect:$("domesticDirect").checked,
+  targets:$("targets").value,extraDomains:$("extraDomains").value,systemProxy:$("systemProxy").checked,
+  maxInflight:num("maxInflight"),connectTimeoutMs:num("connectTimeoutMs"),dialBudgetMs:num("dialBudgetMs")};
+ $("save").disabled=true;
+ try{const r=await fetch("/save?t="+T,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(form)});
+  const j=await r.json();
+  if(j.ok){$("password").value="";$("password").placeholder=form.username?"已保存，不改就留空":"没有就留空";
+   $("tunnelPassword").value="";V.tunnelPreset=form.tunnelPreset;V.tunnelPasswordStored=form.tunnelEnabled||V.tunnelPasswordStored;tunnelPwHint();
+   show("ok","已保存。回到托盘点「进入 Agent 模式」；已经在 Agent 模式里的，要退出再进入才生效。这个页面可以关掉了。")}
+  else{let other=[];for(const x of j.errors){const el=document.querySelector('.fe[data-for="'+x.path+'"]');
+    if(el)el.textContent=x.message;else other.push(x.path+"："+x.message)}
+   if(j.errors.some(x=>["maxInflight","connectTimeoutMs","dialBudgetMs"].includes(x.path)))document.getElementById("relayAdvanced").open=true;
+   $("other").textContent=other.join("；");show("bad","有几处需要改，见标红的说明。")}
+ }catch(err){show("bad","保存失败："+err+"。托盘程序可能已经退出。")}
+ finally{$("save").disabled=V.locked}
+});
+</script></body></html>

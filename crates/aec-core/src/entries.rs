@@ -70,6 +70,56 @@ pub fn browser_args(
     a
 }
 
+/// Only AEC-owned profile directories. Refuse flags which could override an explicitly approved
+/// environment rather than silently launching a different proxy/profile/DNS configuration.
+pub fn environment_browser_args(
+    profile: &AgentProfile,
+    data: &Path,
+    browser: Browser,
+    proxy_port: u16,
+    extra: &[String],
+    first_url: Option<&str>,
+) -> Result<Vec<String>, &'static str> {
+    let flags = crate::browser_environment::launch_flags(data)?;
+    if !flags.is_empty()
+        && extra.iter().any(|arg| {
+            [
+                "--user-data-dir",
+                "--profile-directory",
+                "--proxy-server",
+                "--proxy-bypass-list",
+                "--proxy-pac-url",
+                "--no-proxy-server",
+                "--host-resolver-rules",
+                "--lang",
+                "--accept-lang",
+                "--enable-quic",
+                "--force-webrtc-ip-handling-policy",
+                "--webrtc-ip-handling-policy",
+            ]
+            .iter()
+            .any(|key| arg == key || arg.starts_with(&format!("{key}=")))
+        })
+    {
+        return Err("BROWSER_LAUNCH_ARGUMENT_CONFLICT");
+    }
+    let mut args = browser_args(
+        profile,
+        &user_data_dir(data, browser),
+        proxy_port,
+        extra,
+        None,
+    );
+    if !flags.is_empty() {
+        args.retain(|arg| !arg.starts_with("--lang=") && !arg.starts_with("--accept-lang="));
+        args.extend(flags);
+    }
+    if let Some(url) = first_url {
+        args.push(url.into());
+    }
+    Ok(args)
+}
+
 /// The settings a running instance was started with. The first URL is not part of it: a new
 /// window with another URL is fine, other proxy or language flags are not.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

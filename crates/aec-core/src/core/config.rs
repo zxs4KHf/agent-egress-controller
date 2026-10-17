@@ -219,13 +219,14 @@ pub fn from_profile(
             .and_then(|s| s.parse::<std::net::IpAddr>().ok())
             .is_none()
             || crate::fixed::probe_port(ports).is_none()
+            || crate::fixed::ingress_port(ports).is_none()
             || [ports.relay, ports.tunnel]
                 .iter()
                 .any(|p| ports.all().contains(p))
             || ports.relay == ports.tunnel)
     {
         return Err(ConfigError::InvalidRouting(
-            "fixed exit requires a valid exact IP and distinct listener ports".into(),
+            "fixed exit requires a valid exact IP and distinct listener, probe and cooperation ports".into(),
         ));
     }
     let route_errors = crate::profile::validate_routing(&profile.routing);
@@ -385,6 +386,9 @@ pub fn from_profile(
         );
         if profile.egress.fixed_exit {
             let _ = writeln!(y, "  - name: \"aec-exit-probe\"\n    type: mixed\n    listen: \"127.0.0.1\"\n    port: {}\n    udp: false\n    proxy: {}", crate::fixed::probe_port(ports).expect("validated"), quote(crate::fixed::TRANSPORT));
+            // Unlike the probe entrance, this one can only traverse the guarded relay group.
+            // DoH endpoints and other non-site transport destinations must never hit final DIRECT.
+            let _ = writeln!(y, "  - name: \"aec-fixed-sites\"\n    type: mixed\n    listen: \"127.0.0.1\"\n    port: {}\n    udp: false\n    proxy: \"relay\"", crate::fixed::ingress_port(ports).expect("validated"));
         }
     }
     y.push_str(&rules(profile));

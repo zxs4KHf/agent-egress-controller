@@ -250,7 +250,7 @@ pub fn browser_checks(
             Some(exit) if public.iter().all(|a| *a == exit) => CheckResult::new(id("R3"), Kind::ReadOnly, Status::Pass, None),
             Some(_) => CheckResult::new(id("R3"), Kind::ReadOnly, Status::Warn, Some("webrtc_other_address")).with(
                 "hint",
-                "WebRTC UDP does not go through the HTTP proxy. The entry's extraArgs may add --force-webrtc-ip-handling-policy=disable_non_proxied_udp (the profile's choice; default off)",
+                "WebRTC UDP does not go through the HTTP proxy. Preview the AI browser environment or explicitly configure --webrtc-ip-handling-policy=disable_non_proxied_udp; saving settings alone is not verification",
             ),
         }
     }

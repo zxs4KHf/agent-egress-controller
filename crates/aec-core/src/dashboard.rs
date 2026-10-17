@@ -143,7 +143,7 @@ pub fn apply(set: &mut ProfileSet, form: RulesForm) -> Result<(), Vec<FieldError
 pub fn page(token: &str, view: &View) -> String {
     crate::ui::template(
         "dashboard.html",
-        include_str!("../../../ui/revisions/fluent-1/dashboard.html"),
+        include_str!("../../../ui/revisions/fluent-2/dashboard.html"),
     )
     .replace("__TOKEN__", token)
     .replace(

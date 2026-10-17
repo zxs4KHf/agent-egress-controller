@@ -59,7 +59,23 @@ MCP 使用官方 2025-11-25 JSON-RPC 生命周期与 newline-delimited stdio tra
 
 检测经显式指定的端口访问 `https://www.cloudflare.com/cdn-cgi/trace`，约 8 秒超时，不跟随重定向，不绕过 TLS，不自动选择或回退直连。`UPSTREAM_HTTPS_OK` 只证明测试 URL 可用，不能报告 GPT 对话、Claude ISP 或整个网关已就绪。核心 0.5.4 是必需条件，只有新版界面或 stdio bridge 不足以提供新工具。
 
-## HTTP/JSON
+## 站点协作与浏览器环境（开发中）
+
+只有包含本功能的新核心才提供以下工具；UI 热更不能给旧核心增加能力：
+
+| 工具 | 参数 | 边界 |
+| --- | --- | --- |
+| `aec_cooperation` | `{}` | 生成只含受保护站点的局部脚本；`status:export_only`，不是安装/激活/验证 |
+| `aec_browser_environment` | `{}` | 读取设置、`canRestore`、待确认计划、历史 `recentError`；泄露证据缺失仍为 unknown |
+| `aec_browser_environment_preview` | `{"scope":"ai_only","language":"en-US","preventWebrtc":true,"disableQuic":true,"remoteDnsOnly":true}` | 生成五分钟确认计划，不应用、不重启；`scope` 还可选 `global`，当前只支持普通 Edge |
+
+不存在 Agent 应用/强制确认工具。用户在看板查看影响浏览器、排除项、原值与目标后确认，或取消。修改选项会使当前 UI 计划失效；过期、旧 planId、外部策略变化与机器策略冲突均拒绝。全局范围不写 Chrome / Chrome for Testing；如指纹浏览器使用 Edge，不能应用全局范围。不要依据独立 user-data-dir 推断注册表策略隔离。
+
+本机页面使用 `POST /browser-environment?t=<页面令牌>`，要求精确 Origin；接受严格的 `state`、`preview`、`apply`（精确 planId）、`restore`。这不是 Agent Bearer 接口；Agent 只能通过同名工具读取或预览，不能借此声称用户已确认。失败码保留在 `browser-environment-last-error.json`，恢复快照在 `browser-environment-recovery.json`。它们不含代理凭据；仍只用于本机排查，不自动上传。`recentError.historical:true` 是历史事件，不等于当前操作仍失败。
+
+`remoteDnsOnly` 对 AI 专用浏览器设置解析阻断及 loopback 代理例外；全局 Edge 只关闭预测/预解析，不改系统 DNS，更不保证 EDNS/ECS 安全。`preventWebrtc` 约束非代理 UDP，不能把没有 ICE 候选当作无泄露。全局语言策略是浏览器界面语言，不承诺所有网页的 Accept-Language；系统显示语言不改变。
+
+## HTTP/JSON 协议
 
 用于自建本机 Agent host。数据目录下的 agent-api.json 是发现信息：
 

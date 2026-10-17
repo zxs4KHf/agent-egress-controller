@@ -64,6 +64,14 @@ pub fn probe_port(ports: &crate::core::CorePorts) -> Option<u16> {
         .filter(|p| !ports.all().contains(p) && *p != ports.relay)
 }
 
+/// The cooperative client entrance is distinct from the ungated identity-probe entrance.
+pub fn ingress_port(ports: &crate::core::CorePorts) -> Option<u16> {
+    ports
+        .tunnel
+        .checked_add(2)
+        .filter(|p| !ports.all().contains(p) && *p != ports.relay)
+}
+
 pub fn path_member(profile: &AgentProfile, path: &str) -> Option<String> {
     if path == "direct" {
         return Some("DIRECT".into());

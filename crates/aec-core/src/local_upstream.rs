@@ -207,10 +207,11 @@ pub fn plan(set: &ProfileSet, command: &Command, ports: CorePorts) -> Result<Pro
                     ports.dns,
                     ports.relay,
                     ports.tunnel,
-                    ports.tunnel + 1,
                     17980,
                 ]
                 .contains(port)
+                || crate::fixed::probe_port(&ports) == Some(*port)
+                || crate::fixed::ingress_port(&ports) == Some(*port)
             {
                 return Err("UPSTREAM_PORT: 端口不能为 0 或 AEC 自己的入口、控制、DNS、relay、隧道及检测端口".into());
             }
