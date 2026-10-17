@@ -13,7 +13,9 @@
 
 > 支持“沿用当前系统代理，仅选定站点固定 ISP”：Clash Verge Rev 2.5.8 默认订阅脚本持久安装/撤销、只读运行规则核对及可选 DNS/ECS 权威回证。保存规则不等于激活或已保护；由用户在 Clash 手动重新激活。全局浏览器设置当前仅支持普通 Edge，排除 Chrome / Chrome for Testing 与使用它们的指纹浏览器。公开下载以 [Releases](https://github.com/zxs4KHf/agent-egress-controller/releases/latest) 为准；推送代码不会自动升级本机网关。
 
-**0.5.8：连接方式明确二选一，并支持 Clash 默认控制通道。** 在托盘“设置与维护 → 连接方式”打开设置，两项并列单选，不能同时开启。
+**0.5.9：系统代理被改写时明确显示红色冲突。** AEC 本地接管期间，托盘与看板变红，并弹出“检测到系统代理已经被更改”的错误提醒。请正常退出 Agent 模式，关闭其他客户端的“系统代理”开关，再重新进入；无需重启 Windows。AEC 不抢回代理、不自动停服，重新检测或把端口改回去不会清除本次冲突。Agent 可读取 `aec_state.systemProxyConflict`；详见 [0.5.9 验证与回滚](docs/RELEASE-0.5.9.md)。公开下载仍以 Releases 为准。
+
+保留 0.5.8 的两种连接方式与 Clash 默认控制通道。在托盘“设置与维护 → 连接方式”打开设置，两项并列单选，不能同时开启。
 
 | 选择 | 需要操作 | 连接路径 |
 | --- | --- | --- |
@@ -160,7 +162,7 @@ R11 通过仅证明观测到的连接遵循路由，实际 ISP 身份和出口 I
 
 ## AI Agent 控制
 
-本次候选为 0.5.8；新增 `clientCooperation` 配置和 G7 `scopeEvidence`，兼容 Clash 默认 named pipe，保留面板、托盘、Agent 共用的本机上游管理、组件增量下载与离线更新诊断。验证范围见 [0.5.8 交付记录](docs/RELEASE-0.5.8.md)，历史记录见 [0.5.7](docs/RELEASE-0.5.7.md)、[0.5.6](docs/RELEASE-0.5.6.md)、[0.5.5](docs/RELEASE-0.5.5.md)、[0.5.4](docs/RELEASE-0.5.4.md)、[0.5.3](docs/RELEASE-0.5.3.md)、[0.5.2](docs/RELEASE-0.5.2.md)、[0.5.1](docs/RELEASE-0.5.1.md)。
+本次候选为 0.5.9；新增外部系统代理改写的红色冲突状态 `systemProxyConflict` 与一次性错误弹窗，保留 `clientCooperation`、G7、默认 named pipe、本机上游管理、组件增量下载与离线更新诊断。验证范围见 [0.5.9 交付记录](docs/RELEASE-0.5.9.md)，历史记录见 [0.5.8](docs/RELEASE-0.5.8.md)、[0.5.7](docs/RELEASE-0.5.7.md)、[0.5.6](docs/RELEASE-0.5.6.md)、[0.5.5](docs/RELEASE-0.5.5.md)、[0.5.4](docs/RELEASE-0.5.4.md)、[0.5.3](docs/RELEASE-0.5.3.md)、[0.5.2](docs/RELEASE-0.5.2.md)、[0.5.1](docs/RELEASE-0.5.1.md)。
 
 发布包包含 aec-agent.exe。在看板选择「Agent 接入与 MCP」并显式开启后，可复制配置到支持本机 MCP stdio 的桌面 Agent；自建本机 host 可用 loopback HTTP/JSON 接口。纯云端 Agent 不能直接访问你的电脑。MCP bridge 不需要另外安装 Node、Python 或 SDK。接口只提供具名状态、设置、规则、路径和模式工具，不提供任意 shell；Agent 看不到密码，需用户在本机设置页填写。对接步骤、HTTP 契约、工具 schema 和安全边界见 [Agent 接入指南](docs/AGENT-INTEGRATION.md)。本机接口默认关闭，托盘关闭后停止。
 
