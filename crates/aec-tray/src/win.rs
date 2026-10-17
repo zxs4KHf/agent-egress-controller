@@ -132,3 +132,9 @@ pub fn message_box(hwnd: HWND, text: &str, title: &str) {
     let (t, c) = (wide(text), wide(title));
     unsafe { MessageBoxW(hwnd, t.as_ptr(), c.as_ptr(), MB_OK | MB_ICONWARNING) };
 }
+
+pub fn error_box(hwnd: HWND, text: &str, title: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+    let (t, c) = (wide(text), wide(title));
+    unsafe { MessageBoxW(hwnd, t.as_ptr(), c.as_ptr(), MB_OK | MB_ICONERROR) };
+}

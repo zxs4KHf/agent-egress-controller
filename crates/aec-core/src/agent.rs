@@ -254,7 +254,7 @@ pub fn tools() -> Value {
         &["kind", "value", "target"],
     );
     let specs = vec![
-        ("aec_state", "Read mode, readiness summary, fixed-exit block, paths and rules. Unknown is never pass.", none.clone(), true),
+        ("aec_state", "Read mode, readiness summary, systemProxyConflict, fixed-exit block, paths and rules. A proxy conflict requires normal Agent exit and re-entry; recheck cannot clear it. Unknown is never pass.", none.clone(), true),
         ("aec_cooperation", "Export an owned selected-site subscription script, without changing or reloading the system proxy client. Export is NOT installation, runtime verification, DNS/ECS safety proof or permission to replace an existing script.", none.clone(), true),
         ("aec_cooperation_state", "Read persistent installation ownership, timestamped runtime/DNS reports and failure codes; never reloads or probes.", none.clone(), true),
         ("aec_cooperation_preview", "Preview only a supported CVR 2.5.8 registered default subscription script footer. Does not change the client, proxy, nodes or fingerprint profiles. Custom scripts require manual merge.", none.clone(), false),

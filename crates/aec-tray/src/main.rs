@@ -66,8 +66,8 @@ mod tray {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::System::Threading::CreateMutexW;
     use windows_sys::Win32::UI::Shell::{
-        Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIIF_WARNING,
-        NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+        Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIIF_INFO,
+        NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -117,6 +117,7 @@ mod tray {
         _agent: Option<aec_core::agent::Server>,
         taskbar_created: u32,
         quitting: bool,
+        proxy_conflict_shown: bool,
     }
 
     thread_local! {
@@ -136,6 +137,7 @@ mod tray {
         Open(String),
         Control(String),
         Warn(String),
+        ProxyConflict,
     }
 
     fn run_effect(hwnd: HWND, e: Effect) {
@@ -164,6 +166,11 @@ mod tray {
                 }
             }
             Effect::Warn(text) => win::message_box(hwnd, &text, "Agent 出口控制器"),
+            Effect::ProxyConflict => win::error_box(
+                hwnd,
+                text::PROXY_CONFLICT_GUIDANCE,
+                text::PROXY_CONFLICT_TITLE,
+            ),
         }
     }
 
@@ -209,7 +216,9 @@ mod tray {
         }
 
         fn icon_and_tip(&self, s: &Shared) -> (HICON, String) {
-            let icon = if s.busy.is_some() {
+            let icon = if s.system_proxy_conflict {
+                self.icons[3]
+            } else if s.busy.is_some() {
                 self.icons[2]
             } else {
                 match s.mode {
@@ -221,7 +230,11 @@ mod tray {
             };
             let tip = format!(
                 "Agent 出口控制器\n{}",
-                s.busy.unwrap_or(text::mode_label(s.mode))
+                if s.system_proxy_conflict {
+                    text::PROXY_CONFLICT_TITLE
+                } else {
+                    s.busy.unwrap_or(text::mode_label(s.mode))
+                }
             );
             (icon, tip)
         }
@@ -237,7 +250,7 @@ mod tray {
             unsafe { Shell_NotifyIconW(NIM_ADD, &n) };
         }
 
-        fn refresh(&mut self) {
+        fn refresh(&mut self) -> Effect {
             let (s, mut note, clip) = {
                 let mut g = self.shared.lock().expect("lock");
                 let note = g.note.take();
@@ -262,9 +275,22 @@ mod tray {
                 n.uFlags |= NIF_INFO;
                 win::fill(&mut n.szInfoTitle, &note.title);
                 win::fill(&mut n.szInfo, &note.text);
-                n.dwInfoFlags = if note.error { NIIF_WARNING } else { NIIF_INFO };
+                n.dwInfoFlags = if s.system_proxy_conflict {
+                    NIIF_ERROR
+                } else if note.error {
+                    NIIF_WARNING
+                } else {
+                    NIIF_INFO
+                };
             }
             unsafe { Shell_NotifyIconW(NIM_MODIFY, &n) };
+            let show_conflict = s.system_proxy_conflict && !self.proxy_conflict_shown;
+            self.proxy_conflict_shown = s.system_proxy_conflict;
+            if show_conflict {
+                Effect::ProxyConflict
+            } else {
+                Effect::None
+            }
         }
 
         fn open_page(&mut self, dashboard: bool) -> Effect {
@@ -324,7 +350,11 @@ mod tray {
                     m,
                     MF_STRING | MF_GRAYED,
                     0,
-                    s.busy.unwrap_or(text::mode_label(s.mode)),
+                    if s.system_proxy_conflict {
+                        text::PROXY_CONFLICT_TITLE
+                    } else {
+                        s.busy.unwrap_or(text::mode_label(s.mode))
+                    },
                 );
                 AppendMenuW(m, MF_SEPARATOR, 0, std::ptr::null());
                 add(m, MF_STRING, ID_DASHBOARD, "打开控制中心");
@@ -536,7 +566,9 @@ mod tray {
                 0
             }
             WM_REFRESH => {
-                if with_ui(|u| u.refresh()).is_none() {
+                if let Some(effect) = with_ui(|u| u.refresh()) {
+                    run_effect(hwnd, effect);
+                } else {
                     // The state is borrowed further up this stack: try again shortly.
                     SetTimer(hwnd, TIMER_REFRESH, 150, None);
                 }
@@ -671,6 +703,7 @@ mod tray {
         }
 
         let shared: SharedRef = Arc::new(Mutex::new(Shared {
+            system_proxy_conflict: false,
             fixed_blocked: true,
             mode: Mode::Daily,
             busy: Some("正在启动…"),
@@ -750,11 +783,13 @@ mod tray {
             _agent: agent.ok(),
             taskbar_created: unsafe { RegisterWindowMessageW(tc.as_ptr()) },
             quitting: false,
+            proxy_conflict_shown: false,
         };
         ui.add_icon();
         UI.with(|u| *u.borrow_mut() = Some(ui));
+        let initial_effect = with_ui(|u| u.refresh()).unwrap_or(Effect::None);
+        run_effect(hwnd, initial_effect);
         let first_run = with_ui(|u| {
-            u.refresh();
             let s = u.state();
             // First run: nothing works without an exit, so start there.
             if std::env::args().any(|a| a == "--dashboard") {
@@ -819,6 +854,7 @@ mod tray {
                     .collect()
             };
             let shared = Arc::new(Mutex::new(Shared {
+                system_proxy_conflict: false,
                 fixed_blocked: false,
                 mode: Mode::AgentReady,
                 busy: None,
@@ -884,6 +920,7 @@ mod tray {
                     _agent: None,
                     taskbar_created: 0,
                     quitting: false,
+                    proxy_conflict_shown: false,
                 })
             });
             for desired in ["Clash", "xxyun"] {
@@ -939,6 +976,41 @@ mod tray {
                 );
                 unsafe {
                     DestroyMenu(menu);
+                }
+            }
+            // A conflict is red even while a recheck is busy. It requests one modal effect
+            // outside the UI borrow; all subsequent refreshes retain the red state silently.
+            let icons = [
+                win::dot_icon(GRAY),
+                win::dot_icon(GREEN),
+                win::dot_icon(AMBER),
+                win::dot_icon(RED),
+            ];
+            with_ui(|ui| ui.icons = icons).unwrap();
+            {
+                let mut state = shared.lock().unwrap();
+                state.system_proxy_conflict = true;
+                state.mode = Mode::AgentUnverified;
+                state.busy = Some("正在重新检测…");
+            }
+            let (icon, tip) = with_ui(|ui| ui.icon_and_tip(&ui.state())).unwrap();
+            assert_eq!(icon, icons[3]);
+            assert!(tip.contains(text::PROXY_CONFLICT_TITLE));
+            assert!(matches!(
+                with_ui(|ui| ui.refresh()),
+                Some(Effect::ProxyConflict)
+            ));
+            assert!(matches!(with_ui(|ui| ui.refresh()), Some(Effect::None)));
+            shared.lock().unwrap().system_proxy_conflict = false;
+            assert!(matches!(with_ui(|ui| ui.refresh()), Some(Effect::None)));
+            shared.lock().unwrap().system_proxy_conflict = true;
+            assert!(matches!(
+                with_ui(|ui| ui.refresh()),
+                Some(Effect::ProxyConflict)
+            ));
+            for icon in icons {
+                unsafe {
+                    DestroyIcon(icon);
                 }
             }
         }

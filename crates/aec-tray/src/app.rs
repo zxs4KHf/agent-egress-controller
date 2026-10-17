@@ -167,6 +167,7 @@ pub struct Note {
 
 #[derive(Debug, Clone)]
 pub struct Shared {
+    pub system_proxy_conflict: bool,
     pub fixed_blocked: bool,
     pub mode: Mode,
     /// Set while a command runs; menu actions are disabled.
@@ -258,6 +259,7 @@ impl Worker {
         {
             let mut s = self.shared.lock().expect("lock");
             s.mode = self.controller.state().mode;
+            s.system_proxy_conflict = self.controller.state().system_proxy_conflict;
             s.client_cooperation = self.controller.settings().client_cooperation;
             s.fixed_blocked = p.egress.fixed_exit && !self.controller.platform().fixed_verified();
             s.busy = busy;
@@ -639,13 +641,8 @@ impl Worker {
     fn keep(&mut self) {
         match self.controller.keep_system_proxy() {
             None => {}
-            Some(KeepOutcome::Changed { found }) => self.note(
-                "系统代理发生冲突",
-                &format!(
-                    "检测到系统代理被改为 {found}，当前是 AEC 接管兼容模式，已撤销就绪；AEC 不会抢写。若要保留 Clash 系统代理，请在出口设置改用「站点协作」并安装、激活选定站点规则，不要靠反复开关混用。若继续 AEC 接管模式，另一客户端仅运行本地上游。具体步骤见托盘「代理冲突说明」。"
-                ),
-                true,
-            ),
+            // The UI observes the latched conflict and shows one error dialog per session.
+            Some(KeepOutcome::Changed { .. }) => {}
             Some(KeepOutcome::Failed(e)) => self.note("系统代理巡检失败", &e, true),
         }
         let p = agent_profile(&self.layout.data_dir);
@@ -669,6 +666,7 @@ impl Worker {
                 profile: &p,
             });
             let refresh_unverified = !self.controller.settings().client_cooperation
+                && !self.controller.state().system_proxy_conflict
                 && needs_refresh(&poll, self.controller.state().mode);
             match poll {
                 FixedPoll::Healthy => {}
@@ -1232,6 +1230,7 @@ impl SetupBackend for Backend {
         view.autostart = crate::startup::enabled();
         view.client_cooperation = Settings::load(&self.data_dir).client_cooperation;
         view.scope_evidence = s.scope_evidence;
+        view.system_proxy_conflict = s.system_proxy_conflict;
         Some(view)
     }
     fn startup(&self, enabled: bool) -> Result<(), Vec<FieldError>> {

@@ -127,6 +127,9 @@ pub struct ControllerState {
     /// The system proxy item of the takeover gate as evaluated when entering; G6 depends on it.
     #[serde(default)]
     pub system_proxy_gate: ItemGate,
+    /// External takeover invalidates the session until a normal exit and fresh entry.
+    #[serde(default)]
+    pub system_proxy_conflict: bool,
 }
 
 impl Default for ControllerState {
@@ -144,6 +147,7 @@ impl Default for ControllerState {
             timezone_writable: false,
             foreign_writers: Vec::new(),
             system_proxy_gate: ItemGate::default(),
+            system_proxy_conflict: false,
         }
     }
 }
@@ -552,6 +556,7 @@ impl<P: Platform> Controller<P> {
 
         // E1 preflight: nothing has changed yet, so a failure simply returns.
         self.last_proxy_change = None;
+        self.state.system_proxy_conflict = false;
         let problems: Vec<_> = validate_agent_profile(profile)
             .into_iter()
             .filter(|e| !(opts.direct_test && e.path == "agent.egress.candidates"))
@@ -724,7 +729,9 @@ impl<P: Platform> Controller<P> {
 
     /// Network checks from the platform plus the checks that need this state machine's context
     /// (G4, R10), with missing required checks filled in as unknown.
-    fn full_report(&self, profile: &AgentProfile) -> CheckReport {
+    fn full_report(&mut self, profile: &AgentProfile) -> CheckReport {
+        // A user-requested recheck must not erase a takeover seen before the next timer tick.
+        self.keep_system_proxy();
         let mut report = self.platform.run_checks(profile);
 
         // Browser entries started in this session: G5, R3–R5 from their check pages.
@@ -808,6 +815,20 @@ impl<P: Platform> Controller<P> {
         if self.settings.client_cooperation {
             report.results.retain(|r| r.id != "G6");
         }
+        if !self.state.system_proxy_conflict
+            && report.results.iter().any(|r| {
+                r.id == "G6"
+                    && r.status == Status::Fail
+                    && r.reason.as_deref() == Some("system_proxy_changed")
+            })
+        {
+            self.state.system_proxy_conflict = true;
+            self.event(
+                Level::Error,
+                "observe.system_proxy.changed",
+                json!({"code":"SYSTEM_PROXY_CHANGED","source":"G6","recovery":"exit_and_reenter"}),
+            );
+        }
         report
     }
 
@@ -815,6 +836,14 @@ impl<P: Platform> Controller<P> {
     fn system_scope_check(&self, profile: &AgentProfile) -> Option<CheckResult> {
         if profile.proxy_scope.mode != ProxyScopeMode::SystemAndExplicit {
             return None;
+        }
+        if self.state.system_proxy_conflict {
+            return Some(CheckResult::new(
+                "G6",
+                Kind::Hard,
+                Status::Fail,
+                Some("system_proxy_changed"),
+            ).with("recovery", "Exit Agent mode, turn off the conflicting client's system proxy switch, then re-enter Agent mode"));
         }
         let target = self.system_proxy_target(profile);
         let want = target.proxy_server.clone().unwrap_or_default();
@@ -869,6 +898,9 @@ impl<P: Platform> Controller<P> {
         {
             return None;
         }
+        if self.state.system_proxy_conflict {
+            return None;
+        }
         let ours = self.state.journal.iter().rev().find_map(|e| match e {
             JournalEntry::Global {
                 after: after @ GlobalValue::SystemProxy { .. },
@@ -907,7 +939,12 @@ impl<P: Platform> Controller<P> {
         if self.last_proxy_change.as_ref() == Some(&current) {
             return None;
         }
+        self.state.system_proxy_conflict = true;
+        self.state.mode = Mode::AgentUnverified;
         if let Err(e) = self.proxy_check(Status::Fail, Some("system_proxy_changed")) {
+            return Some(KeepOutcome::Failed(e.to_string()));
+        }
+        if let Err(e) = self.persist() {
             return Some(KeepOutcome::Failed(e.to_string()));
         }
         self.last_proxy_change = Some(current.clone());
@@ -920,9 +957,9 @@ impl<P: Platform> Controller<P> {
             other => format!("{other:?}"),
         };
         self.event(
-            Level::Warn,
+            Level::Error,
             "observe.system_proxy.changed",
-            json!({ "found": found }),
+            json!({ "code": "SYSTEM_PROXY_CHANGED", "recovery": "exit_and_reenter" }),
         );
         Some(KeepOutcome::Changed { found })
     }
@@ -1295,6 +1332,7 @@ impl<P: Platform> Controller<P> {
             json!({ "mode": mode_after.as_str(), "items": items.len() }),
         );
         if mode_after == Mode::Daily {
+            self.state.system_proxy_conflict = false;
             self.state.correlation_id = None;
             self.state.timezone_writable = false;
             self.state.foreign_writers.clear();
@@ -1922,6 +1960,11 @@ mod tests {
         );
         assert_eq!(c.state().mode, Mode::AgentUnverified);
         assert_eq!(
+            serde_json::to_value(c.state()).unwrap()["systemProxyConflict"],
+            true,
+            "a known external takeover must remain visible as an error, not a generic warning"
+        );
+        assert_eq!(
             g6(c.state().last_report.as_ref().unwrap()).status,
             Status::Fail
         );
@@ -1929,14 +1972,51 @@ mod tests {
         assert_eq!(c.keep_system_proxy(), None);
         assert_eq!(c.platform().host.borrow().proxy, clash);
         assert_eq!(c.platform().writes.borrow().len(), writes, "still no write");
-        // Once the user turns the other client's system proxy switch off, G6 returns.
+        // Returning the value alone cannot validate connections opened during the takeover.
         c.platform().host.borrow_mut().proxy = ours;
         assert_eq!(c.keep_system_proxy(), None);
-        assert_eq!(c.state().mode, Mode::AgentReady);
+        c.recheck(&prof).unwrap();
+        assert_eq!(c.state().mode, Mode::AgentUnverified);
         assert_eq!(
             g6(c.state().last_report.as_ref().unwrap()).status,
-            Status::Pass
+            Status::Fail
         );
+        assert_eq!(c.platform().writes.borrow().len(), writes);
+        assert_eq!(c.exit().unwrap().mode_after, Mode::Daily);
+        assert_eq!(
+            serde_json::to_value(c.state()).unwrap()["systemProxyConflict"],
+            false
+        );
+        assert_eq!(
+            c.enter(&prof, EnterOptions::default()).unwrap().mode,
+            Mode::AgentReady
+        );
+    }
+
+    #[test]
+    fn recheck_latches_external_takeover_before_the_timer_and_survives_report_reset() {
+        let d = tmp("recheck-proxy-conflict");
+        let mut c = open(FakePlatform::new(), &d, true);
+        let prof = system_scope();
+        c.enter(&prof, EnterOptions::default()).unwrap();
+        let writes = c.platform().writes.borrow().len();
+        c.platform().host.borrow_mut().proxy.flags = proxy_flags::DIRECT;
+        let report = c.recheck(&prof).unwrap();
+        assert_eq!(g6(&report).status, Status::Fail);
+        assert!(c.state().system_proxy_conflict);
+        assert_eq!(c.platform().writes.borrow().len(), writes);
+        c.invalidate_routing_checks().unwrap();
+        assert!(
+            c.state().system_proxy_conflict,
+            "route changes cannot clear the warning"
+        );
+        let reopened = open(FakePlatform::new(), &d, true);
+        assert!(
+            reopened.state().system_proxy_conflict,
+            "closing UI cannot erase conflict evidence"
+        );
+        assert_eq!(c.exit().unwrap().mode_after, Mode::Daily);
+        assert!(!c.state().system_proxy_conflict);
     }
 
     #[test]
@@ -1952,6 +2032,10 @@ mod tests {
             Some(KeepOutcome::Failed(_))
         ));
         assert_eq!(c.state().mode, Mode::AgentUnverified);
+        assert!(
+            !c.state().system_proxy_conflict,
+            "unknown is not evidence of external takeover"
+        );
         assert_eq!(
             g6(c.state().last_report.as_ref().unwrap()).status,
             Status::Unknown

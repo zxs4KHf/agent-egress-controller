@@ -201,6 +201,23 @@ async function run() {
       await dashboard.locator('#updatesPanel > summary').click();
     }
     await page.locator('[data-tab=dashboard]').click();await dashboard.locator('#siteSearch').fill('');await dashboard.locator('#targetFilter').selectOption('all');
+    // Replay observed external takeover evidence; never mutate the real Windows proxy.
+    let proxyConflict=true;
+    await page.route('**/state?*',async route=>{const response=await route.fetch();const state=await response.json();await route.fulfill({response,json:{...state,mode:proxyConflict?'agent_unverified':'daily',systemProxyConflict:proxyConflict,fixedExit:true,blocked:false}})});
+    await page.locator('#refresh').click();
+    await page.locator('#state').filter({hasText:'检测到系统代理已经被更改'}).waitFor({timeout:10000});
+    await dashboard.locator('#proxyConflict').filter({visible:true}).waitFor({timeout:10000});
+    assert.equal(await page.locator('#dot').evaluate(el=>getComputedStyle(el).backgroundColor),'rgb(180, 35, 24)');
+    assert.match(await dashboard.locator('#modeBadge').getAttribute('class'),/error/);
+    assert.match(await dashboard.locator('#guardBadge').getAttribute('class'),/error/);
+    assert.match(await dashboard.locator('#guardBadge').innerText(),/入口已失去验证/);
+    assert.match(await dashboard.locator('#proxyConflict').innerText(),/退出 Agent 模式/);
+    assert.match(await dashboard.locator('#proxyConflict').innerText(),/重新进入/);
+    await dashboard.locator('#proxyConflict').scrollIntoViewIfNeeded();
+    if(installation){await page.screenshot({path:path.resolve('.scratch/ui-qa/proxy-conflict.png')})}
+    proxyConflict=false;await page.locator('#refresh').click();
+    await dashboard.locator('#proxyConflict').waitFor({state:'hidden',timeout:10000});
+    await page.unroute('**/state?*');
     const screenshotDir=process.env.AEC_UI_SCREENSHOT_DIR||'.scratch/ui-qa';fs.mkdirSync(screenshotDir,{recursive:true});
     await dashboard.locator('main').evaluate(el=>el.scrollIntoView({block:'start'}));
     await page.screenshot({path:path.join(screenshotDir,'dashboard.png')});

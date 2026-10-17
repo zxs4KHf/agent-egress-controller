@@ -130,16 +130,16 @@ jobs:
       - name: Upload release candidates
         uses: actions/upload-artifact@v4
         with:
-          name: AgentEgressController-0.5.8-windows
+          name: AgentEgressController-0.5.9-windows
           path: |
-            dist/AgentEgressController-0.5.8-portable.zip
-            dist/AgentEgressController-0.5.8-setup.exe
-            dist/SHA256SUMS-0.5.8.txt
-            dist/SHA256SETUP-0.5.8.txt
-            dist/aec-update-0.5.8.ps1
-            dist/SHA256UPDATER-0.5.8.txt
-            dist/aec-incremental-0.5.8.json
-            dist/SHA256INCREMENTAL-0.5.8.txt
-            dist/aec-0.5.8-*.zip
+            dist/AgentEgressController-0.5.9-portable.zip
+            dist/AgentEgressController-0.5.9-setup.exe
+            dist/SHA256SUMS-0.5.9.txt
+            dist/SHA256SETUP-0.5.9.txt
+            dist/aec-update-0.5.9.ps1
+            dist/SHA256UPDATER-0.5.9.txt
+            dist/aec-incremental-0.5.9.json
+            dist/SHA256INCREMENTAL-0.5.9.txt
+            dist/aec-0.5.9-*.zip
           if-no-files-found: error
           retention-days: 14

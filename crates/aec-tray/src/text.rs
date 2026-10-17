@@ -4,6 +4,9 @@ use aec_core::checks::{CheckReport, CheckResult, Kind, Status};
 use aec_core::controller::{Mode, RestoreReport, RestoreStatus};
 use aec_core::profile::Entry;
 
+pub const PROXY_CONFLICT_TITLE: &str = "检测到系统代理已经被更改";
+pub const PROXY_CONFLICT_GUIDANCE: &str = "检测到系统代理已经被更改\n\n其他软件或系统操作改变了代理入口，当前会话已失去验证，无法保证日常应用仍经固定 ISP。AEC 不会抢回系统代理。\n\n1. 从托盘或看板退出 Agent 模式。\n2. 关闭 Clash 等其他客户端的“系统代理”开关，保留需要的代理内核运行。\n3. 重新进入 Agent 模式，检测通过后再使用。\n\n重新检测或恢复原端口不能解除本次警告。无需重启 Windows。如需保留 Clash 系统代理，请退出后在连接方式中选择站点协作并安装、激活规则。";
+
 pub fn mode_label(mode: Mode) -> &'static str {
     match mode {
         Mode::Daily => "日常模式",
