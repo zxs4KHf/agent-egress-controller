@@ -6,6 +6,41 @@ pub const TRANSPORT: &str = "aec-relay-transport";
 pub const FIRST_HOP: &str = "aec-first-hop";
 pub const PROBE_URL: &str = "https://www.cloudflare.com/cdn-cgi/trace";
 
+/// Network adapter shared by explicit rechecks and periodic fixed-exit observation.
+pub trait Inspection {
+    fn verified(&self) -> bool;
+    fn verify(&self) -> Result<(), crate::controller::Fault>;
+    fn block(&self) -> Result<(), crate::controller::Fault>;
+    fn open(&self) -> Result<(), crate::controller::Fault>;
+}
+pub enum InspectionOutcome {
+    Healthy,
+    Recovered,
+    Blocked {
+        was_verified: bool,
+        probe_error: crate::controller::Fault,
+        block_error: Option<crate::controller::Fault>,
+    },
+}
+pub fn inspect(gate: &impl Inspection) -> InspectionOutcome {
+    let was_verified = gate.verified();
+    match gate.verify().and_then(|()| {
+        if was_verified {
+            Ok(false)
+        } else {
+            gate.open().map(|()| true)
+        }
+    }) {
+        Ok(false) => InspectionOutcome::Healthy,
+        Ok(true) => InspectionOutcome::Recovered,
+        Err(probe_error) => InspectionOutcome::Blocked {
+            was_verified,
+            probe_error,
+            block_error: gate.block().err(),
+        },
+    }
+}
+
 /// This service family is locked while fixed-exit protection is enabled. Ordinary-upstream and
 /// other service switches must never silently remove it, including newly added subdomains.
 pub const CLAUDE_DOMAINS: [&str; 4] = [

@@ -9,6 +9,51 @@ use std::sync::{
 use std::time::Duration;
 
 #[test]
+fn running_core_log_evidence_survives_utc_day_change() {
+    use aec_core::checks::CoreObserver;
+    use aec_core::core::{preflight::OwnedProcess, process::CoreManager, CorePorts};
+    let data = std::env::temp_dir().join(format!(
+        "aec-log-day-{}",
+        aec_core::crypto::random_hex(8).unwrap()
+    ));
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(data.clone());
+    std::fs::create_dir_all(data.join("core")).unwrap();
+    std::fs::create_dir_all(data.join("logs")).unwrap();
+    let owned = OwnedProcess {
+        role: "core".into(),
+        pid: 0,
+        exe: "isolated-fixture.exe".into(),
+        created: 1,
+        started_at_unix_ms: 946_684_800_000,
+    };
+    std::fs::write(
+        data.join("core/owned.json"),
+        serde_json::to_vec(&owned).unwrap(),
+    )
+    .unwrap();
+    let log = data.join("logs/core-20000101.log");
+    std::fs::write(&log, "").unwrap();
+    let manager = CoreManager {
+        data_dir: data,
+        bin: "unused.exe".into(),
+        relay_bin: "unused-relay.exe".into(),
+        ports: CorePorts::default(),
+    };
+    let observer = aec_core::live::CoreLogObserver::for_core(&manager);
+    let mark = observer.mark();
+    std::fs::write(&log, "time=\"2000-01-02T01:00:00Z\" level=info msg=\"[TCP] 127.0.0.1:45000 --> claude.ai:443 match DomainSuffix(claude.ai) using relay[aec-relay-transport]\"\n").unwrap();
+    let records = observer.records_since(mark).expect("Detection must read the running core's existing log after midnight, not a nonexistent new-day file");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].host, "claude.ai");
+}
+
+#[test]
 fn each_detection_request_has_fresh_proxy_connection_evidence() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
