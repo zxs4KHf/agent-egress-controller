@@ -1,4 +1,7 @@
-param([string]$AgentExe = (Join-Path (Split-Path -Parent $PSScriptRoot) 'target/debug/aec-agent.exe'))
+param(
+    [string]$AgentExe = (Join-Path (Split-Path -Parent $PSScriptRoot) 'target/debug/aec-agent.exe'),
+    [string]$UpdaterPath = (Join-Path $PSScriptRoot 'portable/aec-update.ps1')
+)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 function Import-Functions([string]$Path) {
@@ -7,7 +10,7 @@ function Import-Functions([string]$Path) {
     if ($errors.Count) { throw 'Updater parse error' }
     [scriptblock]::Create((@($ast.EndBlock.Statements | Where-Object { $_ -is [Management.Automation.Language.FunctionDefinitionAst] } | ForEach-Object { $_.Extent.Text }) -join "`n"))
 }
-. (Import-Functions (Join-Path $repo 'packaging/portable/aec-update.ps1'))
+. (Import-Functions $UpdaterPath)
 # These must exercise the same planner/downloader/journal used by the interactive updater.
 foreach ($name in @('Get-IncrementalPlan','Receive-IncrementalPackage','Initialize-UpdateLog','Write-UpdateFailure')) {
     if (-not (Get-Command $name -ErrorAction SilentlyContinue)) { throw "REGRESSION: $name missing; downloads are full ZIP and failures are popup-only" }
@@ -45,17 +48,19 @@ try {
     $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0); $listener.Start()
     $port=$listener.LocalEndpoint.Port
     $server=[PowerShell]::Create()
-    $serveOnce={ param($listener,$file,[int]$status=200)
+    $serveOnce={ param($listener,$file,[int[]]$statuses=@(200))
+      foreach($status in $statuses) {
         $client=$listener.AcceptTcpClient()
         try {
             $stream=$client.GetStream(); $stream.ReadTimeout=5000
             $reader=[IO.StreamReader]::new($stream)
             while ($reader.ReadLine()) { }
-            $body=[IO.File]::ReadAllBytes($file)
+            $body=if($status -eq 200){[IO.File]::ReadAllBytes($file)}else{[Text.Encoding]::ASCII.GetBytes('synthetic HTTP failure')}
             $header=[Text.Encoding]::ASCII.GetBytes("HTTP/1.1 $status Test`r`nContent-Length: $($body.Length)`r`nConnection: close`r`n`r`n")
             $stream.Write($header,0,$header.Length); $stream.Write($body,0,$body.Length)
-            return $body.Length
+            $body.Length
         } finally { $client.Dispose() }
+      }
     }
     [void]$server.AddScript($serveOnce).AddArgument($listener).AddArgument((Join-Path $assets $plan.Components[0].asset))
     $pending=$server.BeginInvoke()
@@ -77,6 +82,35 @@ try {
     Assert ([IO.File]::ReadAllText((Join-Path $target 'docs/test.md')) -eq 'old-doc') 'Rollback failed'
     Assert ([IO.File]::ReadAllText((Join-Path $target 'data/profiles.json')) -eq 'private-fixture-must-stay') 'User data changed'
     Write-Output "PASS: actual HTTP incremental bytes=$sent; unchanged 1048576-byte core skipped; verified reconstruction, hot install, rollback, no-op and data preservation."
+
+    # A real temporary HTTP failure must recover within this attempt, with evidence
+    # retained for the Agent and no second download/shutdown confirmation.
+    $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0); $listener.Start()
+    $port=$listener.LocalEndpoint.Port; $server=[PowerShell]::Create()
+    [void]$server.AddScript($serveOnce).AddArgument($listener).AddArgument((Join-Path $assets $plan.Components[0].asset)).AddArgument(@(503,200))
+    $pending=$server.BeginInvoke()
+    try {
+        Write-UpdateEvent 'download_components' 'running'
+        $retried=Join-Path $sandbox 'retry-download.zip'
+        Receive-UpdateAsset ([pscustomobject]@{size=$sent;browser_download_url="http://127.0.0.1:$port/retry"}) $retried
+        [void]$server.EndInvoke($pending)
+        Assert ((Get-FileHash $retried).Hash -eq (Get-FileHash (Join-Path $assets $plan.Components[0].asset)).Hash) 'Retry accepted incorrect bytes'
+        Assert (@($script:UpdateLog.events | Where-Object {$_.status -eq 'running' -and $_.code -eq 'http_failed' -and $_.httpStatus -eq 503}).Count -eq 1) 'Transient download failure evidence lost'
+        Write-Output 'PASS: real HTTP 503 then 200 recovers, exact bytes validated, retry evidence retained.'
+    } finally { $listener.Stop(); $server.Dispose() }
+
+    $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0); $listener.Start()
+    $port=$listener.LocalEndpoint.Port; $server=[PowerShell]::Create()
+    [void]$server.AddScript($serveOnce).AddArgument($listener).AddArgument($retried).AddArgument(@(503,503,503))
+    $pending=$server.BeginInvoke()
+    try {
+        Reject { Invoke-UpdateStep 'download_components' {
+            Receive-UpdateAsset ([pscustomobject]@{size=1;browser_download_url="http://127.0.0.1:$port/unavailable"}) (Join-Path $sandbox 'exhausted-download')
+        } } 'Retry exhaustion was accepted'
+        [void]$server.EndInvoke($pending)
+        Assert ($script:UpdateLog.events[-1].status -eq 'failed' -and $script:UpdateLog.events[-1].httpStatus -eq 503) 'Exhausted download did not retain final failure'
+        Write-Output 'PASS: persistent HTTP 503 stops after three attempts and retains terminal failure; no installation.'
+    } finally { $listener.Stop(); $server.Dispose() }
 
     # UI-only does not fetch a changed executable, nor select it for installation.
     [IO.File]::WriteAllText((Join-Path $target 'aec-tray.exe'),'older-tray')
@@ -123,19 +157,18 @@ try {
     Assert (-not ($agentOutput -join '').Contains('NEVER-PERSIST')) 'Agent output leaked exception'
     $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0); $listener.Start()
     $port=$listener.LocalEndpoint.Port; $server=[PowerShell]::Create()
-    [void]$server.AddScript($serveOnce).AddArgument($listener).AddArgument($logPath).AddArgument(503)
+    [void]$server.AddScript($serveOnce).AddArgument($listener).AddArgument($logPath).AddArgument(404)
     $pending=$server.BeginInvoke()
     try {
         Reject { Invoke-UpdateStep 'download_components' {
             Receive-UpdateAsset ([pscustomobject]@{size=1;browser_download_url="http://127.0.0.1:$port/fail"}) (Join-Path $sandbox 'failed-download')
-        } } 'HTTP 503 was accepted'
+        } } 'HTTP 404 was accepted'
         [void]$server.EndInvoke($pending)
         $record=Get-Content -LiteralPath $logPath -Raw | ConvertFrom-Json
-        Assert ($record.events[-1].code -eq 'http_failed' -and $record.events[-1].httpStatus -eq 503) 'Actual HTTP error status was not recorded'
+        Assert ($record.events[-1].code -eq 'http_failed' -and $record.events[-1].httpStatus -eq 404) 'Actual HTTP error status was not recorded'
     } finally { $listener.Stop(); $server.Dispose() }
     # Run the actual interactive entry flow in a child PowerShell, but replace only external
     # I/O/dialog/lifecycle boundaries. A unique mutex and synthetic install make it isolated.
-    $updaterPath=Join-Path $repo 'packaging/portable/aec-update.ps1'
     $tokens=$null; $parseErrors=$null
     $ast=[Management.Automation.Language.Parser]::ParseFile($updaterPath,[ref]$tokens,[ref]$parseErrors)
     $definitions=(@($ast.EndBlock.Statements | Where-Object { $_ -is [Management.Automation.Language.FunctionDefinitionAst] } | ForEach-Object { $_.Extent.Text }) -join "`n")
@@ -155,11 +188,25 @@ function Invoke-RestMethod { param($Uri,$Headers,$TimeoutSec)
     Get-Content -LiteralPath (Join-Path $Assets 'release-fixture.json') -Raw | ConvertFrom-Json
 }
 function Receive-UpdateAsset($Asset,[string]$Destination) {
-    if ($Scenario -eq 'manifest-fails' -and $Asset.name -like 'aec-incremental*') { Stop-Update 'hash_mismatch' }
+    if ($Scenario -in @('manifest-fails','failure-can-retry') -and $Asset.name -like 'aec-incremental*') { Stop-Update 'hash_mismatch' }
     Copy-Item -LiteralPath (Join-Path $Assets $Asset.name) -Destination $Destination
     $script:UpdateLog.downloadedBytes += (Get-Item -LiteralPath $Destination).Length
 }
 function Show-UpdateMessage([string]$Text,[string]$Title,[bool]$Confirm=$false) {
+    if ($Scenario -eq 'failure-can-retry' -and -not $Confirm) {
+        # A different thread must be able to retry while the terminal dialog is open.
+        $probe=[PowerShell]::Create()
+        try {
+            [void]$probe.AddScript({param($name)
+                $mutex=[Threading.Mutex]::new($false,$name)
+                $owned=$false
+                try { $owned=$mutex.WaitOne(0); return $owned }
+                finally { if($owned){$mutex.ReleaseMutex()}; $mutex.Dispose() }
+            }).AddArgument($FixtureMutex)
+            $free=@($probe.Invoke())[0]
+            [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'retry-lock.txt'),[string]$free)
+        } finally { $probe.Dispose() }
+    }
     if (-not $Confirm) { return $false }
     if ($script:UpdateStage -eq 'confirm_core') { return $false }
     return $Scenario -ne 'cancel-download'
@@ -170,6 +217,8 @@ function Start-Process { throw 'TEST MUST NEVER START A REAL SERVICE' }
     foreach ($case in @(
         @{Name='discovery-fails';Status='failed';Code='network_timeout'},
         @{Name='manifest-fails';Status='failed';Code='hash_mismatch'},
+        @{Name='failure-can-retry';Status='failed';Code='hash_mismatch'},
+        @{Name='already-updating';Status='cancelled';Code='update_busy'},
         @{Name='cancel-download';Status='cancelled';Code='none'},
         @{Name='cancel-core';Status='cancelled';Code='none'},
         @{Name='hot-install';Status='succeeded';Code='hot_updated'}
@@ -182,14 +231,24 @@ function Start-Process { throw 'TEST MUST NEVER START A REAL SERVICE' }
         $runner=Join-Path $install 'test-entry.ps1'
         # Keep the production entry's launch marker: a packaged Agent really re-executes this
         # isolated script, including these I/O overrides, before any update operation.
-        $prefix='param([string]$Assets,[string]$Scenario,[switch]$IndependentLaunch)' + "`n" + '$CurrentPid=1; $CurrentVersion="8.0.0"; $DataDir=Join-Path $PSScriptRoot "data"; [switch]$UiOnly=$false; $SelfTest=$false; $ResumeAgent=$false; $OpenDashboard=$false' + "`n"
+        $fixtureMutex=[regex]::Match($entry,'Local\\AEC-Test-[a-f0-9]+').Value
+        $prefix='param([string]$Assets,[string]$Scenario,[switch]$IndependentLaunch)' + "`n" + '$CurrentPid=1; $CurrentVersion="8.0.0"; $DataDir=Join-Path $PSScriptRoot "data"; [switch]$UiOnly=$false; $SelfTest=$false; $ResumeAgent=$false; $OpenDashboard=$false' + "`n" + '$FixtureMutex=' + "'$fixtureMutex'" + "`n"
         [IO.File]::WriteAllText($runner,($prefix + $definitions + "`n" + $overrides + "`n" + $entry),[Text.UTF8Encoding]::new($true))
-        & powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Assets $assets -Scenario $case.Name | Out-Null
+        $heldMutex=$null
+        try {
+            if ($case.Name -eq 'already-updating') {
+                $heldMutex=[Threading.Mutex]::new($true,$fixtureMutex)
+            }
+            & powershell -NoProfile -ExecutionPolicy Bypass -File $runner -Assets $assets -Scenario $case.Name | Out-Null
+        } finally { if($heldMutex){$heldMutex.ReleaseMutex();$heldMutex.Dispose()} }
         $expectedExit=if ($case.Status -eq 'failed') {1} else {0}
         Assert ($LASTEXITCODE -eq $expectedExit) "Entry flow wrong exit: $($case.Name)"
         $log=Get-ChildItem -LiteralPath (Join-Path $install 'data/update-logs') -Filter '*.json' | Select-Object -First 1
         $run=Get-Content -LiteralPath $log.FullName -Raw | ConvertFrom-Json
         Assert ($run.events[-1].status -eq $case.Status -and $run.events[-1].code -eq $case.Code) "Entry flow lost terminal evidence: $($case.Name)"
+        if ($case.Name -eq 'failure-can-retry') {
+            Assert ((Get-Content -LiteralPath (Join-Path $install 'retry-lock.txt') -Raw) -eq 'True') 'UPDATE_BUSY: terminal failure dialog prevents retry even though no update work remains'
+        }
         Assert (-not (Get-Content -LiteralPath $log.FullName -Raw).Contains('SECRET')) 'Entry flow secret leaked'
         $expectedDoc=if ($case.Name -eq 'hot-install') {'new-doc'} else {'old-doc'}
         Assert ([IO.File]::ReadAllText((Join-Path $install 'docs/test.md')) -eq $expectedDoc) "Entry flow changed files after failure/cancel: $($case.Name)"
