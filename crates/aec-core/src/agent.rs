@@ -125,6 +125,7 @@ fn cooperation_error(errors: Vec<crate::profile::FieldError>) -> String {
         "COOP_CLIENT_NOT_FOUND",
         "COOP_CLIENT_VERSION_UNSUPPORTED",
         "COOP_CONTROLLER_DISABLED",
+        "COOP_CONTROLLER_PIPE_INVALID",
         "COOP_CONTROLLER_NOT_IPV4_LOOPBACK",
         "COOP_CONTROLLER_OWNER_UNKNOWN",
         "COOP_CONTROLLER_AUTH_UNAVAILABLE",
@@ -207,7 +208,12 @@ fn settings_properties() -> Value {
     ] {
         p.insert(key.into(), json!({"type":"string"}));
     }
-    for key in ["tunnelEnabled", "tunnelDirectFallback", "domesticDirect"] {
+    for key in [
+        "tunnelEnabled",
+        "tunnelDirectFallback",
+        "domesticDirect",
+        "clientCooperation",
+    ] {
         p.insert(key.into(), json!({"type":"boolean"}));
     }
     for key in ["maxInflight", "connectTimeoutMs", "dialBudgetMs"] {
@@ -254,7 +260,7 @@ pub fn tools() -> Value {
         ("aec_cooperation_preview", "Preview only a supported CVR 2.5.8 registered default subscription script footer. Does not change the client, proxy, nodes or fingerprint profiles. Custom scripts require manual merge.", none.clone(), false),
         ("aec_cooperation_install", "Install the exact unexpired preview footer persistently. No automatic client activation/reload; user reactivates in Clash then verifies. Only execute after user authorizes selected-site rules.", schema(json!({"planId":{"type":"string"}}), &["planId"]), false),
         ("aec_cooperation_restore", "Remove this owned footer only if unchanged. Never overwrites foreign edits or reloads the client; user reactivates in Clash.", none.clone(), false),
-        ("aec_cooperation_verify", "Read existing authenticated loopback CVR core rule evidence. No config mutation or external query. Rules/HTTP type alone cannot prove endpoint, DNS or ISP identity.", none.clone(), true),
+        ("aec_cooperation_verify", "Read the existing OS-authenticated CVR pipe or authenticated loopback controller. No config mutation or external query. Rules/HTTP type alone cannot prove endpoint, DNS or ISP identity. aec_state.scopeEvidence reports current system entry scope.", none.clone(), true),
         ("aec_cooperation_dns_probe", "Opt-in external DNS authority TXT probes: current client resolver and explicit Google DoH through AEC fixed ingress. Sends random diagnostics to dnscheck.tools/Google; no permanent extra sites. Scope is not all browser/Claude DNS. consent must reflect explicit user agreement.", schema(json!({"consent":{"type":"boolean"}}), &["consent"]), false),
         ("aec_browser_environment", "Read browser environment settings and recovery availability. Saved settings never imply runtime DNS/WebRTC/UDP/ECS verification.", none.clone(), true),
         ("aec_browser_environment_preview", "Preview AI-only or global supported-Edge browser changes. Chrome/Chrome for Testing/fingerprint profiles are excluded from global policies. Creates a five-minute local confirmation plan, never applies or restarts browsers. User must review and confirm in the panel.", schema(json!({"scope":{"type":"string","enum":["ai_only","global"]},"language":{"type":"string","enum":crate::setup::LANGUAGES.iter().map(|p|p.0).collect::<Vec<_>>()},"preventWebrtc":{"type":"boolean"},"disableQuic":{"type":"boolean"},"remoteDnsOnly":{"type":"boolean"}}), &["scope","language","preventWebrtc","disableQuic","remoteDnsOnly"]), false),
@@ -483,6 +489,9 @@ pub fn patch_settings(
     for (key, value) in patch.as_object().unwrap() {
         base.insert(key.clone(), value.clone());
     }
+    if patch["clientCooperation"] == true {
+        base.insert("systemProxy".into(), false.into());
+    }
     serde_json::from_value(current).map_err(|_| error())
 }
 
@@ -671,6 +680,7 @@ mod tests {
                     stored_user: None,
                     tunnel_password_stored: false,
                     takeover_enabled: false,
+                    client_cooperation: false,
                     locked: false,
                 },
             )
@@ -785,6 +795,22 @@ mod tests {
         let tools = tools();
         assert!(!tools.to_string().contains("password\""));
         assert!(fake.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn agent_can_select_cooperation_without_enabling_system_takeover() {
+        let fake = Fake(Mutex::new(Vec::new()));
+        call(
+            &fake,
+            Call {
+                name: "aec_configure".into(),
+                arguments: json!({"clientCooperation":true}),
+            },
+        )
+        .unwrap();
+        let forms = fake.0.lock().unwrap();
+        assert_eq!(forms[0].client_cooperation, Some(true));
+        assert!(!forms[0].system_proxy);
     }
 
     #[test]

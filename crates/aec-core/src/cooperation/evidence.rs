@@ -6,6 +6,100 @@ pub trait RuntimeHost {
     /// Only existing authenticated loopback controller reads; no arbitrary URL or mutations.
     fn get(&self, path: &str) -> Result<Value, &'static str>;
 }
+
+/// Live entry evidence is distinct from AEC's internal identity and DNS probes.
+/// This API cannot prove the third-party node endpoint/DNS policy, so a matching
+/// entry/ruleset remains unknown rather than turning the whole environment green.
+pub fn scope_check(
+    host: &impl RuntimeHost,
+    selection: &Selection,
+    system: &crate::model::ProxySettings,
+) -> crate::checks::CheckResult {
+    use crate::checks::{CheckResult, Kind, Status};
+    let result = (|| {
+        if !system.proxy_enabled() || system.pac_enabled() || system.auto_detect() {
+            return Err((
+                Status::Fail,
+                "cooperation_system_proxy_disabled_or_automatic",
+            ));
+        }
+        let config = host
+            .get("/configs")
+            .map_err(|_| (Status::Unknown, "cooperation_controller_unavailable"))?;
+        let port = config["mixed-port"]
+            .as_u64()
+            .and_then(|n| u16::try_from(n).ok())
+            .filter(|n| *n != 0)
+            .ok_or((Status::Unknown, "cooperation_listener_unknown"))?;
+        let expected = format!("127.0.0.1:{port}");
+        let server = system.proxy_server.as_deref().unwrap_or("");
+        if server != expected && server != format!("http={expected};https={expected}") {
+            return Err((Status::Fail, "cooperation_system_proxy_bypassed"));
+        }
+        // CVR normally installs private-address bypasses. Arbitrary hostname patterns
+        // need separate evidence; never ignore a bypass that might skip selected sites.
+        if system.bypass.as_deref().is_some_and(|b| {
+            b.split(';').any(|s| {
+                let s = s.trim();
+                !s.is_empty()
+                    && !matches!(
+                        s,
+                        "<local>"
+                            | "<-loopback>"
+                            | "localhost"
+                            | "127.*"
+                            | "10.*"
+                            | "192.168.*"
+                            | "::1"
+                            | "[::1]"
+                    )
+                    && s.parse::<std::net::IpAddr>().is_err()
+                    && !(16..=31).any(|n| s == format!("172.{n}.*"))
+            })
+        }) {
+            return Err((Status::Unknown, "cooperation_proxy_bypass_unverified"));
+        }
+        let evidence = verify_runtime(host, selection);
+        if evidence["rules"] != "pass" {
+            return Err(
+                if matches!(
+                    evidence["reason"].as_str(),
+                    Some(
+                        "COOP_CLIENT_NOT_RULE_MODE"
+                            | "COOP_RUNTIME_NODE_MISSING"
+                            | "COOP_RUNTIME_RULES_MISMATCH"
+                    )
+                ) {
+                    (Status::Fail, "cooperation_rules_missing_or_changed")
+                } else {
+                    (Status::Unknown, "cooperation_controller_unavailable")
+                },
+            );
+        }
+        Ok(())
+    })();
+    match result {
+        Err((status, reason)) => CheckResult::new("G7", Kind::Hard, status, Some(reason)),
+        Ok(()) => CheckResult::new(
+            "G7",
+            Kind::Hard,
+            Status::Unknown,
+            Some("cooperation_endpoint_dns_unverified"),
+        )
+        .with(
+            "system entry",
+            "当前系统代理指向客户端的本机入口；当前规则模式与选定域名规则顺序匹配",
+        )
+        .with(
+            "scope",
+            "仅覆盖遵循该入口的新连接；关闭系统代理、Global/Direct、旧连接及独立代理实例不在此范围",
+        )
+        .with(
+            "missing evidence",
+            "客户端 API 不回显实际 HTTP 节点端点与 DNS policy；AEC 内部固定 IP 通过不代替这两项",
+        ),
+    }
+}
 pub fn verify_runtime(host: &impl RuntimeHost, selection: &Selection) -> Value {
     let result = (|| {
         let config = host.get("/configs")?;

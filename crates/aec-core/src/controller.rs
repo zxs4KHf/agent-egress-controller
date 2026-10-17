@@ -219,6 +219,15 @@ pub trait Platform {
     fn core_down(&self) -> Result<(), Fault>;
     fn core_port(&self) -> u16;
     fn run_checks(&self, profile: &AgentProfile) -> CheckReport;
+    /// Read-only evidence for an external client's selected-site forwarding path.
+    fn cooperation_check(&self, _profile: &AgentProfile) -> CheckResult {
+        CheckResult::new(
+            "G7",
+            Kind::Hard,
+            Status::Unknown,
+            Some("cooperation_unverified"),
+        )
+    }
     /// Start one of the profile's entries. Never ends a process it did not start.
     fn launch_entry(&self, profile: &AgentProfile, entry_id: &str) -> Result<OwnedProcess, Fault>;
     /// What a browser entry's check page reported; waits for the first report, then returns the
@@ -245,6 +254,9 @@ pub struct Settings {
     /// The core's mixed-port, for installations that must occupy a port other programs already
     /// name. `None` and `0` keep [`CorePorts::default`], so a missing field never moves the port.
     pub core_mixed_port: Option<u16>,
+    /// Preserve the external system proxy and verify selected-site forwarding instead.
+    /// Stored outside the profile so older binaries can still read a rollback profile.
+    pub client_cooperation: bool,
 }
 
 impl Settings {
@@ -447,7 +459,8 @@ impl<P: Platform> Controller<P> {
     /// What the user switched on: the time zone in the settings, system-level routing in the profile.
     pub fn enabled(&self, profile: &AgentProfile) -> Enabled {
         Enabled {
-            system_proxy: profile.proxy_scope.mode == ProxyScopeMode::SystemAndExplicit,
+            system_proxy: !self.settings.client_cooperation
+                && profile.proxy_scope.mode == ProxyScopeMode::SystemAndExplicit,
             timezone: self.settings.takeover_enabled,
         }
     }
@@ -503,7 +516,7 @@ impl<P: Platform> Controller<P> {
                 ));
             }
         }
-        if profile.proxy_scope.mode == ProxyScopeMode::SystemAndExplicit {
+        if self.enabled(profile).system_proxy {
             if let Some(p) = before.system_proxy.value() {
                 let target = self.system_proxy_target(profile);
                 if *p != target {
@@ -558,6 +571,12 @@ impl<P: Platform> Controller<P> {
                 json!({ "code": f.code, "message": f.message }),
             );
             return Err(f);
+        }
+        if self.settings.client_cooperation && !profile.egress.fixed_exit {
+            return Err(Fault::new(
+                "COOP_FIXED_EXIT_REQUIRED",
+                "站点协作需要固定出口身份门；请配置精确 ISP IP 并启用固定出口保护",
+            ));
         }
         if let Err(f) = self.platform.core_preflight(profile, opts.direct_test) {
             self.event(
@@ -774,14 +793,22 @@ impl<P: Platform> Controller<P> {
         for (i, r) in hard.into_iter().enumerate() {
             report.results.insert(at + 1 + i, r);
         }
-        if let Some(g6) = self.system_scope_check(profile) {
+        if self.settings.client_cooperation {
+            report
+                .results
+                .push(self.platform.cooperation_check(profile));
+        } else if let Some(g6) = self.system_scope_check(profile) {
             report
                 .results
                 .insert((at + 1 + hard_count).min(report.results.len()), g6);
         }
         report.results.extend(tz);
         report.results.extend(soft);
-        complete_report(report, profile)
+        let mut report = complete_report(report, profile);
+        if self.settings.client_cooperation {
+            report.results.retain(|r| r.id != "G6");
+        }
+        report
     }
 
     /// G6 (SPEC 4.5): with system-level routing on, the system proxy must point at the core.
@@ -838,7 +865,7 @@ impl<P: Platform> Controller<P> {
         if !matches!(self.state.mode, Mode::AgentReady | Mode::AgentUnverified) {
             return None;
         }
-        if !self.settings.takeover_enabled || self.state.system_proxy_gate.state != GateState::Open
+        if self.settings.client_cooperation || self.state.system_proxy_gate.state != GateState::Open
         {
             return None;
         }
@@ -898,6 +925,40 @@ impl<P: Platform> Controller<P> {
             json!({ "found": found }),
         );
         Some(KeepOutcome::Changed { found })
+    }
+
+    /// Observe external forwarding without rewriting its entry or recycling internal probes.
+    pub fn observe_cooperation(&mut self, profile: &AgentProfile) -> Result<bool, Fault> {
+        if !self.settings.client_cooperation
+            || !matches!(self.state.mode, Mode::AgentReady | Mode::AgentUnverified)
+        {
+            return Ok(false);
+        }
+        let result = self.platform.cooperation_check(profile);
+        let Some(report) = &mut self.state.last_report else {
+            return Ok(false);
+        };
+        let previous = report.results.iter_mut().find(|r| r.id == "G7");
+        if let Some(previous) = previous {
+            if previous == &result {
+                return Ok(false);
+            }
+            *previous = result;
+        } else {
+            report.results.push(result);
+        }
+        self.state.mode = if is_ready(report) {
+            Mode::AgentReady
+        } else {
+            Mode::AgentUnverified
+        };
+        self.event(
+            Level::Warn,
+            "observe.cooperation.changed",
+            json!({"scope":"selected_sites"}),
+        );
+        self.persist()?;
+        Ok(true)
     }
 
     /// Periodic observation must reflect actual G6 evidence, while preserving every other gate.
@@ -1290,6 +1351,7 @@ mod tests {
         stubborn: Cell<bool>,
         /// What every browser check page reports.
         signals: RefCell<Option<BrowserSignals>>,
+        cooperation_status: Cell<Status>,
     }
 
     fn good_signals() -> BrowserSignals {
@@ -1320,6 +1382,7 @@ mod tests {
                 entries: RefCell::new(Vec::new()),
                 stubborn: Cell::new(false),
                 signals: RefCell::new(Some(good_signals())),
+                cooperation_status: Cell::new(Status::Unknown),
             }
         }
         fn failing(step: &'static str) -> Self {
@@ -1338,6 +1401,14 @@ mod tests {
     }
 
     impl Platform for FakePlatform {
+        fn cooperation_check(&self, _: &AgentProfile) -> CheckResult {
+            CheckResult::new(
+                "G7",
+                Kind::Hard,
+                self.cooperation_status.get(),
+                Some("fake_external_evidence"),
+            )
+        }
         fn now_ms(&self) -> u64 {
             1_791_701_261_000
         }
@@ -1489,6 +1560,7 @@ mod tests {
             Settings {
                 takeover_enabled: takeover,
                 core_mixed_port: None,
+                client_cooperation: false,
             },
         )
         .unwrap()
@@ -1501,11 +1573,13 @@ mod tests {
         let zero = Settings {
             takeover_enabled: false,
             core_mixed_port: Some(0),
+            client_cooperation: false,
         };
         assert_eq!(zero.core_ports(), base, "0 means unset, not a port");
         let moved = Settings {
             takeover_enabled: false,
             core_mixed_port: Some(7893),
+            client_cooperation: false,
         };
         let ports = moved.core_ports();
         assert_eq!(ports.mixed, 7893);
@@ -1895,6 +1969,68 @@ mod tests {
         let out = c.enter(&profile(), EnterOptions::default()).unwrap();
         assert!(out.report.unwrap().results.iter().all(|r| r.id != "G6"));
         assert_eq!(c.keep_system_proxy(), None);
+    }
+
+    #[test]
+    fn cooperation_never_takes_system_proxy_and_never_reuses_internal_readiness() {
+        let d = tmp("cooperation-scope");
+        let p = FakePlatform::new();
+        let before = p.host.borrow().proxy.clone();
+        let mut c = Controller::open(
+            p,
+            &d,
+            Settings {
+                takeover_enabled: true,
+                client_cooperation: true,
+                ..Settings::default()
+            },
+        )
+        .unwrap();
+        // A stale old profile must not cause a takeover when cooperation was selected.
+        let mut profile = system_scope();
+        profile.egress.fixed_exit = true;
+        profile.egress.expected.ip = Some("198.51.100.7".into());
+        let out = c.enter(&profile, EnterOptions::default()).unwrap();
+        assert_eq!(c.platform().host.borrow().proxy, before);
+        assert!(c
+            .platform()
+            .writes
+            .borrow()
+            .iter()
+            .all(|v| !matches!(v, GlobalValue::SystemProxy { .. })));
+        let report = out.report.unwrap();
+        assert!(report.results.iter().all(|r| r.id != "G6"));
+        let scope = report
+            .results
+            .iter()
+            .find(|r| r.id == "G7")
+            .expect("External route needs its own evidence");
+        assert_eq!(scope.status, Status::Unknown);
+        assert_eq!(c.state().mode, Mode::AgentUnverified);
+        assert_eq!(c.keep_system_proxy(), None);
+        c.platform().cooperation_status.set(Status::Fail);
+        assert!(c.observe_cooperation(&profile).unwrap());
+        assert_eq!(
+            c.state()
+                .last_report
+                .as_ref()
+                .unwrap()
+                .results
+                .iter()
+                .find(|r| r.id == "G7")
+                .unwrap()
+                .status,
+            Status::Fail
+        );
+        assert!(
+            !c.observe_cooperation(&profile).unwrap(),
+            "unchanged evidence does not repeatedly persist/announce"
+        );
+        c.platform().cooperation_status.set(Status::Unknown);
+        assert!(c.observe_cooperation(&profile).unwrap());
+        assert_eq!(c.state().mode, Mode::AgentUnverified);
+        c.exit().unwrap();
+        assert_eq!(c.platform().host.borrow().proxy, before);
     }
 
     #[test]

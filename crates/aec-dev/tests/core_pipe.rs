@@ -65,6 +65,7 @@ fn core_commands_use_the_saved_mixed_port() {
     aec_core::controller::Settings {
         takeover_enabled: false,
         core_mixed_port: Some(port),
+        client_cooperation: false,
     }
     .save(&data)
     .unwrap();

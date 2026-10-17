@@ -357,7 +357,7 @@ mod tray {
                     }
                     submenu(m, entries, "打开 AI 浏览器或终端", idle);
                 }
-                if agent && !s.switches.is_empty() {
+                if agent && !s.client_cooperation && !s.switches.is_empty() {
                     let routes = CreatePopupMenu();
                     let mut groups: Vec<&str> = Vec::new();
                     for (group, _, _, _) in &s.switches {
@@ -406,7 +406,16 @@ mod tray {
                     ID_COOPERATION,
                     "Clash 站点协作与 DNS/ECS…",
                 );
-                add(settings, MF_STRING, ID_SETTINGS, "出口与环境设置…");
+                add(
+                    settings,
+                    MF_STRING,
+                    ID_SETTINGS,
+                    if s.client_cooperation {
+                        "连接方式：保留客户端系统代理（两种选项…）"
+                    } else {
+                        "连接方式：客户端系统代理 / AEC 本地接管…"
+                    },
+                );
                 add(
                     settings,
                     MF_STRING
@@ -671,6 +680,8 @@ mod tray {
             has_report: false,
             note: None,
             summary: None,
+            scope_evidence: None,
+            client_cooperation: false,
             clipboard: None,
         }));
         let (tx, rx) = channel::<Cmd>();
@@ -817,6 +828,8 @@ mod tray {
                 has_report: false,
                 note: None,
                 summary: None,
+                scope_evidence: None,
+                client_cooperation: false,
                 clipboard: None,
             }));
             let (tx, rx) = channel();

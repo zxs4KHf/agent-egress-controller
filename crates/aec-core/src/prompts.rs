@@ -178,6 +178,7 @@ fn title(id: &str) -> String {
             "G4" => "时区".into(),
             "G5" => "浏览器语言".into(),
             "G6" => "系统代理作用域".into(),
+            "G7" => "系统代理与固定站点协作范围".into(),
             "R1" => "出口 ASN/地区".into(),
             "R2" => "延迟".into(),
             "R9" => "非目标流量出口".into(),
@@ -198,6 +199,7 @@ fn expectation(id: &str, p: &AgentProfile) -> String {
                 format!("目标站看到的出口来自档案的固定出口，不同于不经代理时的出口；{ip}。")
             }
             "G3" => format!("每个目标域名都以主机名交给内核，并经策略组「{group}」出站；内核 DNS 端口在监听。"),
+            "G7" => "Windows 系统代理仍指向已核实客户端的入口；规则模式下所选站点规则匹配。关闭系统代理或绕过入口不受保护；规则证据不能代替实际节点端点、DNS policy 和固定 ISP 身份。".into(),
             "G4" => format!("系统时区为 {}（{}）。", p.locale.timezone.windows_id, p.locale.timezone.iana),
             "R10" => "时区由本应用在本次会话中设置，而不是由其他程序维持。".into(),
             "R11" => "Claude 桌面版当前连接的进程身份、本机源地址与本应用内核连接表对应；命中的出站链符合档案，Claude 服务域名未走 DIRECT。仅证明观测到的连接，ISP 身份仍须结合 G1/G2；没有连接证据就是未知。".into(),

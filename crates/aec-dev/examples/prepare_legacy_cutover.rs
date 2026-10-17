@@ -339,6 +339,7 @@ fn prepare(args: &[String]) -> Result<(), String> {
         aec_core::controller::Settings {
             takeover_enabled: true,
             core_mixed_port: Some(old_port),
+            client_cooperation: false,
         }
         .save(&manager.data_dir)
         .map_err(|_| "cannot save cutover entrance port")?;

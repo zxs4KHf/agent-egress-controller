@@ -28,6 +28,7 @@ impl SetupBackend for Preview {
                 stored_user: g.user.as_deref(),
                 tunnel_password_stored: g.tunnel_stored,
                 takeover_enabled: g.takeover,
+                client_cooperation: false,
                 locked: false,
             },
         )
