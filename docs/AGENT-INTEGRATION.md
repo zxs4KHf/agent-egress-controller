@@ -59,7 +59,35 @@ MCP 使用官方 2025-11-25 JSON-RPC 生命周期与 newline-delimited stdio tra
 
 检测经显式指定的端口访问 `https://www.cloudflare.com/cdn-cgi/trace`，约 8 秒超时，不跟随重定向，不绕过 TLS，不自动选择或回退直连。`UPSTREAM_HTTPS_OK` 只证明测试 URL 可用，不能报告 GPT 对话、Claude ISP 或整个网关已就绪。核心 0.5.4 是必需条件，只有新版界面或 stdio bridge 不足以提供新工具。
 
-## HTTP/JSON
+## 站点协作与浏览器环境
+
+只有包含本功能的新核心才提供以下工具；UI 热更不能给旧核心增加能力：
+
+| 工具 | 参数 | 边界 |
+| --- | --- | --- |
+| `aec_cooperation` | `{}` | 生成只含受保护站点的局部脚本；`status:export_only`，不是安装/激活/验证 |
+| `aec_cooperation_state` | `{}` | 持久块是否仍匹配当前站点、canRestore、带时间的最近错误及历史运行/DNS 报告 |
+| `aec_cooperation_preview` | `{}` | 五分钟预览，只读核实标准 CVR 2.5.8、唯一注册的默认脚本、DNS 接管、文件摘要 |
+| `aec_cooperation_install` | `{"planId":"预览返回值"}` | 确认范围后追加受管尾块，不改注册表/订阅/节点，不自动激活或停服 |
+| `aec_cooperation_restore` | `{}` | 精确撤销自己的未变化尾块；外部编辑拒绝覆盖，不自动激活 |
+| `aec_cooperation_verify` | `{}` | 只读当前规则前缀、Rule 模式和 HTTP 类型；端点、ISP 身份和 DNS policy 无证据仍 unknown |
+| `aec_cooperation_dns_probe` | `{"consent":true}` | 需用户明确同意的外网权威 TXT 诊断，分别检查当前解析器及显式固定入口 Google DoH |
+| `aec_browser_environment` | `{}` | 读取设置、`canRestore`、待确认计划、历史 `recentError`；泄露证据缺失仍为 unknown |
+| `aec_browser_environment_preview` | `{"scope":"ai_only","language":"en-US","preventWebrtc":true,"disableQuic":true,"remoteDnsOnly":true}` | 生成五分钟确认计划，不应用、不重启；`scope` 还可选 `global`，当前只支持普通 Edge |
+
+不存在 Agent **浏览器环境应用/强制确认**工具。用户在看板查看影响浏览器、排除项、原值与目标后确认，或取消。修改选项会使当前 UI 计划失效；过期、旧 planId、外部策略变化与机器策略冲突均拒绝。全局范围不写 Chrome / Chrome for Testing；如指纹浏览器使用 Edge，不能应用全局范围。不要依据独立 user-data-dir 推断注册表策略隔离。
+
+协作规则安装的授权与浏览器确认门不同：已获用户明确授权选定站点范围后，Agent 可预览/安装精确 planId。自定义脚本、共享/全局脚本、路径逃逸、未知版本、GUI DNS 接管、文件变化均拒绝。只操作标准 CVR 数据目录的已注册脚本，不接受 Agent 提供文件路径、端口、secret 或任意 JS。安装后由用户在 Clash 官方界面手动重新激活；AEC 不提供自动 PUT/重载接口。修改站点后先撤销旧块再预览；取消确认不写文件。
+
+看板使用 `POST /cooperation?t=<页面令牌>` 与精确 Origin，action 为 state/preview/install（planId）/restore/verify/dns_probe（consent）。Agent 使用同名 MCP/鉴权 HTTP 工具；两者共用串行 Worker。未知字段，包括 state/restore 中的 force，均拒绝。`cooperation-error.json` 保存动作、静态错误码和时间；`cooperation-runtime.json`、`cooperation-dns.json` 保存有作用域/时间的报告。关闭提示仍可查；API 不可用时 Agent 可离线只读这些 JSON，不要上传配置或调用更新来代替排查。
+
+DNS 探针向 `dnscheck.tools` 和 Google 发送随机查询；它不是只读本机操作，未经用户同意不能调用。报告中的 clientResolver 是当前客户端解析器诊断，fixedDoh 是显式固定入口传输，selectedSiteDns/browserDns 仍 unknown。权威递归来源不是 ISP HTTP 出口，ECS 缺失仅该查询通过，不推广为所有站点/浏览器；结果没有凭据或来源 IP 原文。不根据旧历史 pass 宣称当前网络安全。
+
+本机页面使用 `POST /browser-environment?t=<页面令牌>`，要求精确 Origin；接受严格的 `state`、`preview`、`apply`（精确 planId）、`restore`。这不是 Agent Bearer 接口；Agent 只能通过同名工具读取或预览，不能借此声称用户已确认。失败码保留在 `browser-environment-last-error.json`，恢复快照在 `browser-environment-recovery.json`。它们不含代理凭据；仍只用于本机排查，不自动上传。`recentError.historical:true` 是历史事件，不等于当前操作仍失败。
+
+`remoteDnsOnly` 对 AI 专用浏览器设置解析阻断及 loopback 代理例外；全局 Edge 只关闭预测/预解析，不改系统 DNS，更不保证 EDNS/ECS 安全。`preventWebrtc` 约束非代理 UDP，不能把没有 ICE 候选当作无泄露。全局语言策略是浏览器界面语言，不承诺所有网页的 Accept-Language；系统显示语言不改变。
+
+## HTTP/JSON 协议
 
 用于自建本机 Agent host。数据目录下的 agent-api.json 是发现信息：
 
@@ -95,7 +123,7 @@ Content-Length: <UTF-8 body bytes>
 - Agent 不读取或写入密码；让用户在看板出口设置页填写密码。接口只允许声明的设置、规则和模式操作，不提供任意 shell、文件、URL、注册表或进程命令。
 - 不要悄悄改动预期 ISP IP、关闭固定出口保护、扩大 DIRECT 范围或删除受保护网站。需要改变这些安全边界时先征得用户确认。
 - 固定出口路径切换允许断连；切换失败、证据未知或 IP 不同必须继续阻断，不可选另一个公网出口冒充成功。
-- 系统代理只有一个可靠写入者。Clash 等客户端的系统代理开关与全局 VPN/TUN 不受支持；可以保留其本机内核端口作为普通流量上游、关闭它的系统代理开关，然后从其客户端切换节点。冲突解释见看板「代理冲突说明」。
+- 系统代理只有一个写入者。站点协作保留 Clash 系统代理，AEC 只管选定域名脚本；旧 AEC 接管兼容模式则需关闭其他客户端系统代理开关。不要混用；TUN/Global/Direct 或绕过当前入口不在域名规则保证内。冲突解释见看板「代理共存说明」。
 - 用户逐项在看板批准规则/出口/自启等变更。Agent 工具调用并不代表用户批准新的目标站点、凭据、出口身份或权限。
 
 ## 本机命令行

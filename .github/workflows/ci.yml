@@ -73,6 +73,12 @@ jobs:
           $env:AEC_NODE_MODULES = Join-Path $deps 'node_modules'
           node packaging/test-ui.cjs
           if ($LASTEXITCODE) { throw 'UI interaction tests failed' }
+          cargo build -p aec-core --example cooperation_fixture --example browser_environment_fixture --locked
+          if ($LASTEXITCODE) { throw 'Cooperation/browser fixtures build failed' }
+          node packaging/test-cooperation.cjs
+          if ($LASTEXITCODE) { throw 'Selected-site script preservation failed' }
+          node packaging/test-browser-environment.cjs
+          if ($LASTEXITCODE) { throw 'Installed Edge DNS/WebRTC environment test failed' }
       - name: Preserve isolated UI diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
@@ -124,16 +130,16 @@ jobs:
       - name: Upload release candidates
         uses: actions/upload-artifact@v4
         with:
-          name: AgentEgressController-0.5.5-windows
+          name: AgentEgressController-0.5.6-windows
           path: |
-            dist/AgentEgressController-0.5.5-portable.zip
-            dist/AgentEgressController-0.5.5-setup.exe
-            dist/SHA256SUMS-0.5.5.txt
-            dist/SHA256SETUP-0.5.5.txt
-            dist/aec-update-0.5.5.ps1
-            dist/SHA256UPDATER-0.5.5.txt
-            dist/aec-incremental-0.5.5.json
-            dist/SHA256INCREMENTAL-0.5.5.txt
-            dist/aec-0.5.5-*.zip
+            dist/AgentEgressController-0.5.6-portable.zip
+            dist/AgentEgressController-0.5.6-setup.exe
+            dist/SHA256SUMS-0.5.6.txt
+            dist/SHA256SETUP-0.5.6.txt
+            dist/aec-update-0.5.6.ps1
+            dist/SHA256UPDATER-0.5.6.txt
+            dist/aec-incremental-0.5.6.json
+            dist/SHA256INCREMENTAL-0.5.6.txt
+            dist/aec-0.5.6-*.zip
           if-no-files-found: error
           retention-days: 14

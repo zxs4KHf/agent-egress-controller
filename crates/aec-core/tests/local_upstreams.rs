@@ -35,6 +35,45 @@ fn configured() -> ProfileSet {
 }
 
 #[test]
+fn claude_family_stays_pinned_even_if_the_editable_site_list_omits_it() {
+    let mut set = configured();
+    set.agent[0].targets = vec![Target {
+        domain: "example.test".into(),
+        trace: false,
+    }];
+    let yaml = aec_core::core::config::from_profile(
+        &set.agent[0],
+        &CorePorts::default(),
+        "fixture",
+        &aec_core::core::config::NoCredentials,
+    )
+    .unwrap();
+    let rules: serde_yaml_ng::Value = serde_yaml_ng::from_str(&yaml).unwrap();
+    let rules = rules["rules"].as_sequence().unwrap();
+    for domain in [
+        "claude.ai",
+        "anthropic.com",
+        "claude.com",
+        "claudeusercontent.com",
+    ] {
+        assert!(
+            rules
+                .iter()
+                .any(|rule| rule.as_str() == Some(&format!("DOMAIN-SUFFIX,{domain},relay"))),
+            "Missing pinned service {domain}"
+        );
+    }
+    assert!(aec_core::fixed::protects(
+        &set.agent[0],
+        "api.anthropic.com"
+    ));
+    assert!(!aec_core::fixed::protects(
+        &set.agent[0],
+        "anthropic.com.attacker.test"
+    ));
+}
+
+#[test]
 fn adding_and_selecting_local_upstreams_preserves_fixed_identity_and_existing_gpt_default() {
     let original = configured();
     let save = serde_json::from_value(serde_json::json!({"action":"save", "name":"Clash", "host":"127.0.0.1", "port":7890, "protocol":"socks5"})).unwrap();
@@ -170,6 +209,40 @@ fn panel_http_uses_the_same_commands_and_rejects_missing_origin_and_unknown_fiel
         r#"{"action":"select","name":"Clash","force":true}"#,
     );
     assert!(reply.contains("\"ok\":false"));
+}
+
+#[test]
+fn agent_cooperation_export_is_read_only_scoped_and_not_an_installation_claim() {
+    let panel = Panel(std::sync::Mutex::new(configured()));
+    let before = panel.0.lock().unwrap().clone();
+    let call = |arguments| {
+        aec_core::agent::call(
+            &panel,
+            aec_core::agent::Call {
+                name: "aec_cooperation".into(),
+                arguments,
+            },
+        )
+    };
+    let result = call(serde_json::json!({})).unwrap();
+    assert_eq!(result["status"], "export_only");
+    assert_eq!(result["runtimeVerified"], false);
+    assert_eq!(
+        result["persistentInstalled"],
+        serde_json::Value::Null,
+        "without client readback, external installation is unknown rather than absent"
+    );
+    assert_eq!(result["domains"], serde_json::json!(["claude.ai"]));
+    assert!(result["script"]
+        .as_str()
+        .unwrap()
+        .contains("AEC-MANAGED-FIXED"));
+    assert!(
+        !result.to_string().contains("198.51.100.8"),
+        "export must not contain the private ISP identity"
+    );
+    assert!(call(serde_json::json!({"apply":true,"force":true})).is_err());
+    assert_eq!(*panel.0.lock().unwrap(), before);
 }
 
 #[test]

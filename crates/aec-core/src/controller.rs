@@ -156,6 +156,8 @@ pub enum RestoreStatus {
     DryRun,
     /// Somebody else changed the value after we did; left as it is.
     Conflict,
+    /// The user selected another system proxy during this session; preserving it completes exit.
+    PreservedExternal,
     Failed,
     /// Deliberately left to the user (a CLI session); reported, not a failure.
     LeftOpen,
@@ -222,6 +224,10 @@ pub trait Platform {
     /// What a browser entry's check page reported; waits for the first report, then returns the
     /// same one. `None` when nothing came back.
     fn entry_signals(&self, entry_id: &str) -> Option<BrowserSignals>;
+    /// Expected browser-only settings, independently of system time zone and routing identity.
+    fn browser_profile(&self, profile: &AgentProfile) -> AgentProfile {
+        profile.clone()
+    }
     /// Ask an entry this application started to close (no forced kill).
     fn close_entry(&self, process: &OwnedProcess) -> Result<CloseOutcome, Fault>;
     /// Whether this process holds SeTimeZonePrivilege (evidence for G4).
@@ -457,6 +463,27 @@ impl<P: Platform> Controller<P> {
         }
     }
 
+    // Preserving an external choice is only a completed handoff if no active endpoint can
+    // still depend on the core we're about to stop. PAC/WPAD and unparseable values are unknown.
+    fn independent_system_proxy(&self, value: &ProxySettings) -> bool {
+        if value.pac_enabled() || value.auto_detect() {
+            return false;
+        }
+        if !value.proxy_enabled() {
+            return true;
+        }
+        value.proxy_server.as_deref().is_some_and(|servers| {
+            !servers.trim().is_empty()
+                && servers.split(';').all(|server| {
+                    let endpoint = server.rsplit('=').next().unwrap_or("").trim();
+                    endpoint
+                        .rsplit_once(':')
+                        .and_then(|(_, port)| port.parse::<u16>().ok())
+                        .is_some_and(|port| port != 0 && port != self.platform.core_port())
+                })
+        })
+    }
+
     /// Global changes the profile asks for.
     fn plan(
         &self,
@@ -684,6 +711,7 @@ impl<P: Platform> Controller<P> {
         // Browser entries started in this session: G5, R3–R5 from their check pages.
         let mut browser_timezones = Vec::new();
         let mut browser_results = Vec::new();
+        let browser_profile = self.platform.browser_profile(profile);
         for e in &self.state.journal {
             let JournalEntry::Entry { id, .. } = e else {
                 continue;
@@ -696,8 +724,12 @@ impl<P: Platform> Controller<P> {
                 continue;
             }
             let signals = self.platform.entry_signals(id);
-            let (results, tz) =
-                browser_checks(profile, id, signals.as_ref(), report.exit_ip.as_deref());
+            let (results, tz) = browser_checks(
+                &browser_profile,
+                id,
+                signals.as_ref(),
+                report.exit_ip.as_deref(),
+            );
             browser_results.extend(results);
             if let Some(tz) = tz {
                 browser_timezones.push((id.clone(), tz));
@@ -1111,6 +1143,15 @@ impl<P: Platform> Controller<P> {
                         status: RestoreStatus::Restored,
                         detail: "already back to the snapshot value".into(),
                     },
+                    Ok(GlobalValue::SystemProxy { value })
+                        if self.independent_system_proxy(&value) =>
+                    {
+                        RestoreItem {
+                            item: name,
+                            status: RestoreStatus::PreservedExternal,
+                            detail: "保留你后来选择的系统代理；AEC 已交还控制，不覆盖该选择".into(),
+                        }
+                    }
                     Ok(now) => RestoreItem {
                         item: name,
                         status: RestoreStatus::Conflict,
@@ -1893,6 +1934,53 @@ mod tests {
         assert_eq!(out.gate.state, GateState::Closed);
         assert!(out.gate.reasons.iter().any(|r| r.contains("AIEgressGuard")));
         assert!(c.platform().writes.borrow().is_empty());
+    }
+
+    #[test]
+    fn changed_proxy_settings_that_still_reference_aec_do_not_complete_restoration() {
+        for server in [
+            "127.0.0.1:17893",
+            "http=127.0.0.1:7897;https=127.0.0.1:17893",
+        ] {
+            let d = tmp("proxy-still-owned");
+            let mut c = open(FakePlatform::new(), &d, true);
+            c.enter(&system_scope(), EnterOptions::default()).unwrap();
+            // FakePlatform uses port 17893. Changing bypass or just one protocol does not
+            // hand the whole system proxy back to an independent client.
+            c.platform().host.borrow_mut().proxy.proxy_server = Some(server.into());
+            c.platform().host.borrow_mut().proxy.bypass = Some("external-change".into());
+            let report = c.exit().unwrap();
+            assert_eq!(report.mode_after, Mode::RestoreIncomplete, "{server}");
+            assert!(report
+                .items
+                .iter()
+                .any(|i| i.status == RestoreStatus::Conflict));
+        }
+    }
+
+    #[test]
+    fn exit_to_daily_keeps_the_users_new_proxy_without_an_extra_acknowledgement() {
+        let d = tmp("proxy-exit-daily");
+        let mut c = open(FakePlatform::new(), &d, true);
+        c.enter(&system_scope(), EnterOptions::default()).unwrap();
+        let proxy = ProxySettings {
+            flags: proxy_flags::DIRECT | proxy_flags::PROXY,
+            proxy_server: Some("127.0.0.1:7897".into()),
+            bypass: None,
+            auto_config_url: None,
+        };
+        c.platform().host.borrow_mut().proxy = proxy.clone();
+        c.keep_system_proxy();
+        let report = c.exit().unwrap();
+        assert_eq!(
+            report.mode_after,
+            Mode::Daily,
+            "An external proxy choice is not a failed restoration"
+        );
+        assert_eq!(c.platform().host.borrow().proxy, proxy);
+        assert!(c.state().journal.is_empty());
+        assert!(c.state().unacknowledged_restore_failures.is_empty());
+        assert!(!c.platform().core_running.get());
     }
 
     #[test]

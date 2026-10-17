@@ -81,15 +81,15 @@ pub fn asset(name: &str) -> Option<(&'static str, String)> {
     let (ctype, fallback) = match name {
         "theme.css" => (
             "text/css; charset=utf-8",
-            include_str!("../../../ui/revisions/fluent-1/theme.css"),
+            include_str!("../../../ui/revisions/fluent-2/theme.css"),
         ),
         "app.js" => (
             "text/javascript; charset=utf-8",
-            include_str!("../../../ui/revisions/fluent-1/app.js"),
+            include_str!("../../../ui/revisions/fluent-2/app.js"),
         ),
         "icon.svg" => (
             "image/svg+xml",
-            include_str!("../../../ui/revisions/fluent-1/icon.svg"),
+            include_str!("../../../ui/revisions/fluent-2/icon.svg"),
         ),
         _ => return None,
     };

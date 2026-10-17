@@ -83,13 +83,14 @@ pub const TIMEZONES: [(&str, &str, &str, &str); 13] = [
 ];
 
 /// (tag, label) for the Agent browsers' language.
-pub const LANGUAGES: [(&str, &str); 7] = [
+pub const LANGUAGES: [(&str, &str); 8] = [
     ("en-US", "英语（美国）"),
     ("en-GB", "英语（英国）"),
     ("ja-JP", "日语"),
     ("ko-KR", "韩语"),
     ("de-DE", "德语"),
     ("fr-FR", "法语"),
+    ("zh-CN", "简体中文"),
     ("zh-TW", "繁体中文"),
 ];
 
@@ -736,6 +737,7 @@ pub fn apply_settings(
                 defaults.relay,
                 defaults.tunnel,
                 defaults.tunnel + 1,
+                defaults.tunnel + 2,
             ]
             .contains(&port)
             {
@@ -755,6 +757,19 @@ pub fn apply_settings(
 
 /// What the page server needs from its owner.
 pub trait SetupBackend: Send + Sync {
+    fn cooperation_command(
+        &self,
+        _command: crate::cooperation::Command,
+    ) -> Result<serde_json::Value, Vec<FieldError>> {
+        Err(vec![err("cooperation", "COOP_UNAVAILABLE")])
+    }
+    fn browser_environment(
+        &self,
+        _command: crate::browser_environment::Command,
+        _local_confirmation: bool,
+    ) -> Result<serde_json::Value, Vec<FieldError>> {
+        Err(vec![err("browserEnvironment", "BROWSER_UNAVAILABLE")])
+    }
     fn upstream(
         &self,
         _command: crate::local_upstream::Command,
@@ -791,6 +806,25 @@ pub trait SetupBackend: Send + Sync {
     }
     fn dashboard(&self) -> Option<crate::dashboard::View> {
         None
+    }
+    fn cooperation(&self) -> serde_json::Value {
+        let Some(view) = self.dashboard().filter(|view| view.fixed_exit) else {
+            return serde_json::json!({"available":false,"code":"COOP_FIXED_EXIT_REQUIRED","runtimeVerified":false});
+        };
+        let Some(port) = crate::fixed::ingress_port(&crate::core::CorePorts::default()) else {
+            return serde_json::json!({"available":false,"code":"COOP_PORT_INVALID","runtimeVerified":false});
+        };
+        match crate::cooperation::client_script(&crate::cooperation::Selection {
+            domains: view.form.sites.clone(),
+            fixed_port: port,
+        }) {
+            Ok(script) => serde_json::json!({
+                "available":true,"domains":view.form.sites,"fixedPort":port,"script":script,
+                "runtimeVerified":false,"persistentInstalled":null,"installedByAec":false,"status":"export_only",
+                "message":"仅生成局部订阅脚本，未修改或重载客户端；安装后仍需核对运行规则与固定身份。"
+            }),
+            Err(code) => serde_json::json!({"available":false,"code":code,"runtimeVerified":false}),
+        }
     }
     fn rules(&self, _form: crate::dashboard::RulesForm) -> Result<(), Vec<FieldError>> {
         Err(vec![err("rules", "看板不可用")])
@@ -949,6 +983,12 @@ fn handle(
         );
     }
     match (method, path) {
+        ("GET", "/cooperation") if token_ok => respond(
+            &mut s,
+            "200 OK",
+            "application/json; charset=utf-8",
+            &backend.cooperation().to_string(),
+        ),
         ("GET", "/app") if token_ok => respond(
             &mut s,
             "200 OK",
@@ -1009,8 +1049,18 @@ fn handle(
         ),
         (
             "POST",
-            "/save" | "/rules" | "/path" | "/startup" | "/shortcuts" | "/action" | "/agent-access"
-            | "/update" | "/route" | "/upstream",
+            "/save"
+            | "/rules"
+            | "/path"
+            | "/startup"
+            | "/shortcuts"
+            | "/action"
+            | "/agent-access"
+            | "/update"
+            | "/route"
+            | "/upstream"
+            | "/cooperation"
+            | "/browser-environment",
         ) if token_ok => {
             if header(&head, "origin") != Some(format!("http://{me}").as_str()) {
                 return respond(&mut s, "403 Forbidden", "text/plain", "origin rejected");
@@ -1047,10 +1097,20 @@ fn handle(
                 ui_only: bool,
             }
             let malformed = || vec![err("form", "表单格式不对")];
-            if path == "/upstream" {
-                let result = serde_json::from_slice(body)
-                    .map_err(|_| malformed())
-                    .and_then(|command| backend.upstream(command));
+            if path == "/upstream" || path == "/browser-environment" || path == "/cooperation" {
+                let result = if path == "/cooperation" {
+                    serde_json::from_slice(body)
+                        .map_err(|_| malformed())
+                        .and_then(|command| backend.cooperation_command(command))
+                } else if path == "/browser-environment" {
+                    serde_json::from_slice(body)
+                        .map_err(|_| malformed())
+                        .and_then(|command| backend.browser_environment(command, true))
+                } else {
+                    serde_json::from_slice(body)
+                        .map_err(|_| malformed())
+                        .and_then(|command| backend.upstream(command))
+                };
                 buf.iter_mut().for_each(|b| *b = 0);
                 let reply = match result {
                     Ok(result) => serde_json::json!({"ok":true,"result":result}),
@@ -1106,9 +1166,25 @@ fn handle(
         }
         (
             _,
-            "/app" | "/setup" | "/proxy-help" | "/save" | "/dashboard" | "/state" | "/rules"
-            | "/path" | "/startup" | "/shortcuts" | "/agent" | "/agent-access" | "/action"
-            | "/agent-info" | "/update" | "/route" | "/upstream",
+            "/app"
+            | "/setup"
+            | "/proxy-help"
+            | "/save"
+            | "/dashboard"
+            | "/state"
+            | "/rules"
+            | "/path"
+            | "/startup"
+            | "/shortcuts"
+            | "/agent"
+            | "/agent-access"
+            | "/action"
+            | "/agent-info"
+            | "/cooperation"
+            | "/update"
+            | "/route"
+            | "/upstream"
+            | "/browser-environment",
         ) => respond(&mut s, "403 Forbidden", "text/plain", "token rejected"),
         _ => respond(&mut s, "404 Not Found", "text/plain", "not found"),
     }
@@ -1222,7 +1298,7 @@ fn control_page(port: u16, token: &str, query: &str) -> String {
     });
     crate::ui::template(
         "control.html",
-        include_str!("../../../ui/revisions/fluent-1/control.html"),
+        include_str!("../../../ui/revisions/fluent-2/control.html"),
     )
     .replace("__TOKEN__", token)
     .replace("__CONFIG__", &config.to_string().replace("</", "<\\/"))
@@ -1241,9 +1317,9 @@ fn proxy_help_page(token: &str) -> String {
     crate::ui::template("help.html", PROXY_HELP_PAGE).replace("__TOKEN__", token)
 }
 
-const PROXY_HELP_PAGE: &str = include_str!("../../../ui/revisions/fluent-1/help.html");
+const PROXY_HELP_PAGE: &str = include_str!("../../../ui/revisions/fluent-2/help.html");
 
-const PAGE: &str = include_str!("../../../ui/revisions/fluent-1/setup.html");
+const PAGE: &str = include_str!("../../../ui/revisions/fluent-2/setup.html");
 
 #[cfg(test)]
 mod tests {
@@ -1313,7 +1389,7 @@ mod tests {
             assert!(next.takeover_enabled);
         }
         for value in [
-            "-1", "65536", "no-port", "17909", "17553", "17325", "17326", "17327",
+            "-1", "65536", "no-port", "17909", "17553", "17325", "17326", "17327", "17328",
         ] {
             json["coreMixedPort"] = value.into();
             let f: ExitForm = serde_json::from_value(json.clone()).unwrap();

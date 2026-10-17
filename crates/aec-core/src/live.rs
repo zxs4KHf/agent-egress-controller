@@ -245,8 +245,15 @@ impl LivePlatform {
             None
         };
         let url = server.as_ref().map(|s| s.url());
-        let args =
-            entries::browser_args(profile, &udd, self.core.ports.mixed, extra, url.as_deref());
+        let args = entries::environment_browser_args(
+            profile,
+            &self.data_dir,
+            browser,
+            self.core.ports.mixed,
+            extra,
+            url.as_deref(),
+        )
+        .map_err(|code| Fault::new(code, "浏览器设置有冲突或尚未恢复，请先在看板处理"))?;
 
         let running = crate::windows::chromium_profile_in_use(&udd);
         let owned = match entries::decide(running, record.as_ref(), &args) {
@@ -455,6 +462,14 @@ impl Platform for LivePlatform {
             generated_at: rfc3339_utc(self.now_ms() / 1000),
         };
         let mut report = checks::run(&input, &crate::http::WinHttpClient);
+        if let Err(code) = crate::browser_environment::launch_flags(&self.data_dir) {
+            report.results.push(crate::checks::CheckResult::new(
+                "BROWSER_ENV",
+                crate::checks::Kind::Hard,
+                crate::checks::Status::Unknown,
+                Some(code),
+            ));
+        }
         if profile.egress.fixed_exit {
             report.results.push(crate::checks::CheckResult::new(
                 "FIXED",
@@ -510,6 +525,11 @@ impl Platform for LivePlatform {
             rt.signals = signals.clone();
         }
         signals
+    }
+
+    fn browser_profile(&self, profile: &AgentProfile) -> AgentProfile {
+        crate::browser_environment::effective_profile(&self.data_dir, profile)
+            .unwrap_or_else(|_| profile.clone())
     }
 
     fn close_entry(&self, process: &OwnedProcess) -> Result<CloseOutcome, Fault> {

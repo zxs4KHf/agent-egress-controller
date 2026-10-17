@@ -18,44 +18,9 @@ use aec_core::store::ProfileStore;
 
 use crate::text;
 
-/// Periodic fixed-exit recovery never writes globals or changes the saved path/exit identity.
-trait FixedGate {
-    fn verified(&self) -> bool;
-    fn verify(&self) -> Result<(), aec_core::controller::Fault>;
-    fn block(&self) -> Result<(), aec_core::controller::Fault>;
-    fn open(&self) -> Result<(), aec_core::controller::Fault>;
-}
-
-enum FixedPoll {
-    Healthy,
-    Recovered,
-    Blocked {
-        was_verified: bool,
-        probe_error: aec_core::controller::Fault,
-        block_error: Option<aec_core::controller::Fault>,
-    },
-}
-
-fn poll_fixed(gate: &impl FixedGate) -> FixedPoll {
-    let was_verified = gate.verified();
-    let result = gate.verify().and_then(|()| {
-        if was_verified {
-            Ok(false)
-        } else {
-            // open() reselects only the saved first hop and requires another exact probe.
-            gate.open().map(|()| true)
-        }
-    });
-    match result {
-        Ok(false) => FixedPoll::Healthy,
-        Ok(true) => FixedPoll::Recovered,
-        Err(probe_error) => FixedPoll::Blocked {
-            was_verified,
-            probe_error,
-            block_error: gate.block().err(),
-        },
-    }
-}
+use aec_core::fixed::{
+    inspect as poll_fixed, Inspection as FixedGate, InspectionOutcome as FixedPoll,
+};
 
 fn needs_refresh(poll: &FixedPoll, _mode: Mode) -> bool {
     _mode == Mode::AgentUnverified && matches!(poll, FixedPoll::Healthy)
@@ -146,6 +111,15 @@ impl Layout {
 }
 
 pub enum Cmd {
+    Cooperation(
+        aec_core::cooperation::Command,
+        Sender<Result<serde_json::Value, Vec<FieldError>>>,
+    ),
+    BrowserEnvironment(
+        aec_core::browser_environment::Command,
+        bool,
+        Sender<Result<serde_json::Value, Vec<FieldError>>>,
+    ),
     Upstream(
         aec_core::local_upstream::Command,
         Sender<Result<serde_json::Value, Vec<FieldError>>>,
@@ -331,6 +305,8 @@ impl Worker {
                 continue;
             }
             let label = match &cmd {
+                Cmd::Cooperation(..) => "正在核对站点协作（不重载客户端）…",
+                Cmd::BrowserEnvironment(..) => "正在处理浏览器设置…",
                 Cmd::Upstream(..) => "正在处理本机代理上游…",
                 Cmd::AgentAction(..) => "正在执行 Agent 操作…",
                 Cmd::Startup(..) | Cmd::Shortcuts(..) => "正在保存启动入口…",
@@ -384,8 +360,74 @@ impl Worker {
     fn handle(&mut self, cmd: Cmd) -> bool {
         let data_dir = self.layout.data_dir.clone();
         match cmd {
+            Cmd::Cooperation(command, done) => {
+                let result = (|| {
+                    use aec_core::cooperation::{Command, RuntimeHost};
+                    let set = load_set(&data_dir);
+                    let profile = set.agent.first().ok_or("COOP_FIXED_EXIT_REQUIRED")?;
+                    if !profile.egress.fixed_exit
+                        && !matches!(&command, Command::State | Command::Restore)
+                    {
+                        return Err("COOP_FIXED_EXIT_REQUIRED");
+                    }
+                    let selection = aec_core::cooperation::Selection {
+                        domains: profile.targets.iter().map(|t| t.domain.clone()).collect(),
+                        fixed_port: aec_core::fixed::ingress_port(
+                            &aec_core::core::CorePorts::default(),
+                        )
+                        .ok_or("COOP_PORT_INVALID")?,
+                    };
+                    let root = aec_core::cooperation::windows::client_root()?;
+                    if matches!(&command, Command::Preview | Command::Install { .. }) {
+                        let runtime = aec_core::cooperation::windows::ClientRuntime::open(&root)?;
+                        let config = runtime.get("/configs")?;
+                        if config["mode"].as_str() != Some("rule") {
+                            return Err("COOP_CLIENT_NOT_RULE_MODE");
+                        }
+                        if [
+                            "mixed-port",
+                            "port",
+                            "socks-port",
+                            "redir-port",
+                            "tproxy-port",
+                        ]
+                        .iter()
+                        .any(|key| config[*key].as_u64() == Some(u64::from(selection.fixed_port)))
+                        {
+                            return Err("COOP_PROXY_LOOP");
+                        }
+                    }
+                    aec_core::cooperation::Manager::new(&data_dir, &root)
+                        .execute(command, &selection)
+                })()
+                .map_err(|code| {
+                    aec_core::cooperation::record_failure(&data_dir, code);
+                    field_error(code.into())
+                });
+                let _ = done.send(result);
+            }
             Cmd::Upstream(command, done) => {
                 let result = self.change_upstream(command).map_err(field_error);
+                let _ = done.send(result);
+            }
+            Cmd::BrowserEnvironment(command, local_confirmation, done) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let result = aec_core::crypto::random_hex(16)
+                    .map_err(|_| "BROWSER_PLAN_ID_FAILED")
+                    .and_then(|nonce| {
+                        aec_core::browser_environment::execute(
+                            &data_dir,
+                            &aec_core::browser_environment_windows::WindowsBrowserHost,
+                            command,
+                            now,
+                            &nonce,
+                            local_confirmation,
+                        )
+                    })
+                    .map_err(|code| field_error(code.into()));
                 let _ = done.send(result);
             }
             Cmd::Route(form, done) => {
@@ -419,6 +461,7 @@ impl Worker {
                     }
                     "recheck" => self.recheck().map(|_| ()),
                     "exit" => self.controller.exit().and_then(|out| {
+                        self.restore_browser_environment()?;
                         if out.mode_after == Mode::Daily {
                             Ok(())
                         } else {
@@ -543,15 +586,11 @@ impl Worker {
                 );
             }
             Cmd::Restore(done) => {
-                if self.controller.state().mode != Mode::Daily {
-                    self.exit();
-                }
+                self.exit();
                 let _ = done.send(());
             }
             Cmd::Shutdown(done) => {
-                if self.controller.state().mode != Mode::Daily {
-                    self.exit();
-                }
+                self.exit();
                 let _ = done.send(());
                 return true;
             }
@@ -710,19 +749,45 @@ impl Worker {
     fn exit(&mut self) {
         match self.controller.exit() {
             Ok(r) => {
-                let ok = r.mode_after == Mode::Daily;
+                let environment = self.restore_browser_environment();
+                let ok = r.mode_after == Mode::Daily && environment.is_ok();
                 self.note(
                     if ok {
                         "已退出 Agent 模式"
                     } else {
                         "恢复未完成"
                     },
-                    &text::restore_summary(&r),
+                    &format!(
+                        "{}{}",
+                        text::restore_summary(&r),
+                        environment
+                            .err()
+                            .map(|error| format!(
+                                "；浏览器设置恢复失败：{}，请在看板重试，恢复记录仍保留",
+                                error.code
+                            ))
+                            .unwrap_or_default()
+                    ),
                     !ok,
                 );
             }
             Err(f) => self.note("退出失败", &f.to_string(), true),
         }
+    }
+
+    fn restore_browser_environment(&self) -> Result<(), aec_core::controller::Fault> {
+        aec_core::browser_environment::execute(
+            &self.layout.data_dir,
+            &aec_core::browser_environment_windows::WindowsBrowserHost,
+            aec_core::browser_environment::Command::Restore,
+            0,
+            "",
+            true,
+        )
+        .map(|_| ())
+        .map_err(|code| {
+            aec_core::controller::Fault::new(code, "浏览器设置需要在看板恢复；不覆盖外部变更")
+        })
     }
 
     fn prompts(&self) -> String {
@@ -865,12 +930,23 @@ impl Worker {
     fn recheck(&mut self) -> Result<(), aec_core::controller::Fault> {
         let p = agent_profile(&self.layout.data_dir);
         if p.egress.fixed_exit {
-            self.block()
-                .and_then(|()| self.open_fixed(&p))
-                .map_err(|e| aec_core::controller::Fault::new("FIXED_EXIT_UNVERIFIED", e))?;
-        } else {
-            self.controller.recheck(&p)?;
+            let poll = poll_fixed(&LiveFixedGate {
+                platform: self.controller.platform(),
+                profile: &p,
+            });
+            self.last_fixed_probe = std::time::Instant::now();
+            if let FixedPoll::Blocked {
+                probe_error,
+                block_error,
+                ..
+            } = poll
+            {
+                self.shared.lock().expect("lock").fixed_blocked = true;
+                let _ = self.controller.invalidate_routing_checks();
+                return Err(block_error.unwrap_or(probe_error));
+            }
         }
+        self.controller.recheck(&p)?;
         Ok(())
     }
     fn change_path(&mut self, path: String) -> Result<(), String> {
@@ -1013,6 +1089,29 @@ impl Backend {
 }
 
 impl SetupBackend for Backend {
+    fn cooperation_command(
+        &self,
+        command: aec_core::cooperation::Command,
+    ) -> Result<serde_json::Value, Vec<FieldError>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(Cmd::Cooperation(command, tx))
+            .map_err(|_| field_error("托盘服务已退出".into()))?;
+        rx.recv()
+            .map_err(|_| field_error("托盘服务已退出".into()))?
+    }
+    fn browser_environment(
+        &self,
+        command: aec_core::browser_environment::Command,
+        local_confirmation: bool,
+    ) -> Result<serde_json::Value, Vec<FieldError>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(Cmd::BrowserEnvironment(command, local_confirmation, tx))
+            .map_err(|_| field_error("托盘服务已退出".into()))?;
+        rx.recv()
+            .map_err(|_| field_error("托盘服务已退出".into()))?
+    }
     fn upstream(
         &self,
         command: aec_core::local_upstream::Command,

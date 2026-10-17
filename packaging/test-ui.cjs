@@ -25,11 +25,60 @@ async function run() {
     }
     const errors=[];page.on('pageerror',e=>errors.push(e.message));
     await page.goto(url);const frame=id=>page.frameLocator('#'+id);
-    page.on('dialog',dialog=>dialog.accept());
+    let approveDialog=true;page.on('dialog',dialog=>approveDialog?dialog.accept():dialog.dismiss());
     const dashboard=frame('dashboard'),agent=frame('agent'),setup=frame('setup'),help=frame('help');
     await dashboard.locator('#rules tr').first().waitFor();
+    assert.equal(await dashboard.locator('#environmentScope').count(),1,'browser settings must expose AI-only and global scopes');
+    await dashboard.locator('#environmentPanel > summary').click();
+    await dashboard.locator('#environmentScope').selectOption('global');
+    await dashboard.locator('#environmentLanguage').selectOption('zh-CN');
+    await dashboard.locator('#environmentPreview').click();
+    await dashboard.locator('#environmentPlan').filter({visible:true}).waitFor();
+    assert.match(await dashboard.locator('#environmentPlan').innerText(),/Chrome/,'fingerprint Chrome exclusion must appear before confirmation');
+    assert.match(await dashboard.locator('#environmentPlan').innerText(),/QUIC \/ HTTP\/3/,'preview must explain changes in user-facing language');
+    assert.match(await dashboard.locator('#environmentPlan').innerText(),/未配置/,'absent original policy must not be shown as an unexplained null');
+    if(installation){fs.mkdirSync(path.resolve('.scratch/ui-qa'),{recursive:true});await dashboard.locator('#environmentPanel').screenshot({path:path.resolve('.scratch/ui-qa/browser-environment.png')})}
+    assert.equal(await dashboard.locator('#environmentApply').isDisabled(),false);
+    await dashboard.locator('#environmentLanguage').selectOption('en-US');
+    assert.equal(await dashboard.locator('#environmentApply').isDisabled(),true,'editing options invalidates the confirmed plan');
+    await dashboard.locator('#environmentPreview').click();
+    await dashboard.locator('#environmentApply').filter({visible:true}).waitFor();
+    approveDialog=false;await dashboard.locator('#environmentApply').click();approveDialog=true;
+    assert.equal(await dashboard.locator('#environmentRestore').isDisabled(),true,'cancel must not change browser settings');
+    await dashboard.locator('#environmentApply').click();
+    await dashboard.locator('#environmentNotice').filter({hasText:'已保存'}).waitFor();
+    assert.match(await dashboard.locator('#environmentNotice').innerText(),/未验证/);
+    await dashboard.locator('#environmentRestore').click();
+    await dashboard.locator('#environmentNotice').filter({hasText:'已恢复'}).waitFor();
+    await dashboard.locator('#environmentScope').selectOption('ai_only');
+    await dashboard.locator('#environmentPreview').click();
+    assert.match(await dashboard.locator('#environmentPlan').innerText(),/仅 AEC/);
+    await dashboard.locator('#environmentPanel > summary').click();
+    assert.equal(await dashboard.locator('#exportCooperation').count(),1,'selected-site cooperation must have a working explicit preview/export entry');
+    await dashboard.locator('#exportCooperation').evaluate(el=>el.closest('details').open=true);
+    await dashboard.locator('#exportCooperation').click();
+    await dashboard.locator('#cooperationCode textarea').filter({visible:true}).waitFor();
+    assert.match(await dashboard.locator('#cooperationScript').inputValue(),/AEC-MANAGED-FIXED/);
+    assert.match(await dashboard.locator('#cooperationNotice').innerText(),/未修改或重载/);
+    const coop=await page.request.get(new URL('/cooperation?t=preview',url).href);
+    const coopView=await coop.json();assert.equal(coopView.runtimeVerified,false);assert.equal(coopView.persistentInstalled,null);assert.equal(coopView.installedByAec,false);
+    assert.ok([403,404].includes((await page.request.get(new URL('/cooperation?t=wrong',url).href)).status()),'unauthenticated export must not expose script data');
+    await dashboard.locator('#cooperationPreview').click();
+    await dashboard.locator('#cooperationPlan').filter({visible:true}).waitFor();
+    assert.match(await dashboard.locator('#cooperationPlan').innerText(),/不自动激活/);
+    approveDialog=false;await dashboard.locator('#cooperationInstall').click();approveDialog=true;
+    assert.equal(await dashboard.locator('#cooperationRestore').isDisabled(),true,'cancelled installation must not acquire ownership');
+    await dashboard.locator('#cooperationInstall').click();
+    await dashboard.locator('#cooperationNotice').filter({hasText:'等待你在 Clash'}).waitFor();
+    assert.match(await dashboard.locator('#cooperationBadge').innerText(),/未验证/);
+    await dashboard.locator('#cooperationRestore').click();
+    await dashboard.locator('#cooperationNotice').filter({hasText:'已移除'}).waitFor();
+    await dashboard.locator('#cooperationPreview').click();
+    await dashboard.locator('#cooperationPlan').filter({visible:true}).waitFor();
     assert.equal(await dashboard.locator('#rules tr').count(),12);
     await dashboard.locator('#rules tr').first().locator('input[type=text]').fill('edited.example.test');
+    assert.equal(await dashboard.locator('#cooperationInstall').isDisabled(),true,'editing a rule must invalidate a pending cooperation installation');
+    assert.equal(await dashboard.locator('#copyCooperation').isDisabled(),true,'editing the protected scope must invalidate a previously exported script');
     assert.equal(await dashboard.getByRole('button',{name:'Preview GPT → DIRECT（非固定出口）',exact:true}).isDisabled(),true,'unsaved edits must immediately disable quick switching');
     await page.waitForTimeout(5200);
     assert.equal(await dashboard.locator('#rules tr').first().locator('input[type=text]').inputValue(),'edited.example.test','polling must not overwrite a draft');
@@ -53,6 +102,7 @@ async function run() {
     await dashboard.locator('#notice').filter({hasText:'操作已完成'}).waitFor();
     assert.ok(await dashboard.locator('.site-item').filter({hasText:'chatgpt.com'}).count(),'fixed switch restores site protection');
     const protectedBefore=await dashboard.locator('.site-item .domain').allTextContents();
+    await dashboard.locator('#upstreamsPanel > summary').click();
     await dashboard.locator('#newUpstream').click();
     await dashboard.locator('#upstreamName').fill('Clash');
     await dashboard.locator('#upstreamPort').fill('7890');
@@ -118,7 +168,7 @@ async function run() {
     await page.locator('[data-tab=agent]').click();await page.screenshot({path:path.join(screenshotDir,'agent.png')});
     await page.setViewportSize({width:600,height:780});await page.screenshot({path:path.join(screenshotDir,'compact.png')});
     assert.deepEqual(errors,[],'page JavaScript errors');
-    console.log('UI passed: filters, pagination/full save, draft preservation, folding/search, two-way Agent toggle, live badge, authenticated navigation, scrollable targets, live resource switch without process restart; screenshots saved.');
+    console.log('UI passed: selected-site export, two browser scopes/preview/invalidated plan/cancel/confirm/restore, filters, pagination/full save, draft preservation, folding/search, two-way Agent toggle, upstream CRUD, authenticated navigation and live UI hot update; screenshots saved.');
   } catch(error) {
     if(installation&&page){
       const dir=process.env.AEC_UI_SCREENSHOT_DIR||'.scratch/ui-qa';fs.mkdirSync(dir,{recursive:true});

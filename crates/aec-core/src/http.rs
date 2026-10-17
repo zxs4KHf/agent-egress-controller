@@ -123,8 +123,9 @@ mod winhttp {
         WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest,
         WinHttpQueryDataAvailable, WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse,
         WinHttpSendRequest, WinHttpSetOption, WinHttpSetTimeouts, WINHTTP_ACCESS_TYPE_NAMED_PROXY,
-        WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_DISABLE_COOKIES, WINHTTP_DISABLE_REDIRECTS,
-        WINHTTP_FLAG_SECURE, WINHTTP_OPTION_DISABLE_FEATURE, WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_DISABLE_COOKIES, WINHTTP_DISABLE_KEEP_ALIVE,
+        WINHTTP_DISABLE_REDIRECTS, WINHTTP_FLAG_SECURE, WINHTTP_OPTION_DISABLE_FEATURE,
+        WINHTTP_OPTION_DISABLE_GLOBAL_POOLING, WINHTTP_QUERY_FLAG_NUMBER,
         WINHTTP_QUERY_STATUS_CODE,
     };
 
@@ -192,6 +193,18 @@ mod winhttp {
             if session.0.is_null() {
                 return Err(fail("WinHttpOpen"));
             }
+            // New session handles alone do not isolate WinHTTP's legacy cross-session pool.
+            // Older Windows versions may not support this option; KEEP_ALIVE below is always
+            // disabled as well, so our requests never return sockets to that global pool.
+            let disabled: u32 = 1;
+            unsafe {
+                WinHttpSetOption(
+                    session.0,
+                    WINHTTP_OPTION_DISABLE_GLOBAL_POOLING,
+                    (&disabled as *const u32).cast(),
+                    4,
+                );
+            }
             let total = req.total_timeout.as_millis() as i32;
             let connect = req.connect_timeout.as_millis() as i32;
             unsafe { WinHttpSetTimeouts(session.0, connect, connect, total, total) };
@@ -222,15 +235,19 @@ mod winhttp {
                 return Err(fail("WinHttpOpenRequest"));
             }
             // No cookie jar and no redirects: a detection request must not pick up or follow state.
-            let features: u32 = WINHTTP_DISABLE_COOKIES | WINHTTP_DISABLE_REDIRECTS;
-            unsafe {
+            let features: u32 =
+                WINHTTP_DISABLE_COOKIES | WINHTTP_DISABLE_REDIRECTS | WINHTTP_DISABLE_KEEP_ALIVE;
+            if unsafe {
                 WinHttpSetOption(
                     request.0,
                     WINHTTP_OPTION_DISABLE_FEATURE,
                     &features as *const u32 as *const c_void,
                     4,
                 )
-            };
+            } == 0
+            {
+                return Err(fail("WinHttpSetOption"));
+            }
 
             if unsafe { WinHttpSendRequest(request.0, null(), 0, null(), 0, 0, 0) } == 0 {
                 return Err(fail("WinHttpSendRequest"));

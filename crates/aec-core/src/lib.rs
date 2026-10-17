@@ -5,10 +5,14 @@
 //! [`testing::FakeHost`] and never changes system state by accident.
 
 pub mod agent;
+pub mod browser_environment;
+#[cfg(windows)]
+pub mod browser_environment_windows;
 pub mod checkpage;
 pub mod checks;
 pub mod cli;
 pub mod controller;
+pub mod cooperation;
 pub mod core;
 pub mod credentials;
 #[cfg(windows)]
