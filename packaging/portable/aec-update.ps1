@@ -420,6 +420,24 @@ function Show-UpdateMessage([string]$Text, [string]$Title, [bool]$Confirm = $fal
     } finally {$form.Dispose();$icon.Dispose()}
 }
 
+function Exit-UpdateLock {
+    if ($script:ownsUpdateMutex) {
+        $script:updateMutex.ReleaseMutex()
+        $script:ownsUpdateMutex=$false
+    }
+    if ($script:updateMutex) {
+        $script:updateMutex.Dispose()
+        $script:updateMutex=$null
+    }
+}
+
+function Show-UpdateResult([string]$Text, [string]$Title) {
+    # A dismissed or forgotten terminal dialog must never prevent a fresh attempt.
+    # All install/recovery work and its terminal journal entry precede this call.
+    Exit-UpdateLock
+    Show-UpdateMessage $Text $Title
+}
+
 # Never persist exception.Message, response bodies, URLs, command lines or settings.
 # Only controlled codes, numeric transport evidence and public release versions enter logs.
 function Initialize-UpdateLog([string]$Data, [string]$Version, [bool]$PresentationOnly) {
@@ -454,7 +472,7 @@ function Write-UpdateEvent([string]$Stage, [string]$Status, [string]$Code='none'
     else { [IO.File]::Move($pending,$path) }
 }
 
-function Write-UpdateFailure($Failure) {
+function Get-UpdateFailureInfo($Failure) {
     $exception=$Failure.Exception
     $code='operation_failed'; $http=0; $native=0
     while ($exception) {
@@ -468,6 +486,10 @@ function Write-UpdateFailure($Failure) {
                 'TrustFailure' { 'tls_failed' }
                 'SecureChannelFailure' { 'tls_failed' }
                 'ProtocolError' { 'http_failed' }
+                'ConnectFailure' { 'connection_failed' }
+                'ConnectionClosed' { 'connection_failed' }
+                'ReceiveFailure' { 'connection_failed' }
+                'SendFailure' { 'connection_failed' }
                 default { 'network_failed' }
             }
             if ($exception.Response -is [Net.HttpWebResponse]) { $http=[int]$exception.Response.StatusCode }
@@ -480,9 +502,14 @@ function Write-UpdateFailure($Failure) {
         }
         $exception=$exception.InnerException
     }
-    Write-UpdateEvent $script:UpdateStage 'failed' $code $http $native
+    return [pscustomobject]@{code=$code; httpStatus=$http; nativeCode=$native}
+}
+
+function Write-UpdateFailure($Failure) {
+    $info=Get-UpdateFailureInfo $Failure
+    Write-UpdateEvent $script:UpdateStage 'failed' $info.code $info.httpStatus $info.nativeCode
     $script:UpdateFailureRecorded=$true
-    return $code
+    return $info.code
 }
 
 function Invoke-UpdateStep([string]$Stage, [scriptblock]$Action) {
@@ -514,7 +541,21 @@ function Get-ReleaseAsset($Release, [string]$Name) {
 
 function Receive-UpdateAsset($Asset, [string]$Destination) {
     # UseBasicParsing also avoids the Windows PowerShell 5.1 legacy IE dependency.
-    Invoke-WebRequest -UseBasicParsing -Uri $Asset.browser_download_url -OutFile $Destination -TimeoutSec 180
+    for ($attempt=1; $attempt -le 3; $attempt++) {
+        try {
+            Invoke-WebRequest -UseBasicParsing -Uri $Asset.browser_download_url -OutFile $Destination -TimeoutSec 180
+            break
+        } catch {
+            $info=Get-UpdateFailureInfo $_
+            $transient=$info.code -in @('network_timeout','network_failed','connection_failed') -or
+                ($info.code -eq 'http_failed' -and $info.httpStatus -in @(408,429,500,502,503,504))
+            if (-not $transient -or $attempt -eq 3) { throw }
+            # Preserve the failed attempt without marking the whole session terminal.
+            # Overwrite any partial download on retry; never install unverified bytes.
+            Write-UpdateEvent $script:UpdateStage 'running' $info.code $info.httpStatus $info.nativeCode
+            Start-Sleep -Seconds $attempt
+        }
+    }
     $actual=(Get-Item -LiteralPath $Destination).Length
     if ($script:UpdateLog) { $script:UpdateLog.downloadedBytes += $actual }
     if ($actual -ne $Asset.size) { Stop-Update 'download_size_mismatch' }
@@ -764,8 +805,13 @@ try {
     Initialize-UpdateLog $data $CurrentVersion $UiOnly.IsPresent
     if (-not $CurrentPid -or $CurrentVersion -notmatch '^\d{1,5}\.\d{1,5}\.\d{1,5}$') { Stop-Update 'invalid_invocation' }
     $updateMutex = New-Object Threading.Mutex($false, 'Local\AgentEgressControllerUpdater')
-    $ownsUpdateMutex = $updateMutex.WaitOne(0)
-    if (-not $ownsUpdateMutex) { Stop-Update 'update_busy' }
+    try { $ownsUpdateMutex = $updateMutex.WaitOne(0) }
+    catch [Threading.AbandonedMutexException] { $ownsUpdateMutex=$true }
+    if (-not $ownsUpdateMutex) {
+        Write-UpdateEvent 'complete' 'cancelled' 'update_busy'
+        Show-UpdateResult "已有更新正在下载、核验或等待确认，本次没有重复启动，也没有停止网关。请等待原更新窗口；下载较慢时不要反复点击更新。`nAgent 可运行 aec-agent.exe update-status 查看原会话的阶段、下载量和错误。`n日志：$script:UpdateLogRoot" 'Agent Egress 更新正在进行'
+        exit 0
+    }
     Write-UpdateEvent 'discover' 'running'
     $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/zxs4KHf/agent-egress-controller/releases/latest' -Headers @{
         'User-Agent' = 'Agent-Egress-Controller-Updater'
@@ -776,7 +822,7 @@ try {
     $script:UpdateLog.targetVersion=$version
     if ([version]$version -le [version]$CurrentVersion -and -not $UiOnly) {
         Write-UpdateEvent 'complete' 'succeeded' 'already_current'
-        Show-UpdateMessage "当前已是最新版本 v$CurrentVersion。" 'Agent Egress 更新'
+        Show-UpdateResult "当前已是最新版本 v$CurrentVersion。" 'Agent Egress 更新'
         exit 0
     }
     $zipName = "AgentEgressController-$version-portable.zip"
@@ -864,7 +910,7 @@ try {
         $plan = Get-UpdatePlan $package $install $UiOnly.IsPresent
         if ($plan.Files.Count -eq 0) {
             Write-UpdateEvent 'complete' 'succeeded' 'already_current'
-            Show-UpdateMessage '所选更新内容已经一致，无需安装。' 'Agent Egress 更新'
+            Show-UpdateResult '所选更新内容已经一致，无需安装。' 'Agent Egress 更新'
             exit 0
         }
         $backup = Join-Path $install ('.aec-update-backup/' + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N'))
@@ -896,13 +942,13 @@ try {
         $result = Invoke-PlannedUpdate $plan $confirm $stop $copy $restart
         if ($result -eq 'cancelled') {
             Write-UpdateEvent 'confirm_core' 'cancelled'
-            Show-UpdateMessage '已取消核心更新，服务和程序文件保持原样。' 'Agent Egress 更新'
+            Show-UpdateResult '已取消核心更新，服务和程序文件保持原样。' 'Agent Egress 更新'
         } elseif ($result -eq 'hot-updated') {
             Write-UpdateEvent 'complete' 'succeeded' 'hot_updated'
-            Show-UpdateMessage "界面/文档已在线更新，网络服务未停止。请在控制中心点击刷新界面，未保存草稿会先询问。核心程序版本没有变化。`n回滚备份：$backup" 'Agent Egress 更新'
+            Show-UpdateResult "界面/文档已在线更新，网络服务未停止。请在控制中心点击刷新界面，未保存草稿会先询问。核心程序版本没有变化。`n回滚备份：$backup" 'Agent Egress 更新'
         } else {
             Write-UpdateEvent 'complete' 'succeeded' 'core_updated'
-            Show-UpdateMessage "程序已更新到 v$version，并已启动托盘。是否就绪以重新检测结果为准。`n回滚备份：$backup" 'Agent Egress 更新'
+            Show-UpdateResult "程序已更新到 v$version，并已启动托盘。是否就绪以重新检测结果为准。`n回滚备份：$backup" 'Agent Egress 更新'
         }
     } catch {
         throw
@@ -917,13 +963,11 @@ try {
         $lastFailure=@($script:UpdateLog.events | Where-Object { $_.status -eq 'failed' }) | Select-Object -Last 1
         $code=$lastFailure.code
         if (-not $script:UpdateLog) { throw 'Log initialization failed' }
-        Write-UpdateEvent $lastFailure.stage 'failed' $code $lastFailure.httpStatus $lastFailure.nativeCode
-        Show-UpdateMessage "更新失败（$code）。已保留阶段、错误码与下载记录，关闭窗口不会丢失。`n日志：$script:UpdateLogRoot`nAgent 可运行：aec-agent.exe update-status`n没有完成更新不代表已恢复网络，请检查托盘状态。" 'Agent Egress 更新失败'
+        Show-UpdateResult "更新失败（$code）。已保留阶段、错误码与下载记录，关闭窗口不会丢失。更新锁已释放，可以重新检查更新。`n日志：$script:UpdateLogRoot`nAgent 可运行：aec-agent.exe update-status`n没有完成更新不代表已恢复网络，请检查托盘状态。" 'Agent Egress 更新失败'
     } catch {
-        Show-UpdateMessage '更新已中止，无法写入更新日志。请检查数据目录权限和磁盘空间。不要反复确认停服；先由 Agent 检查本机状态。' 'Agent Egress 更新失败'
+        Show-UpdateResult '更新已中止，无法写入更新日志。请检查数据目录权限和磁盘空间。不要反复确认停服；先由 Agent 检查本机状态。' 'Agent Egress 更新失败'
     }
     exit 1
 } finally {
-    if ($ownsUpdateMutex) { $updateMutex.ReleaseMutex() }
-    if ($updateMutex) { $updateMutex.Dispose() }
+    Exit-UpdateLock
 }

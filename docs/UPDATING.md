@@ -1,6 +1,8 @@
-# 升级到 0.5.6
+# 升级到 0.5.7
 
-下载入口：[v0.5.6 Release](https://github.com/zxs4KHf/agent-egress-controller/releases/tag/v0.5.6)。新版修复健康链路重新检测断连、跨 UTC 日期 G3 日志读取，保留独立启动链路、更新弹窗、多个本机上游管理和组件级增量下载：按本机文件哈希，只下载变化的组件，不是字节级二进制差分。重新检测、日志读取、启动链路、上游管理等核心功能仍需完整程序更新，**仅更新界面不会安装这些功能**；核心更新仍需用户单独确认停服。
+0.5.7 修复结果弹窗占着更新锁的问题：失败/成功/无需更新结果显示前释放锁；已有更新运行时，重复请求明确提示等待。临时连接失败、超时和指定 HTTP 错误最多尝试三次，日志保留重试证据，耗尽后仍失败。旧脚本需要先按「一次性更新器引导」校验替换，才能在本次升级使用修复；无需先停网关。
+
+下载入口：[v0.5.7 Release](https://github.com/zxs4KHf/agent-egress-controller/releases/tag/v0.5.7)。新版修复健康链路重新检测断连、跨 UTC 日期 G3 日志读取，保留独立启动链路、更新弹窗、多个本机上游管理和组件级增量下载：按本机文件哈希，只下载变化的组件，不是字节级二进制差分。重新检测、日志读取、启动链路、上游管理等核心功能仍需完整程序更新，**仅更新界面不会安装这些功能**；核心更新仍需用户单独确认停服。
 
 **0.5.3/0.5.4 用户的图标修复：** 原更新器可以增量升级，但当前弹窗仍由旧脚本创建。要让首次下载确认窗口也独立显示，先按下面「一次性更新器引导」校验并替换新版脚本，再从原托盘打开；复制脚本不需要停止网关。新版弹窗使用 AEC 图标，点击「继续」仅确认当前阶段；默认「取消」，关闭不授权停服。完整安装后仍需修复本安装快捷方式；旧的运行中进程不会被远程改变。
 
@@ -26,13 +28,13 @@
 0.5.1/0.5.2 的原脚本只认识完整 ZIP，新 Release 不能远程把旧程序变成增量更新器。原版 0.5.0 还存在包路径白名单限制（不认识图标/UI/中文说明），因此必须引导。不关闭校验、不改写旧 Release。
 
 1. 关闭正在运行的更新检查窗口。无需为了复制脚本停止网络服务。
-2. 从同一个 v0.5.6 Release 下载 `aec-update-0.5.6.ps1` 和 `SHA256UPDATER-0.5.6.txt`。这份脚本与完整 ZIP 里的 `aec-update.ps1` 字节一致。
+2. 从同一个 v0.5.7 Release 下载 `aec-update-0.5.7.ps1` 和 `SHA256UPDATER-0.5.7.txt`。这份脚本与完整 ZIP 里的 `aec-update.ps1` 字节一致。
 3. 在下载目录打开 PowerShell，核对 SHA256。下面只校验，不运行下载的脚本：
 
    ```powershell
-   $actual = (Get-FileHash -LiteralPath '.\aec-update-0.5.6.ps1' -Algorithm SHA256).Hash
-   $line = Get-Content -LiteralPath '.\SHA256UPDATER-0.5.6.txt' -Raw
-   if ($line.Trim() -notmatch '^([a-fA-F0-9]{64})\s+\*?aec-update-0\.5\.6\.ps1$') { throw '校验文件格式错误' }
+   $actual = (Get-FileHash -LiteralPath '.\aec-update-0.5.7.ps1' -Algorithm SHA256).Hash
+   $line = Get-Content -LiteralPath '.\SHA256UPDATER-0.5.7.txt' -Raw
+   if ($line.Trim() -notmatch '^([a-fA-F0-9]{64})\s+\*?aec-update-0\.5\.7\.ps1$') { throw '校验文件格式错误' }
    if ($actual -ne $Matches[1]) { throw 'SHA256 不匹配，不要安装' }
    'SHA256 核对通过'
    ```
@@ -59,7 +61,7 @@
 .\aec-agent.exe --data-dir 'C:\Path\To\data' update-status
 ```
 
-无需托盘运行、API 开启或联网；不弹窗、不更改文件、不重试更新。MCP/鉴权 HTTP 调用 `aec_update_status`，参数 `{}`。只更新脚本但 Agent 仍是旧版时，可先直接读取日志 JSON。`sessions[0].events` 的失败项含 `nextAction`；`downloadedBytes` 计成功下载文件（含元数据），不计中断请求的部分字节或协议头。无日志不能推断没有出错；未终结记录不能证明更新器仍在运行。旧版未留日志的历史错误无法追溯，不能补造原因。
+无需托盘运行、API 开启或联网；不弹窗、不更改文件、不重试更新。MCP/鉴权 HTTP 调用 `aec_update_status`，参数 `{}`。只更新脚本但 Agent 仍是旧版时，可先直接读取日志 JSON。`sessions[0].events` 的失败项含 `nextAction`；重试使用 `running` 加受控错误码，最终耗尽才 `failed`；重复更新请求为 `complete/cancelled/update_busy`，请查另一会话的阶段。`downloadedBytes` 计成功下载文件（含元数据），不计中断请求的部分字节或协议头。无日志不能推断没有出错；未终结记录不能证明更新器仍在运行。旧版未留日志的历史错误无法追溯，不能补造原因。
 
 更新器在安装目录 `.aec-update-backup/<时间戳>-<标识>/` 保存旧程序和 `rollback.json`。失败复制会自动恢复；新版托盘启动失败时尝试回滚并打开旧程序。手动回滚前先正常退出并确认系统恢复完成，再按清单恢复旧文件、移除此次新增文件，保留 `data`、用户 Geo 文件和凭据。快捷方式修复是独立操作，不包含在程序文件回滚清单内。
 

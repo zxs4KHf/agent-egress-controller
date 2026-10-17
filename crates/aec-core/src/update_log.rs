@@ -29,7 +29,7 @@ pub fn collect(data: std::path::PathBuf) -> Value {
 fn advice(code: &str) -> Option<&'static str> {
     Some(match code {
         "none" => "No error at this event; this is not proof of network readiness.",
-        "network_timeout" | "network_failed" => "Check GitHub release downloads through the existing route; retry download without approving shutdown.",
+        "network_timeout" | "network_failed" | "connection_failed" => "A running event records a retry; downloads try at most three times. Check GitHub release downloads through the existing route; retry download without approving shutdown.",
         "dns_failed" => "Check GitHub DNS. Do not change the configured fixed exit to bypass this failure.",
         "proxy_failed" => "Check the existing local proxy port and proxy host resolution; do not enable a competing system proxy.",
         "tls_failed" => "Check clock, trusted certificates and TLS interception. Never disable certificate validation.",
@@ -42,7 +42,7 @@ fn advice(code: &str) -> Option<&'static str> {
         "io_failed" => "Check disk, permissions and nativeCode. Preserve rollback backups.",
         "operation_failed" => "Inspect stage/nativeCode. After stop/install/restart/rollback failure, check tray recovery and backups before retrying. Do not assume recovery succeeded.",
         "invalid_invocation" => "Start the updater from this installation's tray. Do not invent a PID or version.",
-        "update_busy" => "Another updater owns the update lock. Finish or cancel its dialog; do not force-kill it or start parallel updates.",
+        "update_busy" => "Another update is in progress; this duplicate request did not start or stop services. Inspect the other session's stage/download bytes. Terminal result dialogs in 0.5.7+ release the lock before display. Never force-kill an updater.",
         "unsupported_version" => "Release version format is unsupported. Report it to the maintainer; do not bypass version checks.",
         "identity_mismatch" | "install_missing" => "Verify the selected installation and tray identity before retrying. No foreign process should be stopped.",
         "shutdown_timeout" | "children_running" | "control_running" => "Normal application shutdown did not complete. Check tray/control-center state; do not force-kill or overwrite locked binaries.",
