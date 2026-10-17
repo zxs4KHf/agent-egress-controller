@@ -41,7 +41,7 @@ Agent 出口控制器把这件事收进一个托盘图标：从托盘打开的�
 
 详见 [协作与环境验收](docs/SELECTIVE-COOPERATION.md) 和 [Agent 接入](docs/AGENT-INTEGRATION.md#站点协作与浏览器环境)。
 
-**0.5.7：修复更新结果弹窗占锁导致的 `update_busy`，临时下载失败最多重试三次。** 已在更新中的重复请求明确提示等待，日志保留失败与重试证据供 Agent 离线读取。保留健康链路重新检测、跨日 G3 修复、独立窗口与组件增量下载；不包含管理员防绕过服务，不自动改动 Clash。详见 [0.5.7 验收范围](docs/RELEASE-0.5.7.md) 与 [升级指南](docs/UPDATING.md)。
+**更新器保留 0.5.7 的 `update_busy` 修复与临时下载重试。** 更新中的重复请求明确提示等待，日志保留失败与重试证据供 Agent 离线读取。保留健康链路重新检测、跨日 G3 修复、独立窗口与组件增量下载；不包含管理员防绕过服务，不自动激活 Clash。详见 [0.5.7 更新器验收](docs/RELEASE-0.5.7.md)、[0.5.8 协作修复](docs/RELEASE-0.5.8.md) 与 [升级指南](docs/UPDATING.md)。
 
 **兼容模式：多个本机代理上游。** 只有选择由 AEC 接管系统代理时，才在控制中心「AEC 托管普通上游」管理 XxYun、Clash 等端点，并关闭其他客户端系统代理开关。该模式和上方保留 Clash 入口的站点协作不同，不要混用。上游支持面板 CRUD/检测、托盘一键选择与 MCP/HTTP；新增上游不自动替换原选择，固定站点与 ISP 身份不变。
 
@@ -139,7 +139,7 @@ R11 通过仅证明观测到的连接遵循路由，实际 ISP 身份和出口 I
 
 ## 已知限制
 
-`0.5.7` 仍为预览质量：提供 Windows x64 per-user 安装 EXE 和便携 ZIP，没有代码签名；在 GitHub 标记为 Latest 供更新器发现，不代表所有环境均已验收。本机 Agent 控制由用户在看板显式启用，登录自启默认关闭。GEOSITE/GEOIP 需要用户提供可信的 `GeoSite.dat` 和 `GeoIP.dat` 到 `bin\`；包中不附带未核实来源的数据文件，程序不自动下载。未提供时保持「国内直连」关闭；相关规则预检会明确报缺项。
+`0.5.8` 仍为预览质量：提供 Windows x64 per-user 安装 EXE 和便携 ZIP，没有代码签名；公开资产及 Latest 状态以 GitHub Releases 为准，不代表所有环境均已验收。本机 Agent 控制由用户在看板显式启用，登录自启默认关闭。GEOSITE/GEOIP 需要用户提供可信的 `GeoSite.dat` 和 `GeoIP.dat` 到 `bin\`；包中不附带未核实来源的数据文件，程序不自动下载。未提供时保持「国内直连」关闭；相关规则预检会明确报缺项。
 
 已验证的范围包括本地完整链路、真实 mihomo 配置与选择恢复、固定保护阻断和重载，以及维护者旧路由表导入后的真实出口等价性；其他用户网络中的隧道可用性、Windows 10/11 普通账号的全局写入与恢复仍需实机验收。详细证据见 [0.3.2 恢复修复验收](docs/RELEASE-0.3.2.md)、[0.3.1 验收记录](docs/RELEASE-0.3.1.md) 和 [0.3.0 看板验收](docs/RELEASE-0.3.0.md)。遇到问题请开 [Issue](https://github.com/zxs4KHf/agent-egress-controller/issues/new/choose)，附上已脱敏的排查提示词。
 
@@ -153,7 +153,7 @@ R11 通过仅证明观测到的连接遵循路由，实际 ISP 身份和出口 I
 
 ## AI Agent 控制
 
-本次交付版本为 0.5.7；修复更新结果占锁，增加临时下载重试，保留面板、托盘、Agent 共用的本机上游管理、组件增量下载与离线更新诊断。验证范围见 [0.5.7 交付记录](docs/RELEASE-0.5.7.md)，历史记录见 [0.5.6](docs/RELEASE-0.5.6.md)、[0.5.5](docs/RELEASE-0.5.5.md)、[0.5.4](docs/RELEASE-0.5.4.md)、[0.5.3](docs/RELEASE-0.5.3.md)、[0.5.2](docs/RELEASE-0.5.2.md)、[0.5.1](docs/RELEASE-0.5.1.md)。
+本次候选为 0.5.8；新增 `clientCooperation` 配置和 G7 `scopeEvidence`，兼容 Clash 默认 named pipe，保留面板、托盘、Agent 共用的本机上游管理、组件增量下载与离线更新诊断。验证范围见 [0.5.8 交付记录](docs/RELEASE-0.5.8.md)，历史记录见 [0.5.7](docs/RELEASE-0.5.7.md)、[0.5.6](docs/RELEASE-0.5.6.md)、[0.5.5](docs/RELEASE-0.5.5.md)、[0.5.4](docs/RELEASE-0.5.4.md)、[0.5.3](docs/RELEASE-0.5.3.md)、[0.5.2](docs/RELEASE-0.5.2.md)、[0.5.1](docs/RELEASE-0.5.1.md)。
 
 发布包包含 aec-agent.exe。在看板选择「Agent 接入与 MCP」并显式开启后，可复制配置到支持本机 MCP stdio 的桌面 Agent；自建本机 host 可用 loopback HTTP/JSON 接口。纯云端 Agent 不能直接访问你的电脑。MCP bridge 不需要另外安装 Node、Python 或 SDK。接口只提供具名状态、设置、规则、路径和模式工具，不提供任意 shell；Agent 看不到密码，需用户在本机设置页填写。对接步骤、HTTP 契约、工具 schema 和安全边界见 [Agent 接入指南](docs/AGENT-INTEGRATION.md)。本机接口默认关闭，托盘关闭后停止。
 
