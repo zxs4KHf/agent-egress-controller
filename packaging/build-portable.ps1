@@ -89,7 +89,7 @@ try {
         New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
         Copy-Item -LiteralPath (Join-Path $repo $file) -Destination $destination
     }
-    foreach ($file in @("USER-GUIDE.md", "UPDATING.md", "AGENT-INTEGRATION.md", "DIAGNOSTICS.md", "RELEASE-0.5.5.md", "RELEASE-0.5.4.md", "RELEASE-0.5.3.md", "RELEASE-0.5.2.md", "RELEASE-0.5.1.md", "RELEASE-0.5.0.md", "RELEASE-0.4.0.md", "RELEASE-0.2.0.md")) {
+    foreach ($file in @("USER-GUIDE.md", "UPDATING.md", "AGENT-INTEGRATION.md", "DIAGNOSTICS.md", "RELEASE-0.5.6.md", "RELEASE-0.5.5.md", "RELEASE-0.5.4.md", "RELEASE-0.5.3.md", "RELEASE-0.5.2.md", "RELEASE-0.5.1.md", "RELEASE-0.5.0.md", "RELEASE-0.4.0.md", "RELEASE-0.2.0.md")) {
         Copy-Item -LiteralPath (Join-Path $repo "docs/$file") -Destination (Join-Path $output "docs/$file")
     }
     # Keep the script ASCII so Windows PowerShell 5.1 also reads it correctly without a BOM.

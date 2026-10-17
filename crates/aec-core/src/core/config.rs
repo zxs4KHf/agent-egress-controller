@@ -126,7 +126,13 @@ fn local_cidr_rules(y: &mut String) {
 fn rules(profile: &AgentProfile) -> String {
     let mut y = String::from("rules:\n");
     if profile.egress.fixed_exit {
+        for domain in crate::fixed::CLAUDE_DOMAINS {
+            let _ = writeln!(y, "  - {}", quote(&format!("DOMAIN-SUFFIX,{domain},relay")));
+        }
         for t in &profile.targets {
+            if crate::fixed::CLAUDE_DOMAINS.contains(&t.domain.as_str()) {
+                continue;
+            }
             let _ = writeln!(
                 y,
                 "  - {}",

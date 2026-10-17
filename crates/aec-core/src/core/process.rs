@@ -723,9 +723,18 @@ impl CoreManager {
     fn owned_path(&self) -> PathBuf {
         self.core_dir().join("owned.json")
     }
-    /// Today's core log (UTC day), where the core writes one line per connection.
+    /// An owned core retains its startup log handle across UTC midnight. Never switch evidence
+    /// to a new day's nonexistent file while that process is still running.
     pub fn log_path(&self) -> PathBuf {
-        let day = rfc3339_utc(now_ms() / 1000)[..10].replace('-', "");
+        let started = self
+            .owned()
+            .map(|p| p.started_at_unix_ms)
+            .filter(|ms| *ms > 0)
+            .unwrap_or_else(now_ms);
+        self.log_path_at(started)
+    }
+    fn log_path_at(&self, started: u64) -> PathBuf {
+        let day = rfc3339_utc(started / 1000)[..10].replace('-', "");
         self.data_dir.join("logs").join(format!("core-{day}.log"))
     }
 
@@ -884,7 +893,9 @@ impl CoreManager {
             return Err(e);
         }
 
-        let log = self.log_path();
+        // Capture once so a launch crossing midnight records the exact day used for the log.
+        let started_at_unix_ms = now_ms();
+        let log = self.log_path_at(started_at_unix_ms);
         fs::create_dir_all(log.parent().expect("log has a parent"))
             .map_err(io("IO_WRITE", &log))?;
         let out = OpenOptions::new()
@@ -923,7 +934,7 @@ impl CoreManager {
             pid,
             exe,
             created,
-            started_at_unix_ms: now_ms(),
+            started_at_unix_ms,
         };
         write_atomic(
             &self.owned_path(),

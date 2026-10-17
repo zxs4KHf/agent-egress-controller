@@ -18,44 +18,9 @@ use aec_core::store::ProfileStore;
 
 use crate::text;
 
-/// Periodic fixed-exit recovery never writes globals or changes the saved path/exit identity.
-trait FixedGate {
-    fn verified(&self) -> bool;
-    fn verify(&self) -> Result<(), aec_core::controller::Fault>;
-    fn block(&self) -> Result<(), aec_core::controller::Fault>;
-    fn open(&self) -> Result<(), aec_core::controller::Fault>;
-}
-
-enum FixedPoll {
-    Healthy,
-    Recovered,
-    Blocked {
-        was_verified: bool,
-        probe_error: aec_core::controller::Fault,
-        block_error: Option<aec_core::controller::Fault>,
-    },
-}
-
-fn poll_fixed(gate: &impl FixedGate) -> FixedPoll {
-    let was_verified = gate.verified();
-    let result = gate.verify().and_then(|()| {
-        if was_verified {
-            Ok(false)
-        } else {
-            // open() reselects only the saved first hop and requires another exact probe.
-            gate.open().map(|()| true)
-        }
-    });
-    match result {
-        Ok(false) => FixedPoll::Healthy,
-        Ok(true) => FixedPoll::Recovered,
-        Err(probe_error) => FixedPoll::Blocked {
-            was_verified,
-            probe_error,
-            block_error: gate.block().err(),
-        },
-    }
-}
+use aec_core::fixed::{
+    inspect as poll_fixed, Inspection as FixedGate, InspectionOutcome as FixedPoll,
+};
 
 fn needs_refresh(poll: &FixedPoll, _mode: Mode) -> bool {
     _mode == Mode::AgentUnverified && matches!(poll, FixedPoll::Healthy)
@@ -865,12 +830,23 @@ impl Worker {
     fn recheck(&mut self) -> Result<(), aec_core::controller::Fault> {
         let p = agent_profile(&self.layout.data_dir);
         if p.egress.fixed_exit {
-            self.block()
-                .and_then(|()| self.open_fixed(&p))
-                .map_err(|e| aec_core::controller::Fault::new("FIXED_EXIT_UNVERIFIED", e))?;
-        } else {
-            self.controller.recheck(&p)?;
+            let poll = poll_fixed(&LiveFixedGate {
+                platform: self.controller.platform(),
+                profile: &p,
+            });
+            self.last_fixed_probe = std::time::Instant::now();
+            if let FixedPoll::Blocked {
+                probe_error,
+                block_error,
+                ..
+            } = poll
+            {
+                self.shared.lock().expect("lock").fixed_blocked = true;
+                let _ = self.controller.invalidate_routing_checks();
+                return Err(block_error.unwrap_or(probe_error));
+            }
         }
+        self.controller.recheck(&p)?;
         Ok(())
     }
     fn change_path(&mut self, path: String) -> Result<(), String> {

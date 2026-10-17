@@ -100,6 +100,11 @@ pub fn plan(set: &ProfileSet, form: &Form) -> Result<Plan, String> {
         }
     }
     let mut next = set.clone();
+    if p.egress.fixed_exit && !fixed && domains.iter().any(|d| crate::fixed::claude_domain(d)) {
+        return Err(
+            "Claude/Anthropic 已锁定固定 ISP，不能切到普通上游；其他服务仍可独立切换".into(),
+        );
+    }
     let next_p = &mut next.agent[0];
     next_p.routing.groups[index].selected = Some(form.member.clone());
     if p.egress.fixed_exit && !domains.is_empty() {
@@ -188,6 +193,36 @@ mod tests {
             group: "GPT".into(),
             member: member.into(),
         }
+    }
+
+    #[test]
+    fn service_switch_cannot_unlock_claude_while_fixed_protection_is_enabled() {
+        let mut set = configured();
+        let mut claude = set.agent[0].routing.groups[0].clone();
+        claude.name = "Claude".into();
+        set.agent[0].routing.groups.push(claude);
+        set.agent[0].routing.rules.push(RoutingRule {
+            kind: RoutingRuleKind::DomainSuffix,
+            value: "claude.ai".into(),
+            target: "Claude".into(),
+            no_resolve: false,
+            note: None,
+        });
+        assert!(
+            plan(
+                &set,
+                &Form {
+                    group: "Claude".into(),
+                    member: "DIRECT".into()
+                }
+            )
+            .is_err(),
+            "Claude must remain on the verified ISP even when another service is switchable"
+        );
+        assert!(
+            plan(&set, &selection("DIRECT")).is_ok(),
+            "GPT remains independently switchable"
+        );
     }
     struct NoSecrets;
     impl config::CredentialSource for NoSecrets {
