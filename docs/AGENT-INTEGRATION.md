@@ -63,7 +63,9 @@ MCP 使用官方 2025-11-25 JSON-RPC 生命周期与 newline-delimited stdio tra
 
 只有包含本功能的新核心才提供以下工具；UI 热更不能给旧核心增加能力：
 
-0.5.8 的 `aec_configure` 支持 `{"clientCooperation":true}`，仅日常模式可保存；同时关闭 AEC 系统接管选项，不改当前 Windows 系统代理。旧配置缺字段默认 false，不能通过 UI 热更升级能力。`aec_state` 返回 `clientCooperation` 和 G7 `scopeEvidence`；协作状态也返回 `systemProxyTakeover`。协作启动不要求先打开 Clash 开关，但日常浏览器要经过 Clash 入口才受规则覆盖。关闭开关是保护失效，重新开启必须重新核对。G7 的 unknown 不能用内部 ISP pass 或历史规则报告覆盖。
+0.5.8 的 `aec_configure` 支持 `{"clientCooperation":true}`，仅日常模式可保存；同时关闭 AEC 系统接管选项，不改当前 Windows 系统代理。旧配置缺字段默认 false，不能通过 UI 热更升级能力。`aec_state` 返回 `clientCooperation`、配置字段 `systemProxy` 和 G7 `scopeEvidence`；协作状态也返回 `systemProxyTakeover`。配置字段不等于当前系统入口或保护证据。协作启动不要求先打开 Clash 开关，但日常浏览器要经过 Clash 入口才受规则覆盖。关闭开关是保护失效，重新开启必须重新核对。G7 的 unknown 不能用内部 ISP pass 或历史规则报告覆盖。
+
+设置页向用户并列提供两项：①保留客户端系统代理并安装激活站点规则；②关闭客户端系统代理，由 AEC 本地接管，配置普通上游，无需修改 Clash 规则。第二项需要用户在本机选择接管范围，Agent 不可绕过现有全局接管确认边界。`clientCooperation:false` 只关闭协作，不代表自动启用 AEC 系统代理接管。两项都保留原固定 ISP 和隧道优化；不要通过普通上游选择或反复改系统代理开关来代替所有权选择。
 
 | 工具 | 参数 | 边界 |
 | --- | --- | --- |

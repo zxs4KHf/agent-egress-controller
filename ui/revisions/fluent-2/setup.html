@@ -4,9 +4,19 @@
 <title>出口与分流设置</title>
 <link rel="stylesheet" href="/ui/theme.css?t=__TOKEN__"><script src="/ui/app.js?t=__TOKEN__"></script><style>main{max-width:920px}label:not(.check):not(.radio){display:block;margin:12px 0 5px}input[type=text],input[type=password],input[type=number],select{width:100%}#targets{min-height:100px;max-height:160px}#msg{display:none}#msg.ok{display:block;background:var(--okbg);padding:12px;border-radius:8px}#msg.bad{display:block;background:var(--errbg);padding:12px;border-radius:8px;color:var(--err)}details.compact-details{padding:12px;background:var(--soft);border-radius:8px}.fe{margin-top:4px}</style></head><body><main>
 <div class="eyebrow">CONNECTION SETTINGS</div><h1>出口与系统设置</h1><div class="breadcrumbs"><a href="/dashboard?t=__TOKEN__" data-nav="dashboard" data-icon="back">返回看板</a><a href="/agent?t=__TOKEN__" data-nav="agent" data-icon="agent">Agent 接入</a><a href="/proxy-help?t=__TOKEN__" data-nav="help" data-icon="help">代理共存说明</a></div>
-<p class="lead">填写你自己的固定出口、隧道与环境目标。想保留 Clash 的系统代理入口时，在本页选择“站点协作”，再到看板安装并核对所选站点规则；仅导出脚本或升级程序不会自动转换旧工作方式。</p>
-<p class="notice">站点协作仍需完成客户端挂载与运行核对。不要为它勾选旧“接管 Windows 系统代理”，也不要在未确认时退出当前网关。<a href="/dashboard?t=__TOKEN__" data-nav="dashboard">返回看板查看协作状态</a></p>
+<p class="lead">先选择谁管理系统代理，再配置固定 ISP 和隧道。两种方式使用相同的固定出口与连接优化；保存选项不代表已经生效。</p>
 <form id="f" autocomplete="off">
+
+<section id="proxyChoices"><h2>选择连接方式</h2><p class="hint">Windows 系统代理只有一个入口，下面两项只能选一项。选择不会替你开关 Clash，也不会立即重启服务。</p>
+<label class="radio proxy-choice"><input id="clientCooperation" name="proxyOwner" type="radio" value="client"><span><b>1. 打开 Clash 等软件的系统代理 · 安装并激活站点规则</b><p>保留 Clash 的系统代理开关和规则模式，普通网站继续使用它原有的规则与节点。</p><div class="hint">选定站点：浏览器 → Clash → AEC 固定入口 → 原 ISP。<br>需要操作：保存后，在看板预览并安装站点规则，再到 Clash 手动激活，返回看板核对。自动安装目前支持已核实的 Clash Verge Rev 2.5.8 默认脚本，其他客户端需手动适配，未核实保持未知。<br>关闭 Clash 系统代理会使日常浏览器绕过这些规则；AEC 不会抢回开关。</div></span></label>
+<label class="radio proxy-choice"><input id="systemProxy" name="proxyOwner" type="radio" value="aec"><span><b>2. 关闭 Clash 等软件的系统代理 · 由 AEC 本地接管</b><p>关闭 Clash 的系统代理开关，保留其内核运行，在 AEC 配置它的本机代理端口；Clash 内仍可切换节点，无需修改 Clash 站点规则。</p><div class="hint">选定站点：浏览器 → AEC 本地入口 → 原 ISP。<br>其他网站：浏览器 → AEC → 按 AEC 路由选择的本机代理上游（例如 Clash）。请配置普通流量上游与路由；不会自动照搬 Clash 系统规则。<br>进入 Agent 模式后，Windows 系统代理由 AEC 指向本地入口，退出按快照恢复。真实写入须接管门放行；不要同时开启 Clash 的系统代理。外部改写会撤销就绪并提示，不循环抢占。</div></span></label>
+<p id="proxyChoiceStatus" class="notice" role="status" aria-live="polite"></p><div class="fe" data-for="clientCooperation"></div>
+<p class="hint">原有站点和路由保持不变；仅需固定 Claude 时，请核对并手动移除不需要固定的 GPT 等条目。独立指纹浏览器显式配置的出口不自动纳入。VPN/TUN 等额外接管不属于这两个系统代理入口方案。</p>
+<div class="breadcrumbs"><a href="/dashboard?t=__TOKEN__" data-nav="dashboard">管理站点规则与本机代理</a><a href="/proxy-help?t=__TOKEN__" data-nav="help">查看两种方式的操作说明</a></div>
+<details class="compact-details" id="localEntrySettings"><summary>AEC 本地入口端口（高级）</summary>
+<label for="coreMixedPort">本机代理入口端口</label><input id="coreMixedPort" type="number" min="0" max="65535" placeholder="默认 17893"><div class="fe" data-for="coreMixedPort"></div>
+<div class="hint">留空或 0 使用默认端口。这是 AEC 自己的入口，必须与 Clash 等本机上游及已占用端口分开；Clash 的端口在看板“本机代理”中填写。保存后下次进入生效，不改写用户级代理环境变量。</div></details>
+</section>
 
 <section><h2>出口代理</h2>
 <div class="row"><div><label for="host">地址</label><input id="host" type="text" placeholder="例如 203.0.113.10 或 proxy.example.com"><div class="fe" data-for="host"></div></div>
@@ -20,13 +30,6 @@
 <div class="fe" data-for="expectedIp"></div>
 </section>
 
-<section><h2>系统代理工作方式</h2><label class="check"><input id="clientCooperation" type="checkbox"><span>站点协作：保留 Clash 系统代理，只将选定站点转到固定 ISP<div class="hint">开启后，进入 Agent 模式只启动 AEC 固定服务，不改 Windows 系统代理。Clash 须保持规则模式并安装、激活看板中的站点规则；两者启动顺序不限。关闭 Clash 系统代理后，遵循系统代理的浏览器会绕过规则，AEC 显示未受保护，不抢回开关。</div></span></label><div class="fe" data-for="clientCooperation"></div><p class="hint">原有受保护站点会完整保留。若只固定 Claude，请在看板核对站点列表，删除不需要固定的 GPT 等站点；不会自动将旧配置中的站点扩大或缩小。</p></section>
-<details class="panel" id="legacySystemProxy"><summary>兼容模式：AEC 接管系统代理 <span id="legacySystemState" class="badge"></span></summary>
-<label for="coreMixedPort">本机代理入口端口</label><input id="coreMixedPort" type="number" min="0" max="65535" placeholder="默认 17893"><div class="fe" data-for="coreMixedPort"></div>
-<div class="hint">留空或 0 使用默认端口。接替已有代理时，填写客户端当前使用的入口端口；不会改写用户级代理环境变量。保存后下次进入生效。若本机程序依赖这个端口，先核对，避免断网。</div>
-<label class="check"><input id="systemProxy" type="checkbox"><span>进入 Agent 模式时接管 Windows 系统代理，退出时恢复原样
-<div class="hint">Windows 只有一个系统代理设置。本程序接管后会把它指向自己的入口端口；不要同时打开 Clash 等客户端的「系统代理」、VPN/TUN 或全局代理开关。可以保留对方内核运行，在上方「本机代理」填它的本地端口作为普通流量上游，并照常切换节点。检测到其他程序改写时，本程序不会抢写，会撤销就绪并提示关闭冲突开关后退出、重新进入。默认关闭，真实写入需要接管门放行。</div></span></label>
-</details>
 <section><h2>加密隧道（可选）</h2>
 <label class="check"><input id="tunnelEnabled" type="checkbox"><span>经加密隧道连接出口
 <div class="hint">在国内直连某些出口（例如 IPRoyal 的 ISP / 静态住宅代理）会被重置、时通时断时打开。每个连接先走隧道，不通再按下面的设置直连；两条路均连接配置的出口，最终 IP 由检测确认。</div></span></label>
@@ -104,9 +107,11 @@ $("proto").value=V.proto;$("timezone").value=V.timezone;$("language").value=V.la
 $("tunnelPreset").value=V.tunnelPreset;$("tunnelCipher").value=V.tunnelCipher;$("localProxyProto").value=V.localProxyProto;
 for(const k of ["takeoverEnabled","tunnelEnabled","tunnelDirectFallback","domesticDirect","systemProxy","clientCooperation"])$(k).checked=V[k];
 $('clientCooperation').disabled=typeof V.clientCooperation!=='boolean';
-$('clientCooperation').onchange=()=>{if($('clientCooperation').checked)$('systemProxy').checked=false};
-$('systemProxy').onchange=()=>{if($('systemProxy').checked)$('clientCooperation').checked=false};
-$("legacySystemState").textContent=V.systemProxy?"已配置接管":"未配置接管";$("legacySystemState").className='badge'+(V.systemProxy?' warn':'');
+if(V.clientCooperation)$('clientCooperation').checked=true;
+function proxyChoiceStatus(saved=false){const local=$('systemProxy').checked,external=$('clientCooperation').checked;
+ $('proxyChoiceStatus').textContent=external?'已选：保留 Clash 系统代理。'+(saved?'已保存；':'请保存；')+'仍需安装并激活规则，再核对当前入口和固定 ISP。':local?'已选：AEC 本地接管。'+(saved?'已保存；':'请保存；')+'进入前关闭 Clash 系统代理，确认本机上游与分流规则；进入后核对 G6 和固定 ISP。':'当前沿用仅专用入口配置，尚未选择系统分流方式；保存其他设置不会自动接管。请选择以上一种方式后保存。';
+ document.querySelectorAll('.proxy-choice').forEach(el=>el.classList.toggle('selected',el.querySelector('input').checked))}
+for(const id of ['clientCooperation','systemProxy'])$(id).addEventListener('change',()=>proxyChoiceStatus());proxyChoiceStatus(true);
 document.querySelector('input[name=routingMode][value="'+V.routingMode+'"]').checked=true;
 $("password").placeholder=V.passwordStored?"已保存，不改就留空":"没有就留空";
 function tunnelPwHint(){$("tunnelPassword").placeholder=V.tunnelPasswordStored&&V.tunnelPreset==="custom"?"已保存，不改就留空":""}
@@ -148,7 +153,7 @@ $("f").addEventListener("submit",async e=>{e.preventDefault();
   const j=await r.json();
   if(j.ok){$("password").value="";$("password").placeholder=form.username?"已保存，不改就留空":"没有就留空";
    $("tunnelPassword").value="";V.tunnelPreset=form.tunnelPreset;V.tunnelPasswordStored=form.tunnelEnabled||V.tunnelPasswordStored;tunnelPwHint();
-   show("ok","已保存。回到托盘点「进入 Agent 模式」；已经在 Agent 模式里的，要退出再进入才生效。这个页面可以关掉了。")}
+   proxyChoiceStatus(true);show("ok",form.clientCooperation?"已保存：保留 Clash 系统代理。请到看板安装站点规则，在 Clash 手动激活后进行运行核对。保存不代表已经保护。":form.systemProxy?"已保存：AEC 本地接管。请先关闭 Clash 系统代理并保留内核运行，核对 AEC 普通上游与路由，再进入 Agent 模式并核对 G6 和固定 ISP。":"已保存，继续仅使用专用入口，不接管系统代理。")}
   else{let other=[];for(const x of j.errors){const el=document.querySelector('.fe[data-for="'+x.path+'"]');
     if(el)el.textContent=x.message;else other.push(x.path+"："+x.message)}
    if(j.errors.some(x=>["maxInflight","connectTimeoutMs","dialBudgetMs"].includes(x.path)))document.getElementById("relayAdvanced").open=true;

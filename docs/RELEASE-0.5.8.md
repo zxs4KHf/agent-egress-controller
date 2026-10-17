@@ -10,10 +10,19 @@
 
 ## 生产切换步骤与影响
 
+先在连接方式中二选一，保留两种入口及现有隧道优化：
+
+- **保留 Clash 系统代理**：执行下面的规则安装与激活流程。
+- **由 AEC 本地接管**：无需修改 Clash 规则。正常回到日常状态，在设置选第二项、关闭 Clash 系统代理但保留内核，在看板配置并检测普通上游和路由，进入后核对 G6 与原 ISP。Windows 系统代理由 AEC 指向自己的本地入口；不是关闭全部代理。方式二的看板默认折叠 Clash 安装区，仍能查看/撤销旧块。
+
+单选保存不改变隧道、重试与固定身份实现，不立即重启或修改运行中的入口。旧 explicit-only 配置可保持未选，不静默迁移。
+
+以下步骤适用于方式一：
+
 1. 备份当前安装和 data，明确停服授权后通过完整更新安装核心；UI-only 不足以增加此功能。
-2. 日常状态在出口设置选择“站点协作”，保留原 ISP 精确 IP，不勾选 AEC 系统接管。核对站点列表；旧 GPT 项不自动删除，由用户明确选择所需范围。
+2. 日常状态在出口设置选择第一项“打开 Clash 等软件的系统代理 · 安装并激活站点规则”，保留原 ISP 精确 IP。核对站点列表；旧 GPT 项不自动删除，由用户明确选择所需范围。
 3. 看板预览并确认安装受管 footer。仅标准 CVR 2.5.8、独占默认脚本可自动安装；自定义/共享脚本或 DNS 覆盖等拒绝，不强行改写。
-4. 由用户在 Clash 官方 UI 激活配置，可能短暂中断连接。Clash 保持系统代理开启、规则模式，普通规则及节点选择保留。
+4. 由用户在 Clash Verge Rev 2.5.8 的“订阅”页点击顶部火焰图标“重新激活订阅”，可能短暂中断连接。Clash 保持系统代理开启、规则模式，普通规则及节点选择保留。
 5. AEC 进入 Agent 模式与打开 Clash 系统开关的先后不限；运行核对需看到当前受管规则。G7、内部 ISP 身份与 DNS 证据分别查看，不把程序已更新等同于已保护。
 
 关闭 Clash 系统代理会让日常浏览器绕过其规则；Google 等需要代理的站点可能不通，Claude 也不再受此入口保护，AEC 不会抢回。重新开启后需要新规则证据。普通 IP 检测网页遵循原规则，可能显示普通节点 IP，不代表 Claude 的实际出口。关闭入口、Global/Direct、脚本引擎失败、裸 IP、旧连接或独立代理不属于绝对阻断保证；未实现管理员级整机锁定。
@@ -26,7 +35,7 @@
 - `cargo test -p aec-core --test local_upstreams cooperation_ -- --nocapture`：先捕获域名范围被自动扩大，两项失败；修复后两项通过。
 - `cooperation_rechecks_rules_after_system_proxy_is_reenabled`：先关后开、先运行后打开、关期间规则失效后重开均取得新证据；规则匹配仍不伪造端点/DNS pass。
 - `default_windows_pipe_controller_reads_rules_with_tcp_controller_disabled`：真实隔离 named pipe 能读 `/version` 和规则，Claude 命中固定 mock、Google 命中普通 mock；错误入口/bypass/配置变化拒绝旧证据。
-- `node packaging/test-ui.cjs`：实际已安装 Edge 与隔离后端通过；工作方式互斥、保存、协作状态同步、上游隐藏、导航/CRUD/确认/取消/热更等回归。修正了等待文案子串造成的测试误匹配。
+- `node packaging/test-ui.cjs`：实际已安装 Edge 与隔离后端通过；两个并列单选项的互斥、双向保存与重新打开、不同看板提示、本地接管折叠规则安装、协作状态同步、上游隐藏、导航/CRUD/确认/取消/热更等回归。新增验收先捕获旧界面没有两个平等选项（0 ≠ 2）及看板仍只有协作提示，修复后通过。宽屏和窄屏截图已人工核对。
 - `node packaging/test-cooperation.cjs`：保留用户规则/组/节点、幂等、冲突/环路/非 Rule 处理通过。
 - `node packaging/test-browser-environment.cjs`：实际 Edge 的远程域名代理、中文语言、正向 UDP STUN 对照及限制后无非代理 STUN 通过；不改真实浏览器策略或用户 profile。
 - `cargo run --quiet -p aec-core --example cooperation_probe`：现场只读核对，返回 `COOP_RUNTIME_NODE_MISSING` / G7 fail；未安装/激活/重载当前 Clash。

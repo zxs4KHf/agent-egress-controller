@@ -1,16 +1,16 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>系统代理与固定站点协作</title><link rel="stylesheet" href="/ui/theme.css?t=__TOKEN__"><script src="/ui/app.js?t=__TOKEN__"></script></head><body><main>
-<div class="eyebrow">PROXY COOPERATION</div><h1>保留系统代理，单独维护固定站点</h1><div class="breadcrumbs"><a href="/dashboard?t=__TOKEN__" data-nav="dashboard" data-icon="back">返回看板</a><a href="/setup?t=__TOKEN__" data-nav="setup" data-icon="settings">出口与环境设置</a></div>
-<p class="lead">普通网站继续由当前系统代理自动分流；只有明确选定的站点转交 AEC 固定 ISP。GPT 不绑定某家代理，Arena 和独立指纹浏览器不自动纳入。</p>
+<div class="eyebrow">PROXY CONNECTION OPTIONS</div><h1>两种连接方式，选择一个系统代理入口</h1><div class="breadcrumbs"><a href="/dashboard?t=__TOKEN__" data-nav="dashboard" data-icon="back">返回看板</a><a href="/setup?t=__TOKEN__" data-nav="setup" data-icon="settings">选择连接方式</a></div>
+<p class="lead">想保留 Clash 的系统代理开关，选方式一并安装、激活规则；不想修改 Clash 规则，选方式二，由 AEC 本地接管。两者都保留现有隧道、重试和固定 ISP 身份核验。GPT、Arena 和独立指纹浏览器不自动纳入固定范围。</p>
 <div class="callout warning"><b>局部脚本导出不代表已安装或已保护</b><p>AEC 不循环抢回系统代理，也不因“生成成功”就显示固定出口、DNS 或浏览器环境全部通过。客户端挂载、激活及运行规则核对仍是单独步骤，不能自动覆盖已有订阅脚本。</p></div>
-<section><h2>开关与启动顺序</h2><p>在出口设置选择“站点协作”，同时关闭 AEC 的系统代理接管选项。进入 Agent 模式与打开 Clash 系统代理的先后顺序不限；要让日常浏览器经过规则，Clash 系统代理须保持开启。</p><p>关闭 Clash 系统代理后浏览器会绕过其规则，需要代理的普通网站可能不通，固定站点也不再受此入口保护。AEC 不会抢回开关；重新开启后 G7 重新读取入口和规则，不使用旧的通过结果。此方案没有系统级强制阻断绕过能力。</p><p>Clash Verge Rev 2.5.8 默认 named pipe 可直接核对，不需要额外开启 TCP controller。当前规则没有 AEC-MANAGED-FIXED 时，Claude 固定转发尚未生效。普通 IP 检测网页遵循 Clash 原规则，不能用它的 IP 判断所有站点出口。</p></section>
+<section><h2>方式一：保留客户端系统代理，安装并激活站点规则</h2><p>在出口设置选择“打开 Clash 等软件的系统代理 · 安装并激活站点规则”。进入 Agent 模式与打开 Clash 系统代理的先后顺序不限；要让日常浏览器经过规则，Clash 系统代理须保持开启并使用规则模式。</p><p>关闭 Clash 系统代理后浏览器会绕过其规则，需要代理的普通网站可能不通，固定站点也不再受此入口保护。AEC 不会抢回开关；重新开启后 G7 重新读取入口和规则，不使用旧的通过结果。此方案没有系统级强制阻断绕过能力。</p><p>Clash Verge Rev 2.5.8 默认 named pipe 可直接核对，不需要额外开启 TCP controller。当前规则没有 AEC-MANAGED-FIXED 时，Claude 固定转发尚未生效。普通 IP 检测网页遵循 Clash 原规则，不能用它的 IP 判断所有站点出口。</p></section>
 <section><h2>所选站点的连接路径</h2><p>浏览器 → 当前系统代理客户端 → AEC 固定专用入口 → 原 ISP。其他网站继续走客户端原规则，不需要反复更换系统代理端口。</p><ol>
 <li>在支持的 Clash Verge Rev 中保留系统代理开关，使用规则模式。全局/直连模式会绕开域名规则；TUN、裸 IP 和其他绕过路径不能按这份脚本声称已保护。</li>
 <li>在 AEC 看板维护受保护站点，并填写原固定 ISP 的精确预期 IP。不要把 <code>cloud.ai</code> 当作 <code>claude.ai</code> 自动加入。</li>
 <li>生成局部订阅脚本。它只包含选定域名的固定转发、UDP 拒绝、局部 DoH 策略和本机固定入口，不包含节点密钥或控制令牌。</li>
-<li>通过客户端官方订阅扩展入口，在最后一步挂载。已有脚本先保留并正确组合，不能直接覆盖。应用配置可能短暂中断连接，先确认后再激活。</li>
+<li>在 AEC 看板预览并安装受管块，或通过客户端官方订阅扩展入口手动组合。已有脚本先保留，不能直接覆盖。安装之后，在 Clash Verge Rev 2.5.8 的“订阅”页点击顶部火焰图标“重新激活订阅”，再返回 AEC 点“只读运行核对”。重新激活可能短暂中断连接，请选择合适时机。</li>
 <li>实际核对当前订阅的脚本、规则模式和固定身份。订阅刷新、切换或客户端升级后再次核对；不支持的客户端保持未验证。</li>
 </ol><p>AEC 旧“接管系统代理”与客户端协作是不同配置。生成脚本不会替你转换运行模式，也不会停止旧会话。改变当前核心或接管范围前，须展示计划并单独确认。</p></section>
+<section><h2>方式二：关闭客户端系统代理，由 AEC 本地接管</h2><p>路径：浏览器 → AEC 本地入口 → 固定站点走原 ISP；其他网站按 AEC 路由使用 Clash 等本机上游。</p><ol><li>在出口设置选择“关闭 Clash 等软件的系统代理 · 由 AEC 本地接管”并保存。运行中需先正常退出到日常状态；保存不会立即切换连接。</li><li>关闭的是 Clash 等软件的“系统代理”开关，保留其内核和代理端口运行。不要关闭内核，也不要把 AEC 自己的端口填成上游。</li><li>在 AEC 看板“本机代理”填写真实 HTTP/SOCKS5/mixed 端口并检测、选择，核对普通流量规则确实使用它。无需修改 Clash 站点规则；不会自动复制 Clash 的全部规则。</li><li>进入 Agent 模式后，AEC 经接管门把 Windows 系统代理指向自己的本地入口，退出按快照恢复。核对 G6 入口与固定 ISP 身份；配置保存不代表已经生效。</li></ol><p>可以在 Clash 内切换节点，但不要再次打开它的系统代理开关。若外部改写入口，AEC 撤销就绪并提示，不抢回；关闭冲突开关后正常退出并重新进入。此方式覆盖遵循系统代理的应用，独立指定其他代理的程序需要单独核对。</p></section>
 <details class="panel"><summary>DNS、UDP、WebRTC 和 ECS 的验证边界</summary><p>所选域名使用经固定专用入口的 DoH，路径失败不回退普通 DNS。已识别域名的 UDP 在转发规则之前拒绝；不能依赖 HTTP 不支持 UDP 来防止回退。裸 UDP、浏览器预解析和独立 DNS 必须另行验证。</p><p>G3 是检测请求的内核路径证据，不是整机泄露保证。DNS 传输、解析器和 EDNS Client Subnet（ECS）分项显示；没有实际查询或权威端证据就是未知。WebRTC 没有 ICE 候选也不能直接判定无泄露。</p><p>浏览器环境区分“仅 AI 浏览器”和“全局浏览器”；后者需逐项展示影响并确认。尚未接入的策略不显示为已应用。系统时区是整机状态，不是按网站独立设置。</p></details>
-<details class="panel"><summary>兼容模式：由 AEC 接管系统代理</summary><p>继续使用旧接管模式时，另一客户端只运行本地内核作为 AEC 普通上游，不能同时抢写系统代理。客户端内照常切节点，受保护站点仍在 AEC 内固定。两种模式不能靠反复开关混用。</p><p>G6 提示系统代理已改变时，AEC 保留外部设置并撤销就绪，不循环抢写。端口冲突须有同地址同端口占用证据；节点错误不能全部归因于系统代理冲突。</p></details>
 <p><a href="/setup?t=__TOKEN__" data-nav="setup">返回出口与环境设置</a></p>
 </main></body></html>

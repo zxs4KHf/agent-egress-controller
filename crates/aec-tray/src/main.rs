@@ -411,9 +411,9 @@ mod tray {
                     MF_STRING,
                     ID_SETTINGS,
                     if s.client_cooperation {
-                        "系统代理：Clash 站点协作（设置…）"
+                        "连接方式：保留客户端系统代理（两种选项…）"
                     } else {
-                        "系统代理工作方式与出口设置…"
+                        "连接方式：客户端系统代理 / AEC 本地接管…"
                     },
                 );
                 add(
