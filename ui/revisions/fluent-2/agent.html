@@ -5,7 +5,10 @@
 始终保持我指定的 ISP 出口 IP，未知证据不能报告为通过。
 密码由我在本机设置页填写，不进入聊天。
 进入或切换后读取真实状态并说明检测结果。核心升级会停止服务，必须先让我确认。
-如果其他客户端改写系统代理，请解释原因并建议关闭其系统代理开关，保留本机内核与节点切换。</pre><button id="copyPrompt" data-icon="copy">复制任务说明</button></details>
+先区分站点协作与旧系统接管：协作模式保留 Clash 的系统代理、普通规则与节点，不抢写开关；旧 AEC 接管模式才需要关闭其他客户端系统代理。
+协作先读 aec_cooperation_state，获准所选站点后预览/安装精确 planId，不覆盖自定义脚本，不自动重载 Clash；激活由我在客户端完成。
+DNS/ECS 外网探针需我单独同意，结果只代表该次查询。固定入口、规则存在与浏览器全部无泄露是不同证据。
+不修改独立指纹浏览器的 profile、节点和出口。</pre><button id="copyPrompt" data-icon="copy">复制任务说明</button></details>
 <details class="panel"><summary>高级：HTTP / JSON 接口</summary><p>发现文件 <code>agent-api.json</code> 只保存端口和凭据引用。桥接程序从当前用户 Windows Credential Manager 读取临时 Bearer 令牌；请勿把令牌写入配置、URL 或聊天。</p><pre>POST http://127.0.0.1:&lt;port&gt;/api/v1/call
 Authorization: Bearer &lt;本机读取的临时令牌&gt;
 Content-Type: application/json

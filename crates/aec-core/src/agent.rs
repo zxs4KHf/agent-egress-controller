@@ -119,6 +119,47 @@ fn fields(errors: Vec<crate::profile::FieldError>) -> String {
         .join(", ")
         + ": validation failed; check the local panel"
 }
+fn cooperation_error(errors: Vec<crate::profile::FieldError>) -> String {
+    const KNOWN: &[&str] = &[
+        "COOP_FIXED_EXIT_REQUIRED",
+        "COOP_CLIENT_NOT_FOUND",
+        "COOP_CLIENT_VERSION_UNSUPPORTED",
+        "COOP_CONTROLLER_DISABLED",
+        "COOP_CONTROLLER_NOT_IPV4_LOOPBACK",
+        "COOP_CONTROLLER_OWNER_UNKNOWN",
+        "COOP_CONTROLLER_AUTH_UNAVAILABLE",
+        "COOP_CONTROLLER_READ_FAILED",
+        "COOP_CONTROLLER_REPLY_INVALID",
+        "COOP_RUNTIME_CHANGED",
+        "COOP_CLIENT_NOT_RULE_MODE",
+        "COOP_CUSTOM_SCRIPT_MANUAL_MERGE",
+        "COOP_GUI_DNS_OVERRIDE",
+        "COOP_DNS_OVERRIDE_UNKNOWN",
+        "COOP_SCRIPT_SHARED",
+        "COOP_SCRIPT_NOT_REGISTERED",
+        "COOP_REGISTRATION_AMBIGUOUS",
+        "COOP_PROFILE_INVALID",
+        "COOP_FILE_UNSAFE",
+        "COOP_FILE_UNAVAILABLE",
+        "COOP_PREVIEW_REQUIRED",
+        "COOP_PREVIEW_STALE",
+        "COOP_EXTERNAL_CHANGE",
+        "COOP_RESTORE_BEFORE_CHANGE",
+        "COOP_STATE_INVALID",
+        "COOP_STATE_WRITE_FAILED",
+        "COOP_INSTALL_FAILED",
+        "COOP_RESTORE_FAILED",
+        "COOP_NOT_OWNED",
+        "COOP_DNS_CONSENT_REQUIRED",
+        "COOP_PROXY_LOOP",
+    ];
+    let code = errors
+        .iter()
+        .map(|e| e.message.as_str())
+        .find(|m| KNOWN.contains(m))
+        .unwrap_or("COOP_COMMAND_FAILED");
+    format!("{code}; read aec_cooperation_state for timestamped failure evidence; do not reload or stop services automatically")
+}
 fn upstream_error(errors: Vec<crate::profile::FieldError>) -> String {
     // Only known codes cross the Agent boundary, not arbitrary validation text or credentials.
     const CODES: &[&str] = &[
@@ -209,6 +250,12 @@ pub fn tools() -> Value {
     let specs = vec![
         ("aec_state", "Read mode, readiness summary, fixed-exit block, paths and rules. Unknown is never pass.", none.clone(), true),
         ("aec_cooperation", "Export an owned selected-site subscription script, without changing or reloading the system proxy client. Export is NOT installation, runtime verification, DNS/ECS safety proof or permission to replace an existing script.", none.clone(), true),
+        ("aec_cooperation_state", "Read persistent installation ownership, timestamped runtime/DNS reports and failure codes; never reloads or probes.", none.clone(), true),
+        ("aec_cooperation_preview", "Preview only a supported CVR 2.5.8 registered default subscription script footer. Does not change the client, proxy, nodes or fingerprint profiles. Custom scripts require manual merge.", none.clone(), false),
+        ("aec_cooperation_install", "Install the exact unexpired preview footer persistently. No automatic client activation/reload; user reactivates in Clash then verifies. Only execute after user authorizes selected-site rules.", schema(json!({"planId":{"type":"string"}}), &["planId"]), false),
+        ("aec_cooperation_restore", "Remove this owned footer only if unchanged. Never overwrites foreign edits or reloads the client; user reactivates in Clash.", none.clone(), false),
+        ("aec_cooperation_verify", "Read existing authenticated loopback CVR core rule evidence. No config mutation or external query. Rules/HTTP type alone cannot prove endpoint, DNS or ISP identity.", none.clone(), true),
+        ("aec_cooperation_dns_probe", "Opt-in external DNS authority TXT probes: current client resolver and explicit Google DoH through AEC fixed ingress. Sends random diagnostics to dnscheck.tools/Google; no permanent extra sites. Scope is not all browser/Claude DNS. consent must reflect explicit user agreement.", schema(json!({"consent":{"type":"boolean"}}), &["consent"]), false),
         ("aec_browser_environment", "Read browser environment settings and recovery availability. Saved settings never imply runtime DNS/WebRTC/UDP/ECS verification.", none.clone(), true),
         ("aec_browser_environment_preview", "Preview AI-only or global supported-Edge browser changes. Chrome/Chrome for Testing/fingerprint profiles are excluded from global policies. Creates a five-minute local confirmation plan, never applies or restarts browsers. User must review and confirm in the panel.", schema(json!({"scope":{"type":"string","enum":["ai_only","global"]},"language":{"type":"string","enum":crate::setup::LANGUAGES.iter().map(|p|p.0).collect::<Vec<_>>()},"preventWebrtc":{"type":"boolean"},"disableQuic":{"type":"boolean"},"remoteDnsOnly":{"type":"boolean"}}), &["scope","language","preventWebrtc","disableQuic","remoteDnsOnly"]), false),
         ("aec_upstreams", "List editable local proxy upstreams, current selection and whether rules use the group. Does not change routes or probe the network.", none.clone(), true),
@@ -247,6 +294,29 @@ pub fn call(backend: &dyn SetupBackend, request: Call) -> Result<Value, String> 
         return Err(invalid());
     }
     match request.name.as_str() {
+        "aec_cooperation_state"
+        | "aec_cooperation_preview"
+        | "aec_cooperation_install"
+        | "aec_cooperation_restore"
+        | "aec_cooperation_verify"
+        | "aec_cooperation_dns_probe" => {
+            use crate::cooperation::Command;
+            let command = match request.name.as_str() {
+                "aec_cooperation_state" => Command::State,
+                "aec_cooperation_preview" => Command::Preview,
+                "aec_cooperation_install" => Command::Install {
+                    plan_id: a["planId"].as_str().ok_or_else(invalid)?.into(),
+                },
+                "aec_cooperation_restore" => Command::Restore,
+                "aec_cooperation_verify" => Command::Verify,
+                _ => Command::DnsProbe {
+                    consent: a["consent"].as_bool().ok_or_else(invalid)?,
+                },
+            };
+            return backend
+                .cooperation_command(command)
+                .map_err(cooperation_error);
+        }
         "aec_browser_environment" | "aec_browser_environment_preview" => {
             let command = if request.name == "aec_browser_environment" {
                 crate::browser_environment::Command::State
@@ -287,7 +357,7 @@ pub fn call(backend: &dyn SetupBackend, request: Call) -> Result<Value, String> 
         }
         "aec_options" => {
             return Ok(
-                json!({"apiVersion":1,"tools":tools(),"timezones":crate::setup::TIMEZONES,"languages":crate::setup::LANGUAGES,"tunnelPresets":crate::tunnel::PRESETS.iter().map(|p|json!({"key":p.key,"label":p.label,"source":p.source})).collect::<Vec<_>>(),"security":"Loopback only; same Windows user; passwords are entered by the user in panel. AEC system takeover and selected-site client cooperation are different scopes. Cooperation currently exports only, with no installation/runtime proof. TUN/global bypass unsupported. Browser changes require local preview confirmation; no readiness guarantee without evidence."}),
+                json!({"apiVersion":1,"tools":tools(),"timezones":crate::setup::TIMEZONES,"languages":crate::setup::LANGUAGES,"tunnelPresets":crate::tunnel::PRESETS.iter().map(|p|json!({"key":p.key,"label":p.label,"source":p.source})).collect::<Vec<_>>(),"security":"Loopback only; same Windows user; passwords are entered by the user in panel. AEC system takeover and selected-site client cooperation are different scopes. Cooperation supports scoped CVR 2.5.8 default-script persistent installation, manual client activation and limited read-only rule proof; endpoint/ISP/DNS/browser evidence remain separate. External DNS probes require explicit consent. TUN/global bypass unsupported. Browser changes require local preview confirmation; no readiness guarantee without evidence."}),
             )
         }
         "aec_configure" => {

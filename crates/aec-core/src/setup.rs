@@ -757,6 +757,12 @@ pub fn apply_settings(
 
 /// What the page server needs from its owner.
 pub trait SetupBackend: Send + Sync {
+    fn cooperation_command(
+        &self,
+        _command: crate::cooperation::Command,
+    ) -> Result<serde_json::Value, Vec<FieldError>> {
+        Err(vec![err("cooperation", "COOP_UNAVAILABLE")])
+    }
     fn browser_environment(
         &self,
         _command: crate::browser_environment::Command,
@@ -1053,6 +1059,7 @@ fn handle(
             | "/update"
             | "/route"
             | "/upstream"
+            | "/cooperation"
             | "/browser-environment",
         ) if token_ok => {
             if header(&head, "origin") != Some(format!("http://{me}").as_str()) {
@@ -1090,8 +1097,12 @@ fn handle(
                 ui_only: bool,
             }
             let malformed = || vec![err("form", "表单格式不对")];
-            if path == "/upstream" || path == "/browser-environment" {
-                let result = if path == "/browser-environment" {
+            if path == "/upstream" || path == "/browser-environment" || path == "/cooperation" {
+                let result = if path == "/cooperation" {
+                    serde_json::from_slice(body)
+                        .map_err(|_| malformed())
+                        .and_then(|command| backend.cooperation_command(command))
+                } else if path == "/browser-environment" {
                     serde_json::from_slice(body)
                         .map_err(|_| malformed())
                         .and_then(|command| backend.browser_environment(command, true))
@@ -1169,6 +1180,7 @@ fn handle(
             | "/agent-access"
             | "/action"
             | "/agent-info"
+            | "/cooperation"
             | "/update"
             | "/route"
             | "/upstream"

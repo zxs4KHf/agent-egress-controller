@@ -3,6 +3,68 @@ use serde_yaml_ng::Value;
 
 pub const OUTBOUND: &str = "AEC-MANAGED-FIXED";
 
+#[cfg(windows)]
+#[path = "cooperation/client.rs"]
+mod client;
+#[cfg(windows)]
+pub use client::{record_failure, Manager};
+#[derive(Clone, serde::Serialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum Command {
+    State,
+    Preview,
+    Install {
+        #[serde(rename = "planId")]
+        plan_id: String,
+    },
+    Restore,
+    Verify,
+    DnsProbe {
+        consent: bool,
+    },
+}
+impl<'de> serde::Deserialize<'de> for Command {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let invalid = || D::Error::custom("COOP_COMMAND_INVALID");
+        let object = value.as_object().ok_or_else(invalid)?;
+        let action = object
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(invalid)?;
+        let keys: &[&str] = match action {
+            "state" | "preview" | "restore" | "verify" => &["action"],
+            "install" => &["action", "planId"],
+            "dns_probe" => &["action", "consent"],
+            _ => return Err(invalid()),
+        };
+        if object.len() != keys.len() || object.keys().any(|k| !keys.contains(&k.as_str())) {
+            return Err(invalid());
+        }
+        Ok(match action {
+            "state" => Self::State,
+            "preview" => Self::Preview,
+            "restore" => Self::Restore,
+            "verify" => Self::Verify,
+            "install" => Self::Install {
+                plan_id: value["planId"].as_str().ok_or_else(invalid)?.into(),
+            },
+            _ => Self::DnsProbe {
+                consent: value["consent"].as_bool().ok_or_else(invalid)?,
+            },
+        })
+    }
+}
+#[path = "cooperation/evidence.rs"]
+mod evidence;
+#[cfg(windows)]
+#[path = "cooperation/windows.rs"]
+pub mod windows;
+pub use evidence::{evaluate_dns, probe_fixed_dns, verify_runtime, RuntimeHost};
+
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Selection {
     pub domains: Vec<String>,
     pub fixed_port: u16,
@@ -55,7 +117,18 @@ function aecApplyFixedSites(config) {
     dns: {...config.dns, 'nameserver-policy': policies}
   };
 }
-function main(config) { return aecApplyFixedSites(config); }
+function main(config, profileName) {
+  try { return aecApplyFixedSites(config); }
+  catch (error) {
+    // CVR falls back to the original config on thrown errors. For supported rule-mode
+    // inputs, return explicit selected-site rejection instead; preserve ordinary rules.
+    // Global/Direct mode cannot be protected by domain rules. Never claim otherwise.
+    if (!config || typeof config !== 'object' || (config.mode && config.mode.toLowerCase() !== 'rule')) throw error;
+    const rejects = AEC_BLOCK.rules.filter(r => r.startsWith('DOMAIN-SUFFIX,'))
+      .map(r => r.substring(0,r.lastIndexOf(',')) + ',REJECT');
+    return {...config, rules:[...rejects,...(config.rules || [])]};
+  }
+}
 "#))
 }
 
@@ -181,7 +254,7 @@ pub fn prepare(current: &str, selection: &Selection) -> Result<Plan, &'static st
     for domain in &domains {
         let key = Value::from(format!("+.{domain}"));
         let desired = Value::Sequence(vec![Value::from(format!(
-            "https://1.1.1.1/dns-query#{OUTBOUND}"
+            "https://1.1.1.1/dns-query#{OUTBOUND}&ecs=0.0.0.0/0&ecs-override=true"
         ))]);
         if policies
             .get(&key)

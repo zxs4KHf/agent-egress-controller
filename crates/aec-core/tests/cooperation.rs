@@ -215,6 +215,44 @@ fn ordinary_config(port: u16) -> String {
 }
 
 #[test]
+#[ignore = "requires pinned mihomo; isolated controller readback only"]
+fn running_rule_evidence_uses_real_pinned_api_without_claiming_dns_or_endpoint_proof() {
+    let fixed = Proxy::start(b'F');
+    let ordinary = Proxy::start(b'O');
+    let selection = Selection {
+        domains: vec!["claude.ai".into(), "anthropic.com".into()],
+        fixed_port: fixed.port,
+    };
+    let core = Core::new(51000);
+    core.start(
+        &cooperation::prepare(&ordinary_config(ordinary.port), &selection)
+            .unwrap()
+            .candidate_yaml(),
+    );
+    struct Local<'a>(&'a CoreManager);
+    impl cooperation::RuntimeHost for Local<'_> {
+        fn get(&self, path: &str) -> Result<serde_json::Value, &'static str> {
+            let text = std::fs::read_to_string(self.0.config_path()).map_err(|_| "fixture")?;
+            let config: serde_yaml_ng::Value =
+                serde_yaml_ng::from_str(&text).map_err(|_| "fixture")?;
+            let secret = config["secret"].as_str().ok_or("fixture")?;
+            let (_, body) = aec_core::core::process::http_get_local(
+                self.0.ports.controller,
+                path,
+                Some(secret),
+            )
+            .map_err(|_| "fixture")?;
+            serde_json::from_str(&body).map_err(|_| "fixture")
+        }
+    }
+    let evidence = cooperation::verify_runtime(&Local(&core.0), &selection);
+    assert_eq!(evidence["rules"], "pass", "{evidence}");
+    assert_eq!(evidence["dnsPolicy"], "unknown");
+    assert_eq!(evidence["endpoint"], "unknown");
+    assert_eq!(evidence["runtimeVerified"], false);
+}
+
+#[test]
 fn planning_refuses_to_forward_the_client_back_to_its_own_listener() {
     let current = ordinary_config(7890) + "\nmixed-port: 7897\n";
     assert!(
@@ -497,5 +535,100 @@ fn protected_dns_uses_fixed_transport_and_never_falls_back_to_ordinary_dns() {
     assert!(
         capture.recv_from(&mut [0; 512]).is_err(),
         "Fixed DoH failure must not send the query to ordinary DNS or fallback"
+    );
+}
+
+#[test]
+#[ignore = "pinned core; synthetic DNS wire ECS and padding captured on loopback only"]
+fn dns_standard_ecs_is_zeroed_on_real_upstream_wire_without_removing_other_opt_options() {
+    let capture = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    capture
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let address = capture.local_addr().unwrap();
+    let task = std::thread::spawn(move || {
+        let mut wire = [0u8; 2048];
+        let (len, peer) = capture.recv_from(&mut wire).unwrap();
+        let request = wire[..len].to_vec();
+        wire[2] = 0x81;
+        wire[3] = 0x83; // NXDOMAIN, preserving the actual question and OPT.
+        capture.send_to(&wire[..len], peer).unwrap();
+        request
+    });
+    let core = Core::new(50200);
+    core.start(&format!("dns:\n  enable: true\n  nameserver: ['udp://{address}#DIRECT&ecs=0.0.0.0/0&ecs-override=true']\nproxies: []\nrules: [MATCH,DIRECT]\n").replace("rules: [MATCH,DIRECT]","rules: ['MATCH,DIRECT']"));
+    let query = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    query
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let mut packet = vec![0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1];
+    for label in ["ecs", "example", "test"] {
+        packet.push(label.len() as u8);
+        packet.extend(label.as_bytes());
+    }
+    packet.extend([0, 0, 1, 0, 1]);
+    // OPT: nonzero IPv4 /24 ECS plus unrelated two-byte padding option.
+    packet.extend([
+        0, 0, 41, 4, 208, 0, 0, 0, 0, 0, 17, 0, 8, 0, 7, 0, 1, 24, 0, 203, 0, 113, 0, 12, 0, 2, 0,
+        0,
+    ]);
+    query
+        .send_to(&packet, ("127.0.0.1", core.0.ports.dns))
+        .unwrap();
+    let _ = query.recv_from(&mut [0; 2048]);
+    let upstream = task.join().unwrap();
+    assert!(
+        upstream.windows(8).any(|w| w == [0, 8, 0, 4, 0, 1, 0, 0]),
+        "standard ECS must be /0 with no identifying address bytes"
+    );
+    assert!(
+        upstream.windows(6).any(|w| w == [0, 12, 0, 2, 0, 0]),
+        "unrelated OPT padding must survive"
+    );
+    assert!(!upstream.windows(3).any(|w| w == [203, 0, 113]));
+}
+
+#[test]
+#[ignore = "pinned core and synthetic authoritative TXT response; no external DNS"]
+fn dns_authority_detector_accepts_the_actual_pinned_controller_json_contract() {
+    let dns = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    dns.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let port = dns.local_addr().unwrap().port();
+    let task = std::thread::spawn(move || {
+        let mut buffer = [0; 2048];
+        let (len, peer) = dns.recv_from(&mut buffer).unwrap();
+        let request = &buffer[..len];
+        let mut end = 12;
+        while request[end] != 0 {
+            end += request[end] as usize + 1;
+        }
+        end += 5;
+        let mut reply = vec![request[0], request[1], 0x81, 0x80, 0, 1, 0, 2, 0, 0, 0, 0];
+        reply.extend(&request[12..end]);
+        for text in ["FROM: 192.0.2.8#1234 (udp)", "ID: 4321"] {
+            reply.extend([0xc0, 0x0c, 0, 16, 0, 1, 0, 0, 0, 1]);
+            reply.extend(((text.len() + 1) as u16).to_be_bytes());
+            reply.push(text.len() as u8);
+            reply.extend(text.as_bytes());
+        }
+        dns.send_to(&reply, peer).unwrap();
+    });
+    let core = Core::new(49400);
+    core.start(&format!("dns:\n  enable: true\n  nameserver: [127.0.0.1:{port}]\nproxies: []\nrules: ['MATCH,DIRECT']\n"));
+    let config: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&std::fs::read_to_string(core.0.config_path()).unwrap()).unwrap();
+    let (status, body) = aec_core::core::process::http_get_local(
+        core.0.ports.controller,
+        "/dns/query?name=abcdef12.test.dnscheck.tools&type=TXT",
+        config["secret"].as_str(),
+    )
+    .unwrap();
+    task.join().unwrap();
+    assert_eq!(status, 200);
+    let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(reply["Question"][0]["Qclass"], 1);
+    assert_eq!(
+        cooperation::evaluate_dns(&reply, "abcdef12", 500)["status"],
+        "pass"
     );
 }

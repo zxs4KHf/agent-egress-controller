@@ -97,6 +97,7 @@ mod tray {
     const ID_PROXY_HELP: usize = 13;
     const ID_UPDATE: usize = 14;
     const ID_UPDATE_UI: usize = 15;
+    const ID_COOPERATION: usize = 16;
     const ID_ENTRY_BASE: usize = 100;
     const ID_SWITCH_BASE: usize = 10000;
     const TIMER_REFRESH: usize = 1;
@@ -399,6 +400,12 @@ mod tray {
                 }
                 submenu(m, checks, "检测与排查", true);
                 let settings = CreatePopupMenu();
+                add(
+                    settings,
+                    MF_STRING,
+                    ID_COOPERATION,
+                    "Clash 站点协作与 DNS/ECS…",
+                );
                 add(settings, MF_STRING, ID_SETTINGS, "出口与环境设置…");
                 add(
                     settings,
@@ -449,7 +456,7 @@ mod tray {
                     return Effect::Open(self.layout.report_path().to_string_lossy().into())
                 }
                 ID_SETTINGS => return self.open_page(false),
-                ID_DASHBOARD => return self.open_page(true),
+                ID_DASHBOARD | ID_COOPERATION => return self.open_page(true),
                 ID_PROXY_HELP => return self.open_proxy_help(),
                 ID_UPDATE | ID_UPDATE_UI => {
                     if let Err(error) = crate::update::launch(

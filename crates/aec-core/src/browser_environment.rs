@@ -68,8 +68,8 @@ pub trait Host {
     fn write(&self, policy: Policy, value: Option<&Value>) -> Result<(), &'static str>;
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
 pub enum Command {
     State,
     Preview {
@@ -80,6 +80,34 @@ pub enum Command {
         plan_id: String,
     },
     Restore,
+}
+impl<'de> Deserialize<'de> for Command {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let value = Json::deserialize(deserializer)?;
+        let invalid = || D::Error::custom("BROWSER_COMMAND_INVALID");
+        let object = value.as_object().ok_or_else(invalid)?;
+        let action = value["action"].as_str().ok_or_else(invalid)?;
+        let keys: &[&str] = match action {
+            "state" | "restore" => &["action"],
+            "preview" => &["action", "options"],
+            "apply" => &["action", "planId"],
+            _ => return Err(invalid()),
+        };
+        if object.len() != keys.len() || object.keys().any(|k| !keys.contains(&k.as_str())) {
+            return Err(invalid());
+        }
+        Ok(match action {
+            "state" => Self::State,
+            "restore" => Self::Restore,
+            "preview" => Self::Preview {
+                options: serde_json::from_value(value["options"].clone()).map_err(|_| invalid())?,
+            },
+            _ => Self::Apply {
+                plan_id: value["planId"].as_str().ok_or_else(invalid)?.into(),
+            },
+        })
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

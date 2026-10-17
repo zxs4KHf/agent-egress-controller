@@ -53,6 +53,31 @@ impl Drop for Preview {
     }
 }
 impl SetupBackend for Preview {
+    fn cooperation_command(
+        &self,
+        command: aec_core::cooperation::Command,
+    ) -> Result<serde_json::Value, Vec<FieldError>> {
+        let _serial = self.environment_serial.lock().unwrap();
+        let selection = aec_core::cooperation::Selection {
+            domains: self.profiles.lock().unwrap().agent[0]
+                .targets
+                .iter()
+                .map(|t| t.domain.clone())
+                .collect(),
+            fixed_port: 17328,
+        };
+        aec_core::cooperation::Manager::new(
+            &self.environment_data,
+            &self.environment_data.join("synthetic-client"),
+        )
+        .execute(command, &selection)
+        .map_err(|code| {
+            vec![FieldError {
+                path: "cooperation".into(),
+                message: code.into(),
+            }]
+        })
+    }
     fn browser_environment(
         &self,
         command: aec_core::browser_environment::Command,
@@ -213,6 +238,11 @@ fn main() {
         aec_core::crypto::random_hex(8).unwrap()
     ));
     std::fs::create_dir_all(&environment_data).unwrap();
+    let client = environment_data.join("synthetic-client");
+    std::fs::create_dir_all(client.join("profiles")).unwrap();
+    std::fs::write(client.join("profiles.yaml"),"current: remote1\nitems:\n- uid: remote1\n  type: remote\n  option: {script: script1}\n- uid: script1\n  type: script\n  file: script1.js\n").unwrap();
+    std::fs::write(client.join("verge.yaml"), "enable_dns_settings: false\n").unwrap();
+    std::fs::write(client.join("profiles/script1.js"),"// Define main function (script entry)\n\nfunction main(config, profileName) {\n  return config;\n}\n").unwrap();
     let backend = Arc::new(Preview {
         environment_data,
         environment_host: MemoryBrowserHost::default(),

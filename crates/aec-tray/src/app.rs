@@ -111,6 +111,10 @@ impl Layout {
 }
 
 pub enum Cmd {
+    Cooperation(
+        aec_core::cooperation::Command,
+        Sender<Result<serde_json::Value, Vec<FieldError>>>,
+    ),
     BrowserEnvironment(
         aec_core::browser_environment::Command,
         bool,
@@ -301,6 +305,7 @@ impl Worker {
                 continue;
             }
             let label = match &cmd {
+                Cmd::Cooperation(..) => "正在核对站点协作（不重载客户端）…",
                 Cmd::BrowserEnvironment(..) => "正在处理浏览器设置…",
                 Cmd::Upstream(..) => "正在处理本机代理上游…",
                 Cmd::AgentAction(..) => "正在执行 Agent 操作…",
@@ -355,6 +360,52 @@ impl Worker {
     fn handle(&mut self, cmd: Cmd) -> bool {
         let data_dir = self.layout.data_dir.clone();
         match cmd {
+            Cmd::Cooperation(command, done) => {
+                let result = (|| {
+                    use aec_core::cooperation::{Command, RuntimeHost};
+                    let set = load_set(&data_dir);
+                    let profile = set.agent.first().ok_or("COOP_FIXED_EXIT_REQUIRED")?;
+                    if !profile.egress.fixed_exit
+                        && !matches!(&command, Command::State | Command::Restore)
+                    {
+                        return Err("COOP_FIXED_EXIT_REQUIRED");
+                    }
+                    let selection = aec_core::cooperation::Selection {
+                        domains: profile.targets.iter().map(|t| t.domain.clone()).collect(),
+                        fixed_port: aec_core::fixed::ingress_port(
+                            &aec_core::core::CorePorts::default(),
+                        )
+                        .ok_or("COOP_PORT_INVALID")?,
+                    };
+                    let root = aec_core::cooperation::windows::client_root()?;
+                    if matches!(&command, Command::Preview | Command::Install { .. }) {
+                        let runtime = aec_core::cooperation::windows::ClientRuntime::open(&root)?;
+                        let config = runtime.get("/configs")?;
+                        if config["mode"].as_str() != Some("rule") {
+                            return Err("COOP_CLIENT_NOT_RULE_MODE");
+                        }
+                        if [
+                            "mixed-port",
+                            "port",
+                            "socks-port",
+                            "redir-port",
+                            "tproxy-port",
+                        ]
+                        .iter()
+                        .any(|key| config[*key].as_u64() == Some(u64::from(selection.fixed_port)))
+                        {
+                            return Err("COOP_PROXY_LOOP");
+                        }
+                    }
+                    aec_core::cooperation::Manager::new(&data_dir, &root)
+                        .execute(command, &selection)
+                })()
+                .map_err(|code| {
+                    aec_core::cooperation::record_failure(&data_dir, code);
+                    field_error(code.into())
+                });
+                let _ = done.send(result);
+            }
             Cmd::Upstream(command, done) => {
                 let result = self.change_upstream(command).map_err(field_error);
                 let _ = done.send(result);
@@ -1038,6 +1089,17 @@ impl Backend {
 }
 
 impl SetupBackend for Backend {
+    fn cooperation_command(
+        &self,
+        command: aec_core::cooperation::Command,
+    ) -> Result<serde_json::Value, Vec<FieldError>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(Cmd::Cooperation(command, tx))
+            .map_err(|_| field_error("托盘服务已退出".into()))?;
+        rx.recv()
+            .map_err(|_| field_error("托盘服务已退出".into()))?
+    }
     fn browser_environment(
         &self,
         command: aec_core::browser_environment::Command,

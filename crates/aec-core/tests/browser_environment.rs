@@ -560,6 +560,13 @@ fn panel_confirmation_uses_authenticated_origin_and_agent_cannot_apply_a_plan() 
     )
     .contains("\"ok\":true"));
     assert!(!env::launch_flags(&backend.temp.0).unwrap().is_empty());
+    assert!(
+        send("browser-test", true, r#"{"action":"restore","force":true}"#).contains("\"ok\":false")
+    );
+    assert!(
+        !env::launch_flags(&backend.temp.0).unwrap().is_empty(),
+        "unknown restore fields must not undo settings"
+    );
     let result = call("aec_browser_environment", serde_json::json!({})).unwrap();
     assert_eq!(result["canRestore"], true);
     assert_eq!(result["ednsEcs"], "unknown");
