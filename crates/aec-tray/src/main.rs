@@ -741,17 +741,6 @@ mod tray {
             unsafe { DestroyWindow(hwnd) };
             return;
         }
-        // Observe external system-proxy changes; never compete with another global writer.
-        {
-            let keep_tx = tx.clone();
-            std::thread::spawn(move || loop {
-                std::thread::sleep(Duration::from_secs(30));
-                if keep_tx.send(Cmd::Keep).is_err() {
-                    break;
-                }
-            });
-        }
-
         let tc = wide("TaskbarCreated");
         let agent = aec_core::agent::Server::start(
             &layout.data_dir,

@@ -2,8 +2,9 @@
 //! that owns the controller. Commands run one at a time, off the UI thread; the UI reads [`Shared`].
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use aec_core::controller::{Controller, EnterOptions, KeepOutcome, Mode, Settings};
 use aec_core::core::process::CoreManager;
@@ -24,6 +25,42 @@ use aec_core::fixed::{
 
 fn needs_refresh(poll: &FixedPoll, _mode: Mode) -> bool {
     _mode == Mode::AgentUnverified && matches!(poll, FixedPoll::Healthy)
+}
+
+struct FixedProbeSchedule {
+    completed: Instant,
+    failures: usize,
+}
+
+impl FixedProbeSchedule {
+    fn new(now: Instant) -> Self {
+        Self {
+            completed: now,
+            failures: 0,
+        }
+    }
+
+    fn due(&self, now: Instant, verified: bool) -> bool {
+        const BLOCKED_RETRIES: [u64; 5] = [2, 5, 10, 20, 30];
+        let delay = if verified {
+            30
+        } else {
+            BLOCKED_RETRIES[self
+                .failures
+                .saturating_sub(1)
+                .min(BLOCKED_RETRIES.len() - 1)]
+        };
+        now.duration_since(self.completed) >= Duration::from_secs(delay)
+    }
+
+    fn record(&mut self, now: Instant, verified: bool) {
+        self.completed = now;
+        self.failures = if verified {
+            0
+        } else {
+            self.failures.saturating_add(1)
+        };
+    }
 }
 
 struct LiveFixedGate<'a> {
@@ -153,8 +190,6 @@ pub enum Cmd {
     Restore(Sender<()>),
     /// Restore if needed, then reply and stop so the UI can quit.
     Shutdown(Sender<()>),
-    /// Periodic observation: notify if another program changes the system proxy.
-    Keep,
 }
 
 /// A notification for the UI to show once.
@@ -200,8 +235,8 @@ fn agent_profile(data_dir: &Path) -> AgentProfile {
 
 pub struct Worker {
     _session: aec_core::store::SessionLease,
-    last_fixed_probe: std::time::Instant,
-    last_cooperation_probe: std::time::Instant,
+    fixed_probe: FixedProbeSchedule,
+    last_entry_observation: Instant,
     layout: Layout,
     controller: Controller<LivePlatform>,
     shared: SharedRef,
@@ -225,8 +260,8 @@ impl Worker {
         .map_err(|e| e.to_string())?;
         let w = Self {
             _session: session,
-            last_fixed_probe: std::time::Instant::now(),
-            last_cooperation_probe: std::time::Instant::now(),
+            fixed_probe: FixedProbeSchedule::new(Instant::now()),
+            last_entry_observation: Instant::now(),
             layout,
             controller,
             shared,
@@ -312,11 +347,17 @@ impl Worker {
     }
 
     pub fn run(mut self, rx: Receiver<Cmd>) {
-        for cmd in rx {
-            if matches!(cmd, Cmd::Keep) {
-                self.keep();
-                continue;
-            }
+        loop {
+            // Wake the same worker on a deadline instead of accumulating queued timer commands.
+            // A pending user command is served first, then overdue observations are checked.
+            let cmd = match rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(cmd) => cmd,
+                Err(RecvTimeoutError::Timeout) => {
+                    self.keep();
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => return,
+            };
             let label = match &cmd {
                 Cmd::Cooperation(..) => "正在核对站点协作（不重载客户端）…",
                 Cmd::BrowserEnvironment(..) => "正在处理浏览器设置…",
@@ -332,14 +373,18 @@ impl Worker {
                 Cmd::Exit | Cmd::Restore(_) | Cmd::Shutdown(_) => "正在退出并恢复…",
                 Cmd::Ack => "正在处理…",
                 Cmd::CopyPrompts => "正在生成提示词…",
-                Cmd::Keep => unreachable!("handled above"),
             };
             self.publish(Some(label));
+            let was_active = self.active();
             let quit = self.handle(cmd);
             self.publish(None);
             if quit {
                 return;
             }
+            if self.active() && !was_active {
+                self.fixed_probe = FixedProbeSchedule::new(Instant::now());
+            }
+            self.keep();
         }
     }
 
@@ -633,34 +678,37 @@ impl Worker {
                 return true;
             }
             Cmd::Switch { group, member } => self.switch_route(&group, &member),
-            Cmd::Keep => self.keep(),
         }
         false
     }
 
     fn keep(&mut self) {
-        match self.controller.keep_system_proxy() {
-            None => {}
-            // The UI observes the latched conflict and shows one error dialog per session.
-            Some(KeepOutcome::Changed { .. }) => {}
-            Some(KeepOutcome::Failed(e)) => self.note("系统代理巡检失败", &e, true),
+        if !self.active() || self.controller.recovery_pending() {
+            return;
+        }
+        let now = Instant::now();
+        let entry_due = now.duration_since(self.last_entry_observation) >= Duration::from_secs(5);
+        let fixed_verified = self.controller.platform().fixed_verified();
+        let fixed_configured = fixed_verified || self.shared.lock().expect("lock").fixed_blocked;
+        let fixed_due = fixed_configured && self.fixed_probe.due(now, fixed_verified);
+        if !entry_due && !fixed_due {
+            return;
         }
         let p = agent_profile(&self.layout.data_dir);
-        if self.last_cooperation_probe.elapsed() >= std::time::Duration::from_secs(5) {
+        if entry_due {
+            match self.controller.keep_system_proxy() {
+                // The UI observes the latched conflict and shows one error dialog per session.
+                None | Some(KeepOutcome::Changed { .. }) => {}
+                Some(KeepOutcome::Failed(e)) => self.note("系统代理巡检失败", &e, true),
+            }
             match self.controller.observe_cooperation(&p) {
                 Ok(true) => self.publish(Some("系统代理协作证据已变化，请查看 G7 站点协作范围")),
                 Err(e) => self.note("站点协作巡检未完成", &e.message, true),
                 _ => {}
             }
-            self.last_cooperation_probe = std::time::Instant::now();
+            self.last_entry_observation = Instant::now();
         }
-        if p.egress.fixed_exit
-            && matches!(
-                self.controller.state().mode,
-                Mode::AgentReady | Mode::AgentUnverified
-            )
-            && self.last_fixed_probe.elapsed() >= std::time::Duration::from_secs(30)
-        {
+        if p.egress.fixed_exit && fixed_due {
             let poll = poll_fixed(&LiveFixedGate {
                 platform: self.controller.platform(),
                 profile: &p,
@@ -694,7 +742,7 @@ impl Worker {
                             true,
                         );
                     } else if was_verified {
-                        self.note("固定出口已阻断", &format!("{}。将定期重新核对同一出口，取得精确证据后自动恢复；也可点击重新检测。", probe_error.message), true);
+                        self.note("固定出口已阻断", &format!("{}。将很快重新核对同一出口，连续失败时逐步延长重试间隔。取得精确证据后自动恢复；也可点击重新检测。", probe_error.message), true);
                     }
                 }
             }
@@ -705,7 +753,8 @@ impl Worker {
                 }
             }
             // A full recovery check can take time; do not immediately poll again afterwards.
-            self.last_fixed_probe = std::time::Instant::now();
+            self.fixed_probe
+                .record(Instant::now(), self.controller.platform().fixed_verified());
         }
         self.write_report();
         self.publish(None);
@@ -965,8 +1014,9 @@ impl Worker {
             .open_fixed(p)
             .map_err(|e| e.to_string())?;
         self.shared.lock().expect("lock").fixed_blocked = false;
-        self.last_fixed_probe = std::time::Instant::now();
-        self.controller.recheck(p).map_err(|e| e.to_string())?;
+        let checked = self.controller.recheck(p).map_err(|e| e.to_string());
+        self.fixed_probe.record(Instant::now(), true);
+        checked?;
         self.write_report();
         Ok(())
     }
@@ -977,19 +1027,22 @@ impl Worker {
                 platform: self.controller.platform(),
                 profile: &p,
             });
-            self.last_fixed_probe = std::time::Instant::now();
             if let FixedPoll::Blocked {
                 probe_error,
                 block_error,
                 ..
             } = poll
             {
+                self.fixed_probe.record(Instant::now(), false);
                 self.shared.lock().expect("lock").fixed_blocked = true;
                 let _ = self.controller.invalidate_routing_checks();
                 return Err(block_error.unwrap_or(probe_error));
             }
         }
-        self.controller.recheck(&p)?;
+        let checked = self.controller.recheck(&p);
+        self.fixed_probe
+            .record(Instant::now(), self.controller.platform().fixed_verified());
+        checked?;
         Ok(())
     }
     fn change_path(&mut self, path: String) -> Result<(), String> {
@@ -1286,6 +1339,28 @@ mod tests {
     use aec_core::http::{HttpClient, HttpError, Request, Response};
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
+
+    #[test]
+    fn blocked_exit_retries_early_then_backs_off_and_resets_after_recovery() {
+        let start = Instant::now();
+        let mut schedule = FixedProbeSchedule::new(start);
+        schedule.record(start, false);
+        let mut now = start;
+        for delay in [2, 5, 10, 20, 30, 30] {
+            assert!(!schedule.due(now + Duration::from_secs(delay - 1), false));
+            now += Duration::from_secs(delay);
+            assert!(
+                schedule.due(now, false),
+                "blocked retry is due after {delay}s"
+            );
+            schedule.record(now, false);
+        }
+        schedule.record(now, true);
+        assert!(!schedule.due(now + Duration::from_secs(29), true));
+        assert!(schedule.due(now + Duration::from_secs(30), true));
+        schedule.record(now, false);
+        assert!(schedule.due(now + Duration::from_secs(2), false));
+    }
 
     struct Client(Result<Response, HttpError>);
     impl HttpClient for Client {

@@ -1,4 +1,6 @@
 //! Fixed exit identity is independent of the first hop. No probe uses the system proxy.
+use std::{net::IpAddr, time::Duration};
+
 use crate::http::{HttpClient, Request, Route};
 use crate::profile::AgentProfile;
 
@@ -98,18 +100,34 @@ pub fn protects(profile: &AgentProfile, host: &str) -> bool {
 /// Error messages deliberately omit response bodies and addresses.
 pub fn verify(client: &dyn HttpClient, port: u16, expected: Option<&str>) -> Result<(), String> {
     let expected = expected
-        .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+        .and_then(|s| s.parse::<IpAddr>().ok())
         .ok_or("未配置精确出口 IP；保持阻断")?;
-    let response = client
-        .send(&Request::get(PROBE_URL, Route::Proxy(port)))
-        .map_err(|_| "出口检测无证据；保持阻断")?;
-    if response.status != 200 {
-        return Err("出口检测未成功；保持阻断".into());
-    }
-    let actual = crate::providers::parse_cf_trace(&response.body)
+    let route = Route::Proxy(port);
+    let primary = client
+        .send(&Request::get(PROBE_URL, route))
         .ok()
-        .and_then(|t| t.ip.parse::<std::net::IpAddr>().ok())
-        .ok_or("出口检测无有效 IP；保持阻断")?;
+        .filter(|response| response.status == 200)
+        .and_then(|response| crate::providers::parse_cf_trace(&response.body).ok())
+        .and_then(|trace| trace.ip.parse::<IpAddr>().ok());
+
+    // An unavailable provider is not evidence of a changed exit. A real mismatch, however,
+    // must not be overridden by a second service. Both requests use the same fixed probe inlet.
+    let actual = primary
+        .or_else(|| {
+            let url = if expected.is_ipv4() {
+                "https://api-ipv4.ip.sb/ip"
+            } else {
+                "https://api-ipv6.ip.sb/ip"
+            };
+            let mut request = Request::get(url, route);
+            request.total_timeout = Duration::from_secs(4);
+            client
+                .send(&request)
+                .ok()
+                .filter(|response| response.status == 200)
+                .and_then(|response| response.body.trim().parse::<IpAddr>().ok())
+        })
+        .ok_or("两个出口检测服务均未返回有效 IP；保持阻断")?;
     if actual != expected {
         return Err("出口 IP 与固定值不同；保持阻断".into());
     }

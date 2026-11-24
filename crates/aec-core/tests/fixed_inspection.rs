@@ -1,7 +1,48 @@
 use aec_core::{
     controller::Fault,
     fixed::{self, Inspection, InspectionOutcome},
+    http::{HttpClient, HttpError, Request, Response, Route},
 };
+
+#[test]
+fn a_provider_timeout_does_not_erase_independent_exact_exit_evidence() {
+    struct Providers;
+    impl HttpClient for Providers {
+        fn send(&self, request: &Request) -> Result<Response, HttpError> {
+            assert_eq!(request.route, Route::Proxy(17327));
+            match request.url.as_str() {
+                "https://www.cloudflare.com/cdn-cgi/trace" => Err(HttpError::Timeout),
+                "https://api-ipv4.ip.sb/ip" => Ok(Response {
+                    status: 200,
+                    body: "198.51.100.7\n".into(),
+                    elapsed: Duration::ZERO,
+                }),
+                _ => panic!("unexpected fixed identity service"),
+            }
+        }
+    }
+    assert_eq!(
+        fixed::verify(&Providers, 17327, Some("198.51.100.7")),
+        Ok(())
+    );
+}
+
+#[test]
+fn a_known_ip_mismatch_never_consults_the_backup_service() {
+    struct WrongExit;
+    impl HttpClient for WrongExit {
+        fn send(&self, request: &Request) -> Result<Response, HttpError> {
+            assert_eq!(request.route, Route::Proxy(17327));
+            assert_eq!(request.url, "https://www.cloudflare.com/cdn-cgi/trace");
+            Ok(Response {
+                status: 200,
+                body: "ip=198.51.100.8\n".into(),
+                elapsed: Duration::ZERO,
+            })
+        }
+    }
+    assert!(fixed::verify(&WrongExit, 17327, Some("198.51.100.7")).is_err());
+}
 use std::{
     cell::Cell,
     io::{Read, Write},
